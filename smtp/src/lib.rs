@@ -1,5 +1,5 @@
 use base64::prelude::*;
-use miette::{Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
+use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_while1},
@@ -7,12 +7,16 @@ use nom::{
     sequence::preceded,
     IResult,
 };
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+
+mod parser;
+pub use parser::*;
 
 #[derive(Debug, Error, Diagnostic)]
-enum SmtpError {
+pub enum SmtpError {
     #[error("IO error")]
     #[diagnostic(code(smtp::io_error))]
     IoError(#[from] std::io::Error),
@@ -31,27 +35,14 @@ enum SmtpError {
 }
 
 #[derive(Debug)]
-struct Email {
-    from: String,
-    to: String,
-    body: String,
-}
-
-#[derive(Debug, PartialEq)]
-enum SmtpCommand {
-    Ehlo(String),
-    AuthPlain(String),
-    AuthLogin,
-    AuthUsername(String),
-    AuthPassword(String),
-    MailFrom(String),
-    RcptTo(String),
-    Data,
-    Quit,
+pub struct Email {
+    pub from: String,
+    pub to: String,
+    pub body: String,
 }
 
 #[derive(Debug)]
-enum SessionState {
+pub enum SessionState {
     Connected,
     Greeted,
     AuthenticatingUsername,
@@ -60,6 +51,243 @@ enum SessionState {
     ReceivingMailFrom,
     ReceivingRcptTo,
     ReceivingData,
+}
+
+#[derive(Clone)]
+pub struct SmtpServer {
+    on_ehlo: Arc<dyn Fn(&str) -> Result<(), SmtpError> + Send + Sync>,
+    on_auth: Arc<dyn Fn(&str, &str) -> Result<bool, SmtpError> + Send + Sync>,
+    on_mail_from: Arc<dyn Fn(&str) -> Result<(), SmtpError> + Send + Sync>,
+    on_rcpt_to: Arc<dyn Fn(&str) -> Result<(), SmtpError> + Send + Sync>,
+    on_data: Arc<dyn Fn(&Email) -> Result<(), SmtpError> + Send + Sync>,
+}
+
+impl SmtpServer {
+    pub fn new() -> Self {
+        SmtpServer {
+            on_ehlo: Arc::new(|_| Ok(())),
+            on_auth: Arc::new(|_, _| Ok(true)),
+            on_mail_from: Arc::new(|_| Ok(())),
+            on_rcpt_to: Arc::new(|_| Ok(())),
+            on_data: Arc::new(|_| Ok(())),
+        }
+    }
+
+    pub fn on_ehlo<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str) -> Result<(), SmtpError> + Send + Sync + 'static,
+    {
+        self.on_ehlo = Arc::new(f);
+        self
+    }
+
+    pub fn on_auth<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str, &str) -> Result<bool, SmtpError> + Send + Sync + 'static,
+    {
+        self.on_auth = Arc::new(f);
+        self
+    }
+
+    pub fn on_mail_from<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str) -> Result<(), SmtpError> + Send + Sync + 'static,
+    {
+        self.on_mail_from = Arc::new(f);
+        self
+    }
+
+    pub fn on_rcpt_to<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str) -> Result<(), SmtpError> + Send + Sync + 'static,
+    {
+        self.on_rcpt_to = Arc::new(f);
+        self
+    }
+
+    pub fn on_data<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&Email) -> Result<(), SmtpError> + Send + Sync + 'static,
+    {
+        self.on_data = Arc::new(f);
+        self
+    }
+
+    pub async fn handle_client(&self, mut socket: TcpStream) -> Result<()> {
+        let mut session = SmtpSession::new();
+        let mut buffer = [0; 1024];
+
+        socket
+            .write_all(b"220 localhost ESMTP server ready\r\n")
+            .await
+            .into_diagnostic()?;
+
+        loop {
+            let n = socket.read(&mut buffer).await.into_diagnostic()?;
+            if n == 0 {
+                return Ok(());
+            }
+
+            let command = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
+
+            if let SessionState::ReceivingData = session.state {
+                session.parse_email_body(&buffer[..n]).await?;
+                (self.on_data)(&session.email)?;
+                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+                session.state = SessionState::Authenticated;
+                continue;
+            }
+
+            match session.parse_command(&command) {
+                Ok(cmd) => {
+                    if self.handle_command(&mut session, cmd, &mut socket).await? {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Parse error: {}", e);
+                    socket
+                        .write_all(b"500 Syntax error, command unrecognized\r\n")
+                        .await
+                        .into_diagnostic()?;
+                }
+            }
+        }
+    }
+
+    async fn handle_command(
+        &self,
+        session: &mut SmtpSession,
+        command: SmtpCommand,
+        socket: &mut TcpStream,
+    ) -> Result<bool> {
+        match (&session.state, command) {
+            (SessionState::Connected, SmtpCommand::Ehlo(domain)) => {
+                (self.on_ehlo)(&domain)?;
+                socket
+                    .write_all(b"250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n")
+                    .await
+                    .into_diagnostic()?;
+                session.state = SessionState::Greeted;
+            }
+            (SessionState::Greeted, SmtpCommand::AuthPlain(auth_data)) => {
+                self.handle_auth_plain(session, auth_data, socket).await?;
+            }
+            (SessionState::Greeted, SmtpCommand::AuthLogin) => {
+                session.state = SessionState::AuthenticatingUsername;
+                socket
+                    .write_all(b"334 VXNlcm5hbWU6\r\n")
+                    .await
+                    .into_diagnostic()?;
+            }
+            (SessionState::AuthenticatingUsername, SmtpCommand::AuthUsername(username)) => {
+                let decoded_username = decode_base64(&username)?;
+                session.state = SessionState::AuthenticatingPassword(decoded_username);
+                socket
+                    .write_all(b"334 UGFzc3dvcmQ6\r\n")
+                    .await
+                    .into_diagnostic()?;
+            }
+            (
+                SessionState::AuthenticatingPassword(username),
+                SmtpCommand::AuthPassword(password),
+            ) => {
+                self.handle_auth_login(session, username.to_string(), password, socket)
+                    .await?;
+            }
+            (SessionState::Authenticated, SmtpCommand::MailFrom(from)) => {
+                (self.on_mail_from)(&from)?;
+                session.email.from = from;
+                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+                session.state = SessionState::ReceivingMailFrom;
+            }
+            (SessionState::ReceivingMailFrom, SmtpCommand::RcptTo(to)) => {
+                (self.on_rcpt_to)(&to)?;
+                session.email.to = to;
+                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+                session.state = SessionState::ReceivingRcptTo;
+            }
+            (SessionState::ReceivingRcptTo, SmtpCommand::Data) => {
+                socket
+                    .write_all(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n")
+                    .await
+                    .into_diagnostic()?;
+                session.state = SessionState::ReceivingData;
+            }
+            (_, SmtpCommand::Quit) => {
+                socket.write_all(b"221 Bye\r\n").await.into_diagnostic()?;
+                return Ok(true);
+            }
+            _ => {
+                if !session.can_accept_mail_commands() {
+                    socket
+                        .write_all(b"530 Authentication required\r\n")
+                        .await
+                        .into_diagnostic()?;
+                } else {
+                    socket
+                        .write_all(b"500 Unknown command\r\n")
+                        .await
+                        .into_diagnostic()?;
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn handle_auth_plain(
+        &self,
+        session: &mut SmtpSession,
+        auth_data: String,
+        socket: &mut TcpStream,
+    ) -> Result<()> {
+        let decoded = decode_base64(&auth_data)?;
+        let parts: Vec<&str> = decoded.split('\0').collect();
+        if parts.len() != 3 {
+            bail!("Invalid AUTH PLAIN data");
+        }
+        self.handle_authentication(session, parts[1], parts[2], socket)
+            .await
+    }
+
+    async fn handle_auth_login(
+        &self,
+        session: &mut SmtpSession,
+        username: String,
+        password: String,
+        socket: &mut TcpStream,
+    ) -> Result<()> {
+        let decoded_password = decode_base64(&password)?;
+        self.handle_authentication(session, &username, &decoded_password, socket)
+            .await
+    }
+
+    async fn handle_authentication(
+        &self,
+        session: &mut SmtpSession,
+        username: &str,
+        password: &str,
+        socket: &mut TcpStream,
+    ) -> Result<()> {
+        match (self.on_auth)(username, password) {
+            Ok(true) => {
+                session.state = SessionState::Authenticated;
+                socket
+                    .write_all(b"235 Authentication successful\r\n")
+                    .await
+                    .into_diagnostic()?;
+            }
+            Ok(false) | Err(_) => {
+                session.state = SessionState::Greeted;
+                socket
+                    .write_all(b"535 Authentication failed\r\n")
+                    .await
+                    .into_diagnostic()
+                    .wrap_err("Authentication failed")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 struct SmtpSession {
@@ -79,6 +307,7 @@ impl SmtpSession {
         }
     }
 
+    // Implement other methods (handle_command, parse_email_body, etc.) here...
     fn can_accept_mail_commands(&self) -> bool {
         matches!(
             self.state,
@@ -88,144 +317,12 @@ impl SmtpSession {
         )
     }
 
-    async fn handle_command(
-        &mut self,
-        command: SmtpCommand,
-        socket: &mut tokio::net::TcpStream,
-    ) -> Result<bool> {
-        match (&self.state, command) {
-            (SessionState::Connected, SmtpCommand::Ehlo(domain)) => {
-                println!("EHLO from {}", domain);
-                socket
-                    .write_all(b"250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n")
-                    .await
-                    .into_diagnostic()?;
-                self.state = SessionState::Greeted;
-            }
-            (SessionState::Greeted, SmtpCommand::AuthPlain(auth_data)) => {
-                self.handle_auth_plain(auth_data, socket).await?;
-            }
-            (SessionState::Greeted, SmtpCommand::AuthLogin) => {
-                self.state = SessionState::AuthenticatingUsername;
-                socket
-                    .write_all(b"334 VXNlcm5hbWU6\r\n")
-                    .await
-                    .into_diagnostic()?;
-            }
-            (SessionState::AuthenticatingUsername, SmtpCommand::AuthUsername(username)) => {
-                let decoded_username = decode_base64(&username)?;
-                self.state = SessionState::AuthenticatingPassword(decoded_username);
-                socket
-                    .write_all(b"334 UGFzc3dvcmQ6\r\n")
-                    .await
-                    .into_diagnostic()?;
-            }
-            (
-                SessionState::AuthenticatingPassword(username),
-                SmtpCommand::AuthPassword(password),
-            ) => {
-                self.handle_auth_login(username.to_string(), password, socket)
-                    .await?;
-            }
-            (SessionState::Authenticated, SmtpCommand::MailFrom(from)) => {
-                println!("Mail from: {from}");
-                self.email.from = from;
-                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
-                self.state = SessionState::ReceivingMailFrom;
-            }
-            (SessionState::ReceivingMailFrom, SmtpCommand::RcptTo(to)) => {
-                println!("Mail to: {to}");
-                self.email.to = to;
-                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
-                self.state = SessionState::ReceivingRcptTo;
-            }
-            (SessionState::ReceivingRcptTo, SmtpCommand::Data) => {
-                socket
-                    .write_all(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n")
-                    .await
-                    .into_diagnostic()?;
-                self.state = SessionState::ReceivingData;
-            }
-            (_, SmtpCommand::Quit) => {
-                socket.write_all(b"221 Bye\r\n").await.into_diagnostic()?;
-                return Ok(true);
-            }
-            cmd => {
-                if !self.can_accept_mail_commands() {
-                    println!("Command not allowed before authentication: {:?}", cmd);
-                    socket
-                        .write_all(b"530 Authentication required\r\n")
-                        .await
-                        .into_diagnostic()?;
-                } else {
-                    println!("Unknown command: {:?}", cmd);
-                    socket
-                        .write_all(b"500 Unknown command\r\n")
-                        .await
-                        .into_diagnostic()?;
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    async fn handle_auth_plain(
-        &mut self,
-        auth_data: String,
-        socket: &mut tokio::net::TcpStream,
-    ) -> Result<()> {
-        let decoded = decode_base64(&auth_data)?;
-        let parts: Vec<&str> = decoded.split('\0').collect();
-        if parts.len() != 3 {
-            return Err(SmtpError::AuthError).into_diagnostic();
-        }
-        self.handle_authentication(parts[1], parts[2], socket).await
-    }
-
-    async fn handle_auth_login(
-        &mut self,
-        username: String,
-        password: String,
-        socket: &mut tokio::net::TcpStream,
-    ) -> Result<()> {
-        let decoded_password = decode_base64(&password)?;
-        self.handle_authentication(&username, &decoded_password, socket)
-            .await
-    }
-
-    async fn handle_authentication(
-        &mut self,
-        username: &str,
-        password: &str,
-        socket: &mut tokio::net::TcpStream,
-    ) -> Result<()> {
-        match authenticate(username, password) {
-            Ok(true) => {
-                self.state = SessionState::Authenticated;
-                socket
-                    .write_all(b"235 Authentication successful\r\n")
-                    .await
-                    .into_diagnostic()?;
-            }
-            Ok(false) | Err(_) => {
-                self.state = SessionState::Greeted;
-                socket
-                    .write_all(b"535 Authentication failed\r\n")
-                    .await
-                    .into_diagnostic()?;
-            }
-        }
-        Ok(())
-    }
-
     async fn parse_email_body(&mut self, data: &[u8]) -> Result<()> {
         let mut body = String::new();
         let chunk = String::from_utf8_lossy(&data);
         for line in chunk.lines() {
-            println!("line: {line}");
             if line.trim() == "." {
                 self.email.body = body;
-                println!("Received email: {:?}", self.email);
                 self.state = SessionState::Authenticated;
                 break;
             }
@@ -279,7 +376,7 @@ impl SmtpSession {
     }
 }
 
-fn decode_base64(input: &str) -> Result<String, SmtpError> {
+pub fn decode_base64(input: &str) -> Result<String, SmtpError> {
     String::from_utf8(
         BASE64_STANDARD
             .decode(input)
@@ -288,76 +385,6 @@ fn decode_base64(input: &str) -> Result<String, SmtpError> {
     .map_err(|_| SmtpError::AuthError)
 }
 
-async fn handle_client(mut socket: tokio::net::TcpStream) -> Result<()> {
-    let mut session = SmtpSession::new();
-    let mut buffer = [0; 1024];
-
-    socket
-        .write_all(b"220 localhost ESMTP server ready\r\n")
-        .await
-        .into_diagnostic()?;
-
-    loop {
-        let n = socket.read(&mut buffer).await.into_diagnostic()?;
-        if n == 0 {
-            return Ok(());
-        }
-        println!("Read {} bytes", n);
-
-        let command = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
-
-        println!("Session state: {:?}", session.state);
-
-        if let SessionState::ReceivingData = session.state {
-            session.parse_email_body(&buffer[..n]).await?;
-            socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
-            continue;
-        }
-
-        match session.parse_command(&command) {
-            Ok(cmd) => {
-                if session.handle_command(cmd, &mut socket).await? {
-                    return Ok(());
-                }
-            }
-            Err(e) => {
-                eprintln!("Parse error: {}", e);
-                socket
-                    .write_all(b"500 Syntax error, command unrecognized\r\n")
-                    .await
-                    .into_diagnostic()?;
-            }
-        }
-    }
-}
-
 fn is_alphanumeric(c: char) -> bool {
     c.is_alphanumeric() || c == '.' || c == '-'
-}
-
-fn authenticate(username: &str, password: &str) -> Result<bool, SmtpError> {
-    // Here you should implement your actual authentication logic
-    // For this example, we'll just check if the username and password are "test"
-    Ok(username == "test" && password == "test")
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:2525")
-        .await
-        .into_diagnostic()?;
-    println!("SMTP server listening on port 2525");
-
-    loop {
-        let (socket, _) = listener
-            .accept()
-            .await
-            .into_diagnostic()
-            .wrap_err("error accepting tcp connection")?;
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(socket).await {
-                eprintln!("Error handling client: {:#}", e);
-            }
-        });
-    }
 }

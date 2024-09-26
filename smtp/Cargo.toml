@@ -1,0 +1,11 @@
+[package]
+name = "smtp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+base64 = "0.22.1"
+miette = { workspace = true }
+nom = "7.1.3"
+thiserror = { workspace = true }
+tokio = { workspace = true }
