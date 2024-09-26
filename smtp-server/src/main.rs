@@ -1,30 +1,41 @@
+use async_trait::async_trait;
 use miette::{Context, IntoDiagnostic, Result};
-use smtp::SmtpServer;
+use smtp::{Email, SmtpCallbacks, SmtpError, SmtpServer};
 use tokio::net::TcpListener;
+
+struct MySmtpCallbacks;
+
+#[async_trait]
+impl SmtpCallbacks for MySmtpCallbacks {
+    async fn on_ehlo(&self, domain: &str) -> Result<(), SmtpError> {
+        println!("EHLO from {}", domain);
+        Ok(())
+    }
+
+    async fn on_auth(&self, username: &str, password: &str) -> Result<bool, SmtpError> {
+        println!("Auth attempt: {}:{}", username, password);
+        Ok(username == "test" && password == "test")
+    }
+
+    async fn on_mail_from(&self, from: &str) -> Result<(), SmtpError> {
+        println!("Mail from: {}", from);
+        Ok(())
+    }
+
+    async fn on_rcpt_to(&self, to: &str) -> Result<(), SmtpError> {
+        println!("Rcpt to: {}", to);
+        Ok(())
+    }
+
+    async fn on_data(&self, email: &Email) -> Result<(), SmtpError> {
+        println!("Received email: {:?}", email);
+        Ok(())
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let smtp_server = SmtpServer::new()
-        .on_ehlo(|domain| {
-            println!("EHLO from {}", domain);
-            Ok(())
-        })
-        .on_auth(|username, password| {
-            println!("Auth attempt: {}:{}", username, password);
-            Ok(username == "test" && password == "test")
-        })
-        .on_mail_from(|from| {
-            println!("Mail from: {}", from);
-            Ok(())
-        })
-        .on_rcpt_to(|to| {
-            println!("Rcpt to: {}", to);
-            Ok(())
-        })
-        .on_data(|email| {
-            println!("Received email: {:?}", email);
-            Ok(())
-        });
+    let smtp_server = SmtpServer::new(MySmtpCallbacks);
 
     let listener = TcpListener::bind("127.0.0.1:2525")
         .await

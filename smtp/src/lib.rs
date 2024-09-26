@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use base64::prelude::*;
 use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
 use nom::{
@@ -53,64 +54,25 @@ pub enum SessionState {
     ReceivingData,
 }
 
+#[async_trait]
+pub trait SmtpCallbacks: Send + Sync {
+    async fn on_ehlo(&self, domain: &str) -> Result<(), SmtpError>;
+    async fn on_auth(&self, username: &str, password: &str) -> Result<bool, SmtpError>;
+    async fn on_mail_from(&self, from: &str) -> Result<(), SmtpError>;
+    async fn on_rcpt_to(&self, to: &str) -> Result<(), SmtpError>;
+    async fn on_data(&self, email: &Email) -> Result<(), SmtpError>;
+}
+
 #[derive(Clone)]
 pub struct SmtpServer {
-    on_ehlo: Arc<dyn Fn(&str) -> Result<(), SmtpError> + Send + Sync>,
-    on_auth: Arc<dyn Fn(&str, &str) -> Result<bool, SmtpError> + Send + Sync>,
-    on_mail_from: Arc<dyn Fn(&str) -> Result<(), SmtpError> + Send + Sync>,
-    on_rcpt_to: Arc<dyn Fn(&str) -> Result<(), SmtpError> + Send + Sync>,
-    on_data: Arc<dyn Fn(&Email) -> Result<(), SmtpError> + Send + Sync>,
+    callbacks: Arc<dyn SmtpCallbacks>,
 }
 
 impl SmtpServer {
-    pub fn new() -> Self {
+    pub fn new<T: SmtpCallbacks + 'static>(callbacks: T) -> Self {
         SmtpServer {
-            on_ehlo: Arc::new(|_| Ok(())),
-            on_auth: Arc::new(|_, _| Ok(true)),
-            on_mail_from: Arc::new(|_| Ok(())),
-            on_rcpt_to: Arc::new(|_| Ok(())),
-            on_data: Arc::new(|_| Ok(())),
+            callbacks: Arc::new(callbacks),
         }
-    }
-
-    pub fn on_ehlo<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&str) -> Result<(), SmtpError> + Send + Sync + 'static,
-    {
-        self.on_ehlo = Arc::new(f);
-        self
-    }
-
-    pub fn on_auth<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&str, &str) -> Result<bool, SmtpError> + Send + Sync + 'static,
-    {
-        self.on_auth = Arc::new(f);
-        self
-    }
-
-    pub fn on_mail_from<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&str) -> Result<(), SmtpError> + Send + Sync + 'static,
-    {
-        self.on_mail_from = Arc::new(f);
-        self
-    }
-
-    pub fn on_rcpt_to<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&str) -> Result<(), SmtpError> + Send + Sync + 'static,
-    {
-        self.on_rcpt_to = Arc::new(f);
-        self
-    }
-
-    pub fn on_data<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&Email) -> Result<(), SmtpError> + Send + Sync + 'static,
-    {
-        self.on_data = Arc::new(f);
-        self
     }
 
     pub async fn handle_client(&self, mut socket: TcpStream) -> Result<()> {
@@ -132,7 +94,7 @@ impl SmtpServer {
 
             if let SessionState::ReceivingData = session.state {
                 session.parse_email_body(&buffer[..n]).await?;
-                (self.on_data)(&session.email)?;
+                self.callbacks.on_data(&session.email).await?;
                 socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
                 session.state = SessionState::Authenticated;
                 continue;
@@ -163,7 +125,7 @@ impl SmtpServer {
     ) -> Result<bool> {
         match (&session.state, command) {
             (SessionState::Connected, SmtpCommand::Ehlo(domain)) => {
-                (self.on_ehlo)(&domain)?;
+                self.callbacks.on_ehlo(&domain).await?;
                 socket
                     .write_all(b"250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n")
                     .await
@@ -196,13 +158,13 @@ impl SmtpServer {
                     .await?;
             }
             (SessionState::Authenticated, SmtpCommand::MailFrom(from)) => {
-                (self.on_mail_from)(&from)?;
+                self.callbacks.on_mail_from(&from).await?;
                 session.email.from = from;
                 socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
                 session.state = SessionState::ReceivingMailFrom;
             }
             (SessionState::ReceivingMailFrom, SmtpCommand::RcptTo(to)) => {
-                (self.on_rcpt_to)(&to)?;
+                self.callbacks.on_rcpt_to(&to).await?;
                 session.email.to = to;
                 socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
                 session.state = SessionState::ReceivingRcptTo;
@@ -269,7 +231,7 @@ impl SmtpServer {
         password: &str,
         socket: &mut TcpStream,
     ) -> Result<()> {
-        match (self.on_auth)(username, password) {
+        match self.callbacks.on_auth(username, password).await {
             Ok(true) => {
                 session.state = SessionState::Authenticated;
                 socket
