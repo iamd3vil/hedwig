@@ -13,7 +13,7 @@ impl SmtpCallbacks for MySmtpCallbacks {
     }
 
     async fn on_auth(&self, username: &str, password: &str) -> Result<bool, SmtpError> {
-        println!("Auth attempt: {}:{}", username, password);
+        // println!("Auth attempt: {}:{}", username, password);
         Ok(username == "test" && password == "test")
     }
 
@@ -35,7 +35,7 @@ impl SmtpCallbacks for MySmtpCallbacks {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let smtp_server = SmtpServer::new(MySmtpCallbacks);
+    let smtp_server = SmtpServer::new(MySmtpCallbacks, false);
 
     let listener = TcpListener::bind("127.0.0.1:2525")
         .await

@@ -27,8 +27,11 @@ pub fn parse_command(input: &str, state: &SessionState) -> Result<SmtpCommand, S
         }
         _ => alt((
             map(
-                preceded(tag("EHLO "), take_while1(is_alphanumeric)),
-                |s: &str| SmtpCommand::Ehlo(s.to_string()),
+                preceded(
+                    alt((tag("EHLO "), tag("HELO "), tag("ehlo "), tag("helo "))),
+                    take_while1(is_alphanumeric),
+                ),
+                |domain: &str| SmtpCommand::Ehlo(domain.to_string()),
             ),
             map(
                 preceded(tag("AUTH PLAIN "), take_while1(|c: char| c.is_ascii())),

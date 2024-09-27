@@ -38,11 +38,11 @@ pub enum SmtpError {
 #[derive(Debug)]
 pub struct Email {
     pub from: String,
-    pub to: String,
+    pub to: Vec<String>,
     pub body: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum SessionState {
     Connected,
     Greeted,
@@ -66,18 +66,21 @@ pub trait SmtpCallbacks: Send + Sync {
 #[derive(Clone)]
 pub struct SmtpServer {
     callbacks: Arc<dyn SmtpCallbacks>,
+    auth_enabled: bool,
 }
 
 impl SmtpServer {
-    pub fn new<T: SmtpCallbacks + 'static>(callbacks: T) -> Self {
+    pub fn new<T: SmtpCallbacks + 'static>(callbacks: T, auth_enabled: bool) -> Self {
         SmtpServer {
             callbacks: Arc::new(callbacks),
+            auth_enabled,
         }
     }
 
     pub async fn handle_client(&self, mut socket: TcpStream) -> Result<()> {
         let mut session = SmtpSession::new();
-        let mut buffer = [0; 1024];
+        let mut buffer = [0; 4028];
+        let mut data_buffer = Vec::new();
 
         socket
             .write_all(b"220 localhost ESMTP server ready\r\n")
@@ -90,28 +93,35 @@ impl SmtpServer {
                 return Ok(());
             }
 
-            let command = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
-
-            if let SessionState::ReceivingData = session.state {
-                session.parse_email_body(&buffer[..n]).await?;
-                self.callbacks.on_data(&session.email).await?;
-                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
-                session.state = SessionState::Authenticated;
-                continue;
-            }
-
-            match session.parse_command(&command) {
-                Ok(cmd) => {
-                    if self.handle_command(&mut session, cmd, &mut socket).await? {
-                        return Ok(());
-                    }
+            if session.state == SessionState::ReceivingData {
+                data_buffer.extend_from_slice(&buffer[..n]);
+                if let Some(end_index) = data_buffer
+                    .windows(5)
+                    .position(|window| window == b"\r\n.\r\n")
+                {
+                    let email_body = String::from_utf8_lossy(&data_buffer[..end_index]).to_string();
+                    session.email.body = email_body;
+                    self.callbacks.on_data(&session.email).await?;
+                    socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+                    session.state = SessionState::Authenticated;
+                    data_buffer.clear();
+                    continue;
                 }
-                Err(e) => {
-                    eprintln!("Parse error: {}", e);
-                    socket
-                        .write_all(b"500 Syntax error, command unrecognized\r\n")
-                        .await
-                        .into_diagnostic()?;
+            } else {
+                let command = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
+                match parse_command(&command, &session.state) {
+                    Ok(cmd) => {
+                        if self.handle_command(&mut session, cmd, &mut socket).await? {
+                            return Ok(());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Parse error: {}", e);
+                        socket
+                            .write_all(b"500 Syntax error, command unrecognized\r\n")
+                            .await
+                            .into_diagnostic()?;
+                    }
                 }
             }
         }
@@ -130,7 +140,11 @@ impl SmtpServer {
                     .write_all(b"250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n")
                     .await
                     .into_diagnostic()?;
-                session.state = SessionState::Greeted;
+                if self.auth_enabled {
+                    session.state = SessionState::Greeted;
+                } else {
+                    session.state = SessionState::Authenticated;
+                }
             }
             (SessionState::Greeted, SmtpCommand::AuthPlain(auth_data)) => {
                 self.handle_auth_plain(session, auth_data, socket).await?;
@@ -163,11 +177,23 @@ impl SmtpServer {
                 socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
                 session.state = SessionState::ReceivingMailFrom;
             }
-            (SessionState::ReceivingMailFrom, SmtpCommand::RcptTo(to)) => {
+            (SessionState::ReceivingMailFrom, SmtpCommand::RcptTo(to))
+            | (SessionState::ReceivingRcptTo, SmtpCommand::RcptTo(to)) => {
                 self.callbacks.on_rcpt_to(&to).await?;
-                session.email.to = to;
+                session.email.to.push(to); // Consider changing this to a Vec<String> to support multiple recipients
                 socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
                 session.state = SessionState::ReceivingRcptTo;
+            }
+            (SessionState::ReceivingRcptTo, SmtpCommand::MailFrom(from)) => {
+                // Start a new email transaction
+                self.callbacks.on_mail_from(&from).await?;
+                session.email = Email {
+                    from,
+                    to: Vec::with_capacity(1),
+                    body: String::new(),
+                };
+                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+                session.state = SessionState::ReceivingMailFrom;
             }
             (SessionState::ReceivingRcptTo, SmtpCommand::Data) => {
                 socket
@@ -180,13 +206,14 @@ impl SmtpServer {
                 socket.write_all(b"221 Bye\r\n").await.into_diagnostic()?;
                 return Ok(true);
             }
-            _ => {
+            cmd => {
                 if !session.can_accept_mail_commands() {
                     socket
                         .write_all(b"530 Authentication required\r\n")
                         .await
                         .into_diagnostic()?;
                 } else {
+                    eprintln!("Unknown command: {:?}", cmd);
                     socket
                         .write_all(b"500 Unknown command\r\n")
                         .await
@@ -263,7 +290,7 @@ impl SmtpSession {
             state: SessionState::Connected,
             email: Email {
                 from: String::new(),
-                to: String::new(),
+                to: Vec::with_capacity(1),
                 body: String::new(),
             },
         }
@@ -278,64 +305,6 @@ impl SmtpSession {
                 | SessionState::ReceivingRcptTo
         )
     }
-
-    async fn parse_email_body(&mut self, data: &[u8]) -> Result<()> {
-        let mut body = String::new();
-        let chunk = String::from_utf8_lossy(&data);
-        for line in chunk.lines() {
-            if line.trim() == "." {
-                self.email.body = body;
-                self.state = SessionState::Authenticated;
-                break;
-            }
-            body.push_str(&format!("{}\n", line));
-        }
-        Ok(())
-    }
-
-    fn parse_command(&self, input: &str) -> Result<SmtpCommand, SmtpError> {
-        let parse_result: IResult<&str, SmtpCommand> = match self.state {
-            SessionState::AuthenticatingUsername => {
-                map(take_while1(|c: char| c.is_ascii()), |s: &str| {
-                    SmtpCommand::AuthUsername(s.to_string())
-                })(input)
-            }
-            SessionState::AuthenticatingPassword(_) => {
-                map(take_while1(|c: char| c.is_ascii()), |s: &str| {
-                    SmtpCommand::AuthPassword(s.to_string())
-                })(input)
-            }
-            _ => alt((
-                map(
-                    preceded(tag("EHLO "), take_while1(is_alphanumeric)),
-                    |s: &str| SmtpCommand::Ehlo(s.to_string()),
-                ),
-                map(
-                    preceded(tag("AUTH PLAIN "), take_while1(|c: char| c.is_ascii())),
-                    |s: &str| SmtpCommand::AuthPlain(s.to_string()),
-                ),
-                map(tag("AUTH LOGIN"), |_| SmtpCommand::AuthLogin),
-                map(
-                    preceded(tag("MAIL FROM:"), opt(take_while1(is_alphanumeric))),
-                    |_| SmtpCommand::MailFrom(input.trim_start_matches("MAIL FROM:").to_string()),
-                ),
-                map(
-                    preceded(tag("RCPT TO:"), opt(take_while1(is_alphanumeric))),
-                    |_| SmtpCommand::RcptTo(input.trim_start_matches("RCPT TO:").to_string()),
-                ),
-                map(tag("DATA"), |_| SmtpCommand::Data),
-                map(tag("QUIT"), |_| SmtpCommand::Quit),
-            ))(input),
-        };
-
-        match parse_result {
-            Ok((_, command)) => Ok(command),
-            Err(e) => Err(SmtpError::ParseError {
-                message: e.to_string(),
-                span: (0, input.len()).into(),
-            }),
-        }
-    }
 }
 
 pub fn decode_base64(input: &str) -> Result<String, SmtpError> {
@@ -345,8 +314,4 @@ pub fn decode_base64(input: &str) -> Result<String, SmtpError> {
             .map_err(|_| SmtpError::AuthError)?,
     )
     .map_err(|_| SmtpError::AuthError)
-}
-
-fn is_alphanumeric(c: char) -> bool {
-    c.is_alphanumeric() || c == '.' || c == '-'
 }
