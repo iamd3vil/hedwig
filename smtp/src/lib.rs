@@ -206,6 +206,14 @@ impl SmtpServer {
                 socket.write_all(b"221 Bye\r\n").await.into_diagnostic()?;
                 return Ok(true);
             }
+            (_, SmtpCommand::Rset) => {
+                // Reset the session state
+                session.reset();
+                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+            }
+            (_, SmtpCommand::Noop) => {
+                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+            }
             cmd => {
                 if !session.can_accept_mail_commands() {
                     socket
@@ -293,6 +301,18 @@ impl SmtpSession {
                 to: Vec::with_capacity(1),
                 body: String::new(),
             },
+        }
+    }
+
+    fn reset(&mut self) {
+        self.email = Email {
+            from: String::new(),
+            to: Vec::with_capacity(1),
+            body: String::new(),
+        };
+        // Reset the state, but keep authentication
+        if self.state != SessionState::Connected && self.state != SessionState::Greeted {
+            self.state = SessionState::Authenticated;
         }
     }
 

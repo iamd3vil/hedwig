@@ -11,6 +11,8 @@ pub enum SmtpCommand {
     RcptTo(String),
     Data,
     Quit,
+    Rset,
+    Noop,
 }
 
 pub fn parse_command(input: &str, state: &SessionState) -> Result<SmtpCommand, SmtpError> {
@@ -48,6 +50,8 @@ pub fn parse_command(input: &str, state: &SessionState) -> Result<SmtpCommand, S
             ),
             map(tag("DATA"), |_| SmtpCommand::Data),
             map(tag("QUIT"), |_| SmtpCommand::Quit),
+            map(tag("RSET"), |_| SmtpCommand::Rset),
+            map(tag("NOOP"), |_| SmtpCommand::Noop),
         ))(input),
     };
 
