@@ -1,9 +1,24 @@
 use async_trait::async_trait;
-use miette::{Context, IntoDiagnostic, Result};
+use config::CfgStorage;
+use mail_parser::MessageParser;
+use miette::{bail, Context, IntoDiagnostic, Result};
 use smtp::{Email, SmtpCallbacks, SmtpError, SmtpServer};
+use storage::{fs_storage::FileSystemStorage, Storage, StoredEmail};
 use tokio::net::TcpListener;
+use ulid::Ulid;
 
-struct MySmtpCallbacks;
+mod config;
+mod storage;
+
+struct MySmtpCallbacks {
+    storage: Box<dyn Storage>,
+}
+
+impl MySmtpCallbacks {
+    pub fn new(storage: Box<dyn Storage>) -> Self {
+        MySmtpCallbacks { storage }
+    }
+}
 
 #[async_trait]
 impl SmtpCallbacks for MySmtpCallbacks {
@@ -29,18 +44,52 @@ impl SmtpCallbacks for MySmtpCallbacks {
 
     async fn on_data(&self, email: &Email) -> Result<(), SmtpError> {
         println!("Received email: {:?}", email);
+        // Parse email body.
+        let msg = MessageParser::default().parse(&email.body);
+        if let Some(msg) = msg {
+            // Print each header and html, text body.
+            // Check if message_id exists, or else let's generate one.
+            let ulid = Ulid::new().to_string();
+            let message_id = msg.message_id().unwrap_or(&ulid);
+            println!("Message-ID: {}", message_id);
+            let stored_email = StoredEmail {
+                message_id: message_id.to_string(),
+                from: email.from.clone(),
+                to: email.to.clone(),
+                body: email.body.clone(),
+            };
+            // Map any error into a SmtpError.
+            self.storage
+                .put(stored_email)
+                .await
+                .map_err(|e| SmtpError::ParseError {
+                    message: format!("Failed to store email: {}", e),
+                    span: (0, email.body.len()).into(),
+                })?;
+            // TODO: Handle sending the email to the worker later.
+        } else {
+            eprintln!("Error parsing email body, skipping");
+            return Err(SmtpError::ParseError {
+                message: "error parsing email body".into(),
+                span: (0, email.body.len()).into(),
+            });
+        }
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let smtp_server = SmtpServer::new(MySmtpCallbacks, false);
+    // Load the configuration from the file.
+    let cfg = config::Cfg::load("config.toml").wrap_err("error loading configuration")?;
 
-    let listener = TcpListener::bind("127.0.0.1:2525")
+    let storage = get_storage_type(&cfg.storage).wrap_err("error getting storage type")?;
+    let smtp_server = SmtpServer::new(MySmtpCallbacks::new(storage), false);
+
+    let listener = TcpListener::bind(&cfg.server.addr)
         .await
         .into_diagnostic()?;
-    println!("SMTP server listening on port 2525");
+    println!("SMTP server listening on {}", cfg.server.addr);
 
     loop {
         let (socket, _) = listener
@@ -54,5 +103,12 @@ async fn main() -> Result<()> {
                 eprintln!("Error handling client: {:#}", e);
             }
         });
+    }
+}
+
+fn get_storage_type(cfg: &CfgStorage) -> Result<Box<dyn Storage>> {
+    match cfg.storage_type.as_ref() {
+        "fs" => Ok(Box::new(FileSystemStorage::new(cfg.base_path.clone()))),
+        _ => bail!("Unknown storage type: {}", cfg.storage_type),
     }
 }
