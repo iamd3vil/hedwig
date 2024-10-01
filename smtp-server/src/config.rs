@@ -11,6 +11,7 @@ pub struct Cfg {
 #[derive(Debug, Deserialize)]
 pub struct CfgServer {
     pub addr: String,
+    pub workers: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

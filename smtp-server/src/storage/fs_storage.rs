@@ -34,11 +34,11 @@ impl Storage for FileSystemStorage {
         }
     }
 
-    async fn put(&self, email: StoredEmail) -> Result<()> {
+    async fn put(&self, email: StoredEmail) -> Result<Utf8PathBuf> {
         let path = self.file_path(&email.message_id);
         let json = serde_json::to_string(&email).into_diagnostic()?;
-        fs::write(path, json).await.into_diagnostic()?;
-        Ok(())
+        fs::write(&path, json).await.into_diagnostic()?;
+        Ok(path)
     }
 
     async fn delete(&self, key: &str) -> Result<()> {

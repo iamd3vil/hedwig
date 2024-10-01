@@ -18,3 +18,4 @@ config = { version = "0.14.0", default-features = false, features = [
     "async",
     "toml",
 ] }
+async-channel = "2.3.1"

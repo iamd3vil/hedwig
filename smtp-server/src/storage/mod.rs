@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use camino::Utf8PathBuf;
 use miette::Result;
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,6 @@ pub struct StoredEmail {
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<StoredEmail>>;
-    async fn put(&self, email: StoredEmail) -> Result<()>;
+    async fn put(&self, email: StoredEmail) -> Result<Utf8PathBuf>;
     async fn delete(&self, key: &str) -> Result<()>;
 }
