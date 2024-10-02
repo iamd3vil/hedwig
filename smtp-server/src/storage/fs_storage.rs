@@ -1,8 +1,10 @@
 use crate::storage::{Storage, StoredEmail};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
+use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use serde_json;
+use std::pin::Pin;
 use tokio::fs;
 
 pub struct FileSystemStorage {
@@ -18,6 +20,22 @@ impl FileSystemStorage {
 
     fn file_path(&self, key: &str) -> Utf8PathBuf {
         self.base_path.join(format!("{}.json", key))
+    }
+
+    fn create_list_stream(
+        base_path: Utf8PathBuf,
+    ) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>> {
+        Box::pin(async_stream::try_stream! {
+            let mut entries = fs::read_dir(&base_path).await.into_diagnostic()?;
+            while let Some(entry) = entries.next_entry().await.into_diagnostic()? {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    let contents = fs::read_to_string(&path).await.into_diagnostic()?;
+                    let email: StoredEmail = serde_json::from_str(&contents).into_diagnostic()?;
+                    yield email;
+                }
+            }
+        })
     }
 }
 
@@ -47,5 +65,9 @@ impl Storage for FileSystemStorage {
             fs::remove_file(path).await.into_diagnostic()?;
         }
         Ok(())
+    }
+
+    fn list(&self) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>> {
+        Self::create_list_stream(self.base_path.clone())
     }
 }
