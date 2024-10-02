@@ -56,19 +56,16 @@ impl MySmtpCallbacks {
                 body: email.body.clone(),
             };
             // Map any error into a SmtpError.
-            let email_path =
-                self.storage
-                    .put(stored_email)
-                    .await
-                    .map_err(|e| SmtpError::ParseError {
-                        message: format!("Failed to store email: {}", e),
-                        span: (0, email.body.len()).into(),
-                    })?;
-
-            let email_path = email_path.clone();
+            self.storage
+                .put(stored_email)
+                .await
+                .map_err(|e| SmtpError::ParseError {
+                    message: format!("Failed to store email: {}", e),
+                    span: (0, email.body.len()).into(),
+                })?;
 
             // Send the email to the worker.
-            let job = Job::new(email_path);
+            let job = Job::new(message_id.to_owned());
             self.sender_channel
                 .send(job)
                 .await
