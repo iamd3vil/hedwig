@@ -7,7 +7,7 @@ use std::sync::Arc;
 use storage::{fs_storage::FileSystemStorage, Storage, StoredEmail};
 use tokio::net::TcpListener;
 use ulid::Ulid;
-use worker::{worker::Worker, Job};
+use worker::{Job, Worker};
 
 mod config;
 mod storage;
