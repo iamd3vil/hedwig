@@ -28,7 +28,8 @@ impl MySmtpCallbacks {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
             tokio::spawn(async move {
-                let mut worker = Worker::new(receiver_channel, storage_cloned.clone());
+                let mut worker = Worker::new(receiver_channel, storage_cloned.clone())
+                    .expect("Failed to create worker");
                 worker.run().await;
             });
         }
@@ -40,7 +41,7 @@ impl MySmtpCallbacks {
     }
 
     async fn process_email(&self, email: &Email) -> Result<(), SmtpError> {
-        println!("Received email: {:?}", email);
+        // println!("Received email: {:?}", email);
         // Parse email body.
         let msg = MessageParser::default().parse(&email.body);
         if let Some(msg) = msg {
@@ -48,7 +49,6 @@ impl MySmtpCallbacks {
             // Check if message_id exists, or else let's generate one.
             let ulid = Ulid::new().to_string();
             let message_id = msg.message_id().unwrap_or(&ulid);
-            println!("Message-ID: {}", message_id);
             let stored_email = StoredEmail {
                 message_id: message_id.to_string(),
                 from: email.from.clone(),
@@ -86,8 +86,8 @@ impl MySmtpCallbacks {
 
 #[async_trait]
 impl SmtpCallbacks for MySmtpCallbacks {
-    async fn on_ehlo(&self, domain: &str) -> Result<(), SmtpError> {
-        println!("EHLO from {}", domain);
+    async fn on_ehlo(&self, _domain: &str) -> Result<(), SmtpError> {
+        // println!("EHLO from {}", domain);
         Ok(())
     }
 
@@ -96,13 +96,13 @@ impl SmtpCallbacks for MySmtpCallbacks {
         Ok(username == "test" && password == "test")
     }
 
-    async fn on_mail_from(&self, from: &str) -> Result<(), SmtpError> {
-        println!("Mail from: {}", from);
+    async fn on_mail_from(&self, _from: &str) -> Result<(), SmtpError> {
+        // println!("Mail from: {}", from);
         Ok(())
     }
 
-    async fn on_rcpt_to(&self, to: &str) -> Result<(), SmtpError> {
-        println!("Rcpt to: {}", to);
+    async fn on_rcpt_to(&self, _to: &str) -> Result<(), SmtpError> {
+        // println!("Rcpt to: {}", to);
         Ok(())
     }
 
@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
     let storage = get_storage_type(&cfg.storage).wrap_err("error getting storage type")?;
     let smtp_server = SmtpServer::new(
         MySmtpCallbacks::new(storage, cfg.server.workers.unwrap_or(1)),
-        false,
+        true,
     );
 
     let listener = TcpListener::bind(&cfg.server.addr)
