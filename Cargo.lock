@@ -1530,6 +1530,7 @@ dependencies = [
  "smtp",
  "thiserror",
  "tokio",
+ "tokio-rustls 0.26.0",
  "ulid",
 ]
 

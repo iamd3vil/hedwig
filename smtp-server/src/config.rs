@@ -12,12 +12,20 @@ pub struct Cfg {
 pub struct CfgServer {
     pub addr: String,
     pub workers: Option<usize>,
+    pub dkim: Option<CfgDKIM>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CfgStorage {
     pub storage_type: String,
     pub base_path: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CfgDKIM {
+    pub domain: String,
+    pub selector: String,
+    pub private_key: String,
 }
 
 impl Cfg {

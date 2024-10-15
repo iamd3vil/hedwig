@@ -1,10 +1,10 @@
 use async_trait::async_trait;
-use config::CfgStorage;
+use config::{CfgDKIM, CfgStorage};
 use mail_parser::MessageParser;
 use miette::{bail, Context, IntoDiagnostic, Result};
 use smtp::{Email, SmtpCallbacks, SmtpError, SmtpServer};
 use std::sync::Arc;
-use storage::{fs_storage::FileSystemStorage, Storage, StoredEmail};
+use storage::{fs_storage::FileSystemStorage, Status, Storage, StoredEmail};
 use tokio::net::TcpListener;
 use ulid::Ulid;
 use worker::{Job, Worker};
@@ -19,7 +19,7 @@ struct MySmtpCallbacks {
 }
 
 impl MySmtpCallbacks {
-    pub fn new(storage: Box<dyn Storage>, worker_count: usize) -> Self {
+    pub fn new(storage: Box<dyn Storage>, worker_count: usize, dkim: Option<CfgDKIM>) -> Self {
         let (sender_channel, receiver_channel) = async_channel::bounded(1);
 
         let storage = Arc::new(storage);
@@ -27,8 +27,9 @@ impl MySmtpCallbacks {
         for _ in 0..worker_count {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
+            let dkim = dkim.clone();
             tokio::spawn(async move {
-                let mut worker = Worker::new(receiver_channel, storage_cloned.clone())
+                let mut worker = Worker::new(receiver_channel, storage_cloned.clone(), dkim)
                     .expect("Failed to create worker");
                 worker.run().await;
             });
@@ -57,7 +58,7 @@ impl MySmtpCallbacks {
             };
             // Map any error into a SmtpError.
             self.storage
-                .put(stored_email)
+                .put(stored_email, Status::QUEUED)
                 .await
                 .map_err(|e| SmtpError::ParseError {
                     message: format!("Failed to store email: {}", e),
@@ -117,9 +118,19 @@ async fn main() -> Result<()> {
     // Load the configuration from the file.
     let cfg = config::Cfg::load("config.toml").wrap_err("error loading configuration")?;
 
-    let storage = get_storage_type(&cfg.storage).wrap_err("error getting storage type")?;
+    if cfg.server.dkim.is_some() {
+        println!("DKIM is enabled");
+    }
+
+    let storage = get_storage_type(&cfg.storage)
+        .await
+        .wrap_err("error getting storage type")?;
     let smtp_server = SmtpServer::new(
-        MySmtpCallbacks::new(storage, cfg.server.workers.unwrap_or(1)),
+        MySmtpCallbacks::new(
+            storage,
+            cfg.server.workers.unwrap_or(1),
+            cfg.server.dkim.clone(),
+        ),
         true,
     );
 
@@ -143,9 +154,12 @@ async fn main() -> Result<()> {
     }
 }
 
-fn get_storage_type(cfg: &CfgStorage) -> Result<Box<dyn Storage>> {
+async fn get_storage_type(cfg: &CfgStorage) -> Result<Box<dyn Storage>> {
     match cfg.storage_type.as_ref() {
-        "fs" => Ok(Box::new(FileSystemStorage::new(cfg.base_path.clone()))),
+        "fs" => {
+            let st = FileSystemStorage::new(cfg.base_path.clone()).await?;
+            Ok(Box::new(st))
+        }
         _ => bail!("Unknown storage type: {}", cfg.storage_type),
     }
 }

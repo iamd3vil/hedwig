@@ -7,7 +7,7 @@ build:
     cargo build
 
 build-linux $RUSTFLAGS="-C target-feature=+crt-static":
-    cross build --release --target x86_64-unknown-linux-gnu
+    cross build --release --target x86_64-unknown-linux-musl
 
 build-macos $RUSTFLAGS="-C target-feature=+crt-static":
     #!/usr/bin/env sh

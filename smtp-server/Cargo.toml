@@ -25,3 +25,7 @@ email-address-parser = "2.0.0"
 deadpool = "0.12.1"
 hickory-resolver = "0.24.1"
 mail-send = "0.4.9"
+tokio-rustls = { version = "0.26.0", features = [
+    "ring",
+], default-features = false }
+# lettre = "0.11.9"
