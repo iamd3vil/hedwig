@@ -2,20 +2,21 @@ use config::{Config, File};
 use miette::{IntoDiagnostic, Result};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Cfg {
     pub server: CfgServer,
     pub storage: CfgStorage,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct CfgServer {
     pub addr: String,
     pub workers: Option<usize>,
+    pub auth: Option<CfgAuth>,
     pub dkim: Option<CfgDKIM>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct CfgStorage {
     pub storage_type: String,
     pub base_path: String,
@@ -26,6 +27,12 @@ pub struct CfgDKIM {
     pub domain: String,
     pub selector: String,
     pub private_key: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CfgAuth {
+    pub username: String,
+    pub password: String,
 }
 
 impl Cfg {

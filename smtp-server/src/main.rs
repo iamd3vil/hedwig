@@ -1,10 +1,11 @@
 use async_trait::async_trait;
-use config::{CfgDKIM, CfgStorage};
+use config::{Cfg, CfgStorage};
 use mail_parser::MessageParser;
 use miette::{bail, Context, IntoDiagnostic, Result};
 use smtp::{Email, SmtpCallbacks, SmtpError, SmtpServer};
 use std::sync::Arc;
 use storage::{fs_storage::FileSystemStorage, Status, Storage, StoredEmail};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use ulid::Ulid;
 use worker::{Job, Worker};
@@ -14,20 +15,21 @@ mod storage;
 mod worker;
 
 struct MySmtpCallbacks {
+    cfg: Cfg,
     storage: Arc<Box<dyn Storage>>,
     sender_channel: async_channel::Sender<worker::Job>,
 }
 
 impl MySmtpCallbacks {
-    pub fn new(storage: Box<dyn Storage>, worker_count: usize, dkim: Option<CfgDKIM>) -> Self {
+    pub fn new(storage: Box<dyn Storage>, cfg: Cfg) -> Self {
         let (sender_channel, receiver_channel) = async_channel::bounded(1);
 
         let storage = Arc::new(storage);
         // Start workers.
-        for _ in 0..worker_count {
+        for _ in 0..cfg.server.workers.unwrap_or(1) {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
-            let dkim = dkim.clone();
+            let dkim = cfg.server.dkim.clone();
             tokio::spawn(async move {
                 let mut worker = Worker::new(receiver_channel, storage_cloned.clone(), dkim)
                     .expect("Failed to create worker");
@@ -38,6 +40,7 @@ impl MySmtpCallbacks {
         MySmtpCallbacks {
             storage,
             sender_channel,
+            cfg,
         }
     }
 
@@ -93,8 +96,17 @@ impl SmtpCallbacks for MySmtpCallbacks {
     }
 
     async fn on_auth(&self, username: &str, password: &str) -> Result<bool, SmtpError> {
-        // println!("Auth attempt: {}:{}", username, password);
-        Ok(username == "test" && password == "test")
+        match &self.cfg.server.auth {
+            Some(auth) => {
+                // Use constant-time comparison to prevent timing attacks
+                let username_match =
+                    constant_time_eq(username.as_bytes(), auth.username.as_bytes());
+                let password_match =
+                    constant_time_eq(password.as_bytes(), auth.password.as_bytes());
+                Ok(username_match && password_match)
+            }
+            None => Ok(true), // Authentication is disabled
+        }
     }
 
     async fn on_mail_from(&self, _from: &str) -> Result<(), SmtpError> {
@@ -125,14 +137,7 @@ async fn main() -> Result<()> {
     let storage = get_storage_type(&cfg.storage)
         .await
         .wrap_err("error getting storage type")?;
-    let smtp_server = SmtpServer::new(
-        MySmtpCallbacks::new(
-            storage,
-            cfg.server.workers.unwrap_or(1),
-            cfg.server.dkim.clone(),
-        ),
-        true,
-    );
+    let smtp_server = SmtpServer::new(MySmtpCallbacks::new(storage, cfg.clone()), true);
 
     let listener = TcpListener::bind(&cfg.server.addr)
         .await
@@ -162,4 +167,8 @@ async fn get_storage_type(cfg: &CfgStorage) -> Result<Box<dyn Storage>> {
         }
         _ => bail!("Unknown storage type: {}", cfg.storage_type),
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.ct_eq(b).into()
 }
