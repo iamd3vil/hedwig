@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Debug, PartialEq)]
-pub enum SmtpCommand {
+pub(crate) enum SmtpCommand {
     Ehlo(String),
     AuthPlain(String),
     AuthLogin,
@@ -15,7 +15,7 @@ pub enum SmtpCommand {
     Noop,
 }
 
-pub fn parse_command(input: &str, state: &SessionState) -> Result<SmtpCommand, SmtpError> {
+pub(crate) fn parse_command(input: &str, state: &SessionState) -> Result<SmtpCommand, SmtpError> {
     let parse_result: IResult<&str, SmtpCommand> = match state {
         SessionState::AuthenticatingUsername => {
             map(take_while1(|c: char| c.is_ascii()), |s: &str| {

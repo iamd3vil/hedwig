@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 mod parser;
-pub use parser::*;
+use parser::{parse_command, SmtpCommand};
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum SmtpError {
@@ -35,15 +35,19 @@ pub enum SmtpError {
     AuthError,
 }
 
+/// Represents an email message.
 #[derive(Debug)]
 pub struct Email {
+    /// The sender's email address.
     pub from: String,
+    /// A list of recipient email addresses.
     pub to: Vec<String>,
+    /// The full content of the email, including headers and body.
     pub body: String,
 }
 
 #[derive(Debug, PartialEq)]
-pub enum SessionState {
+enum SessionState {
     Connected,
     Greeted,
     AuthenticatingUsername,
@@ -54,22 +58,67 @@ pub enum SessionState {
     ReceivingData,
 }
 
+/// Trait defining callback methods for SMTP server events.
+///
+/// Implementations of this trait can be used to customize the behavior of the SMTP server
+/// at various stages of the SMTP transaction.
 #[async_trait]
 pub trait SmtpCallbacks: Send + Sync {
+    /// Called when a client sends an EHLO command.
+    ///
+    /// # Arguments
+    /// * `domain` - The domain name provided by the client in the EHLO command.
     async fn on_ehlo(&self, domain: &str) -> Result<(), SmtpError>;
+
+    /// Called when a client attempts to authenticate.
+    ///
+    /// # Arguments
+    /// * `username` - The username provided by the client.
+    /// * `password` - The password provided by the client.
+    ///
+    /// # Returns
+    /// `Ok(true)` if authentication is successful, `Ok(false)` or `Err` otherwise.
     async fn on_auth(&self, username: &str, password: &str) -> Result<bool, SmtpError>;
+
+    /// Called when a client sends a MAIL FROM command.
+    ///
+    /// # Arguments
+    /// * `from` - The email address of the sender.
     async fn on_mail_from(&self, from: &str) -> Result<(), SmtpError>;
+
+    /// Called when a client sends an RCPT TO command.
+    ///
+    /// # Arguments
+    /// * `to` - The email address of the recipient.
     async fn on_rcpt_to(&self, to: &str) -> Result<(), SmtpError>;
+
+    /// Called when a client sends the email data.
+    ///
+    /// # Arguments
+    /// * `email` - The `Email` struct containing the parsed email data.
     async fn on_data(&self, email: &Email) -> Result<(), SmtpError>;
 }
 
+/// Represents an SMTP server instance.
 #[derive(Clone)]
 pub struct SmtpServer {
+    // Callbacks for handling various SMTP events.
     callbacks: Arc<dyn SmtpCallbacks>,
+    // Indicates whether authentication is enabled for this server.
     auth_enabled: bool,
 }
 
 impl SmtpServer {
+    /// Creates a new SMTP server instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `callbacks` - An implementation of `SmtpCallbacks` to handle SMTP events.
+    /// * `auth_enabled` - A boolean indicating whether authentication is required.
+    ///
+    /// # Returns
+    ///
+    /// A new `SmtpServer` instance.
     pub fn new<T: SmtpCallbacks + 'static>(callbacks: T, auth_enabled: bool) -> Self {
         SmtpServer {
             callbacks: Arc::new(callbacks),
@@ -77,6 +126,17 @@ impl SmtpServer {
         }
     }
 
+    /// Handles a client connection.
+    ///
+    /// This method processes SMTP commands from the client and manages the SMTP session.
+    ///
+    /// # Arguments
+    ///
+    /// * `socket` - A `TcpStream` representing the client connection.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or failure of the client handling process.
     pub async fn handle_client(&self, mut socket: TcpStream) -> Result<()> {
         let mut session = SmtpSession::new();
         let mut buffer = [0; 4028];
