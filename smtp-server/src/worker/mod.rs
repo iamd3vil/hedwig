@@ -30,6 +30,7 @@ pub struct Worker {
     resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
     pool: SmtpClientPool,
     dkim: Option<CfgDKIM>,
+    disable_outbound: bool,
 }
 
 impl Worker {
@@ -37,6 +38,7 @@ impl Worker {
         channel: Receiver<Job>,
         storage: Arc<Box<dyn Storage>>,
         dkim: Option<CfgDKIM>,
+        disable_outbound: bool,
     ) -> Result<Self> {
         let resolver = TokioAsyncResolver::tokio_from_system_conf()
             .into_diagnostic()
@@ -48,6 +50,7 @@ impl Worker {
             resolver,
             pool,
             dkim,
+            disable_outbound,
         })
     }
 
@@ -81,6 +84,10 @@ impl Worker {
             Some(msg) => msg,
             None => bail!("failed to parse email body"),
         };
+
+        if self.disable_outbound {
+            return self.storage.delete(&job.msg_id, Status::QUEUED).await;
+        }
 
         match self.send_email(&msg).await {
             Ok(_) => self.storage.delete(&job.msg_id, Status::QUEUED).await,

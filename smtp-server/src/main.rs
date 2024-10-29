@@ -31,8 +31,13 @@ impl MySmtpCallbacks {
             let storage_cloned = storage.clone();
             let dkim = cfg.server.dkim.clone();
             tokio::spawn(async move {
-                let mut worker = Worker::new(receiver_channel, storage_cloned.clone(), dkim)
-                    .expect("Failed to create worker");
+                let mut worker = Worker::new(
+                    receiver_channel,
+                    storage_cloned.clone(),
+                    dkim,
+                    cfg.server.disable_outbound.unwrap_or(false),
+                )
+                .expect("Failed to create worker");
                 worker.run().await;
             });
         }
