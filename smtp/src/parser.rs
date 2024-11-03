@@ -2,7 +2,7 @@ use super::*;
 use nom::{
     branch::alt,
     bytes::complete::{tag_no_case, take_while1},
-    combinator::map,
+    combinator::{map, opt},
     sequence::preceded,
     IResult,
 };
@@ -77,7 +77,7 @@ fn parse_ehlo(input: &str) -> IResult<&str, SmtpCommand> {
     map(
         preceded(
             alt((tag_no_case("EHLO "), tag_no_case("HELO "))),
-            take_while1(is_domain_char),
+            take_while1(is_alphanumeric),
         ),
         |domain: &str| SmtpCommand::Ehlo(domain.to_string()),
     )(input)
@@ -99,15 +99,15 @@ fn parse_auth_login(input: &str) -> IResult<&str, SmtpCommand> {
 
 fn parse_mail_from(input: &str) -> IResult<&str, SmtpCommand> {
     map(
-        preceded(tag_no_case("MAIL FROM:"), parse_email_address),
-        |addr: &str| SmtpCommand::MailFrom(addr.trim().to_string()),
+        preceded(tag_no_case("MAIL FROM:"), opt(take_while1(is_alphanumeric))),
+        |_| SmtpCommand::MailFrom(input.trim_start_matches("MAIL FROM:").to_string()),
     )(input)
 }
 
 fn parse_rcpt_to(input: &str) -> IResult<&str, SmtpCommand> {
     map(
-        preceded(tag_no_case("RCPT TO:"), parse_email_address),
-        |addr: &str| SmtpCommand::RcptTo(addr.trim().to_string()),
+        preceded(tag_no_case("RCPT TO:"), opt(take_while1(is_alphanumeric))),
+        |_| SmtpCommand::RcptTo(input.trim_start_matches("RCPT TO:").to_string()),
     )(input)
 }
 
@@ -120,17 +120,8 @@ fn parse_simple_command(input: &str) -> IResult<&str, SmtpCommand> {
     ))(input)
 }
 
-fn parse_email_address(input: &str) -> IResult<&str, &str> {
-    take_while1(is_email_char)(input)
-}
-
-/// Checks if a character is valid in email addresses
-fn is_email_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '.' || c == '-' || c == '@' || c == '_' || c == '+'
-}
-
-/// Checks if a character is valid in domain names
-fn is_domain_char(c: char) -> bool {
+/// Checks if a character is valid char.
+fn is_alphanumeric(c: char) -> bool {
     c.is_alphanumeric() || c == '.' || c == '-'
 }
 
@@ -246,5 +237,59 @@ mod tests {
 
         // Test malformed AUTH PLAIN
         assert!(parse_command("AUTH PLAIN", &SessionState::Connected).is_err());
+    }
+
+    #[test]
+    fn test_mail_rcpt_commands() {
+        // Test MAIL FROM
+        assert_eq!(
+            parse_command("MAIL FROM:<user@example.com>", &SessionState::Connected).unwrap(),
+            SmtpCommand::MailFrom("<user@example.com>".to_string())
+        );
+
+        assert_eq!(
+            parse_command("MAIL FROM: <admin@test.com>", &SessionState::Connected).unwrap(),
+            SmtpCommand::MailFrom(" <admin@test.com>".to_string())
+        );
+
+        // Test RCPT TO
+        assert_eq!(
+            parse_command("RCPT TO:<recipient@domain.com>", &SessionState::Connected).unwrap(),
+            SmtpCommand::RcptTo("<recipient@domain.com>".to_string())
+        );
+
+        assert_eq!(
+            parse_command(
+                "RCPT TO: <multiple@addresses.com>",
+                &SessionState::Connected
+            )
+            .unwrap(),
+            SmtpCommand::RcptTo(" <multiple@addresses.com>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_edge_case_domains() {
+        // Test domains with hyphens
+        assert_eq!(
+            parse_command("EHLO my-domain-name.com", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("my-domain-name.com".to_string())
+        );
+
+        // Test domains with multiple dots
+        assert_eq!(
+            parse_command(
+                "EHLO very.long.subdomain.example.com",
+                &SessionState::Connected
+            )
+            .unwrap(),
+            SmtpCommand::Ehlo("very.long.subdomain.example.com".to_string())
+        );
+
+        // Test single-letter domains
+        assert_eq!(
+            parse_command("EHLO a.b.c", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("a.b.c".to_string())
+        );
     }
 }
