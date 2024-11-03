@@ -118,3 +118,99 @@ impl Storage for FileSystemStorage {
         Self::create_list_stream(self.base_path.clone(), status)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use tempfile::tempdir;
+    use tokio::test;
+
+    async fn create_test_storage() -> (FileSystemStorage, tempfile::TempDir) {
+        let temp_dir = tempdir().into_diagnostic().unwrap();
+        let storage = FileSystemStorage::new(
+            Utf8PathBuf::from_path_buf(temp_dir.path().to_path_buf()).unwrap(),
+        )
+        .await
+        .unwrap();
+        (storage, temp_dir)
+    }
+
+    fn create_test_email(id: &str) -> StoredEmail {
+        StoredEmail {
+            message_id: id.to_string(),
+            from: "sender@example.com".to_string(),
+            to: vec!["recipient@example.com".to_string()],
+            body: "Test email body".to_string(),
+        }
+    }
+
+    #[test]
+    async fn test_put_and_get() {
+        let (storage, _temp) = create_test_storage().await;
+        let email = create_test_email("test1");
+
+        // Test put
+        let path = storage.put(email.clone(), Status::QUEUED).await.unwrap();
+        assert!(path.exists());
+
+        // Test get
+        let retrieved = storage.get("test1", Status::QUEUED).await.unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().message_id, "test1");
+
+        // Test get non-existent
+        let not_found = storage.get("nonexistent", Status::QUEUED).await.unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    async fn test_delete() {
+        let (storage, _temp) = create_test_storage().await;
+        let email = create_test_email("test2");
+
+        storage.put(email, Status::QUEUED).await.unwrap();
+        storage.delete("test2", Status::QUEUED).await.unwrap();
+
+        let not_found = storage.get("test2", Status::QUEUED).await.unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    async fn test_mv() {
+        let (storage, _temp) = create_test_storage().await;
+        let email = create_test_email("test3");
+
+        storage.put(email, Status::QUEUED).await.unwrap();
+        storage
+            .mv("test3", "test3", Status::QUEUED, Status::ERROR)
+            .await
+            .unwrap();
+
+        let not_found = storage.get("test3", Status::QUEUED).await.unwrap();
+        assert!(not_found.is_none());
+
+        let found = storage.get("test3", Status::ERROR).await.unwrap();
+        assert!(found.is_some());
+    }
+
+    #[test]
+    async fn test_list() {
+        let (storage, _temp) = create_test_storage().await;
+
+        // Add multiple emails
+        for i in 1..=3 {
+            let email = create_test_email(&format!("test{}", i));
+            storage.put(email, Status::QUEUED).await.unwrap();
+        }
+
+        let mut count = 0;
+        let mut list_stream = storage.list(Status::QUEUED);
+        while let Some(result) = list_stream.next().await {
+            let email = result.unwrap();
+            assert!(email.message_id.starts_with("test"));
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+}

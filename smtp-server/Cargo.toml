@@ -29,4 +29,4 @@ tokio-rustls = { version = "0.26.0", features = [
     "ring",
 ], default-features = false }
 subtle = "2.6.1"
-# lettre = "0.11.9"
+tempfile = "3.13.0"

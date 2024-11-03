@@ -7,7 +7,7 @@ use std::pin::Pin;
 
 pub mod fs_storage;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct StoredEmail {
     pub message_id: String,
     pub from: String,
