@@ -1,13 +1,6 @@
 use async_trait::async_trait;
 use base64::prelude::*;
 use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
-use nom::{
-    branch::alt,
-    bytes::complete::{tag, take_while1},
-    combinator::{map, opt},
-    sequence::preceded,
-    IResult,
-};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
