@@ -61,7 +61,7 @@ impl DeferredWorker {
     // Helper methods
     async fn handle_permanent_failure(&self, msg_id: &str) -> Result<()> {
         self.storage
-            .mv(msg_id, msg_id, Status::DEFERRED, Status::ERROR)
+            .mv(msg_id, msg_id, Status::DEFERRED, Status::BOUNCED)
             .await
             .wrap_err("moving from deferred to error")
     }
@@ -165,7 +165,7 @@ mod tests {
 
         // Verify the email was moved to error status
         let deferred_email = worker.storage.get("test2", Status::DEFERRED).await.unwrap();
-        let error_email = worker.storage.get("test2", Status::ERROR).await.unwrap();
+        let error_email = worker.storage.get("test2", Status::BOUNCED).await.unwrap();
 
         assert!(deferred_email.is_none());
         assert!(error_email.is_some());

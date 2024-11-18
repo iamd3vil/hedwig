@@ -23,12 +23,12 @@ impl FileSystemStorage {
             .wrap_err("creating base path")?;
 
         // Create queued, deferred, and error directories.
-        let status = [Status::QUEUED, Status::DEFERRED, Status::ERROR];
+        let status = [Status::QUEUED, Status::DEFERRED, Status::BOUNCED];
         for s in status.iter() {
             fs::create_dir_all(base_path.as_ref().join(match s {
                 Status::QUEUED => "queued",
                 Status::DEFERRED => "deferred",
-                Status::ERROR => "error",
+                Status::BOUNCED => "bounced",
             }))
             .await
             .into_diagnostic()
@@ -44,7 +44,7 @@ impl FileSystemStorage {
         match status {
             Status::QUEUED => self.base_path.join("queued"),
             Status::DEFERRED => self.base_path.join("deferred"),
-            Status::ERROR => self.base_path.join("error"),
+            Status::BOUNCED => self.base_path.join("bounced"),
         }
     }
 
@@ -220,14 +220,14 @@ mod tests {
 
         storage.put(email, Status::QUEUED).await.unwrap();
         storage
-            .mv("test3", "test3", Status::QUEUED, Status::ERROR)
+            .mv("test3", "test3", Status::QUEUED, Status::BOUNCED)
             .await
             .unwrap();
 
         let not_found = storage.get("test3", Status::QUEUED).await.unwrap();
         assert!(not_found.is_none());
 
-        let found = storage.get("test3", Status::ERROR).await.unwrap();
+        let found = storage.get("test3", Status::BOUNCED).await.unwrap();
         assert!(found.is_some());
     }
 

@@ -20,7 +20,7 @@ pub struct StoredEmail {
 pub enum Status {
     QUEUED,
     DEFERRED,
-    ERROR,
+    BOUNCED,
 }
 
 #[async_trait]
