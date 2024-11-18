@@ -1,4 +1,7 @@
-use crate::storage::{Status, Storage, StoredEmail};
+use crate::{
+    storage::{Status, Storage, StoredEmail},
+    worker::EmailMetadata,
+};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::Stream;
@@ -50,23 +53,26 @@ impl FileSystemStorage {
         base_path.join(format!("{}.json", key))
     }
 
-    fn create_list_stream(
+    fn meta_file_path(&self, key: &str) -> Utf8PathBuf {
+        let base_path = self.dir(Status::DEFERRED);
+        base_path.join(format!("{}.meta.json", key))
+    }
+
+    fn create_meta_list_stream(
         base_path: Utf8PathBuf,
-        status: Status,
-    ) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<EmailMetadata>> + Send>> {
         Box::pin(async_stream::try_stream! {
-            let base_path = base_path.join(match status {
-                Status::QUEUED => "queued",
-                Status::DEFERRED => "deferred",
-                Status::ERROR => "error",
-            }).clone();
+            let base_path = base_path.join("deferred").clone();
             let mut entries = fs::read_dir(&base_path).await.into_diagnostic()?;
             while let Some(entry) = entries.next_entry().await.into_diagnostic()? {
                 let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                    let contents = fs::read_to_string(&path).await.into_diagnostic()?;
-                    let email: StoredEmail = serde_json::from_str(&contents).into_diagnostic()?;
-                    yield email;
+                // Check for the ".meta.json" suffix instead of just the extension
+                if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
+                    if file_name.ends_with(".meta.json") {
+                        let contents = fs::read_to_string(&path).await.into_diagnostic()?;
+                        let meta: EmailMetadata = serde_json::from_str(&contents).into_diagnostic()?;
+                        yield meta;
+                    }
                 }
             }
         })
@@ -95,6 +101,32 @@ impl Storage for FileSystemStorage {
 
     async fn delete(&self, key: &str, status: Status) -> Result<()> {
         let path = self.file_path(key, status);
+        if fs::metadata(&path).await.is_ok() {
+            fs::remove_file(path).await.into_diagnostic()?;
+        }
+        Ok(())
+    }
+
+    async fn get_meta(&self, key: &str) -> Result<Option<EmailMetadata>> {
+        let path = self.meta_file_path(key);
+        if fs::metadata(&path).await.is_ok() {
+            let contents = fs::read_to_string(&path).await.into_diagnostic()?;
+            let meta: EmailMetadata = serde_json::from_str(&contents).into_diagnostic()?;
+            Ok(Some(meta))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn put_meta(&self, key: &str, meta: &EmailMetadata) -> Result<Utf8PathBuf> {
+        let path = self.meta_file_path(key);
+        let json = serde_json::to_string(meta).into_diagnostic()?;
+        fs::write(&path, json).await.into_diagnostic()?;
+        Ok(path)
+    }
+
+    async fn delete_meta(&self, key: &str) -> Result<()> {
+        let path = self.meta_file_path(key);
         if path.exists() {
             fs::remove_file(path).await.into_diagnostic()?;
         }
@@ -114,8 +146,12 @@ impl Storage for FileSystemStorage {
         Ok(())
     }
 
-    fn list(&self, status: Status) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>> {
-        Self::create_list_stream(self.base_path.clone(), status)
+    // fn list(&self, status: Status) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>> {
+    //     Self::create_list_stream(self.base_path.clone(), status)
+    // }
+
+    fn list_meta(&self) -> Pin<Box<dyn Stream<Item = Result<EmailMetadata>> + Send>> {
+        Self::create_meta_list_stream(self.base_path.clone())
     }
 }
 
@@ -123,6 +159,7 @@ impl Storage for FileSystemStorage {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
     use tokio::test;
 
@@ -194,23 +231,130 @@ mod tests {
         assert!(found.is_some());
     }
 
+    fn create_test_metadata(id: &str) -> EmailMetadata {
+        EmailMetadata {
+            msg_id: id.to_string(),
+            attempts: 1,
+            last_attempt: SystemTime::now(),
+            next_attempt: SystemTime::now() + Duration::from_secs(300), // 5 minutes in the future
+        }
+    }
+
     #[test]
-    async fn test_list() {
+    async fn test_put_and_get_meta() {
+        let (storage, _temp) = create_test_storage().await;
+        let meta = create_test_metadata("test_meta");
+
+        // Test put_meta
+        let path = storage.put_meta("test_meta", &meta).await.unwrap();
+        assert!(path.exists());
+
+        // Test get_meta
+        let retrieved = storage.get_meta("test_meta").await.unwrap();
+        assert!(retrieved.is_some());
+        let retrieved_meta = retrieved.unwrap();
+        assert_eq!(retrieved_meta.msg_id, meta.msg_id);
+        assert_eq!(retrieved_meta.attempts, meta.attempts);
+
+        // Test get_meta for non-existent key
+        let not_found = storage.get_meta("nonexistent").await.unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    async fn test_delete_meta() {
+        let (storage, _temp) = create_test_storage().await;
+        let meta = create_test_metadata("test_meta_delete");
+
+        // Put and then delete metadata
+        storage.put_meta("test_meta_delete", &meta).await.unwrap();
+        storage.delete_meta("test_meta_delete").await.unwrap();
+
+        // Verify it's gone
+        let not_found = storage.get_meta("test_meta_delete").await.unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    async fn test_list_meta() {
         let (storage, _temp) = create_test_storage().await;
 
-        // Add multiple emails
-        for i in 1..=3 {
-            let email = create_test_email(&format!("test{}", i));
-            storage.put(email, Status::QUEUED).await.unwrap();
-        }
+        // Create several metadata entries
+        let meta1 = create_test_metadata("test_meta_1");
+        let meta2 = create_test_metadata("test_meta_2");
 
+        storage.put_meta("test_meta_1", &meta1).await.unwrap();
+        storage.put_meta("test_meta_2", &meta2).await.unwrap();
+
+        // List and collect all metadata
         let mut count = 0;
-        let mut list_stream = storage.list(Status::QUEUED);
-        while let Some(result) = list_stream.next().await {
-            let email = result.unwrap();
-            assert!(email.message_id.starts_with("test"));
+        let mut collected_ids = Vec::new();
+        let mut meta_stream = storage.list_meta();
+        while let Some(meta_result) = meta_stream.next().await {
+            dbg!(&meta_result);
+            let meta = meta_result.unwrap();
+            collected_ids.push(meta.msg_id.clone());
             count += 1;
         }
-        assert_eq!(count, 3);
+
+        assert_eq!(count, 2);
+        assert!(collected_ids.contains(&"test_meta_1".to_string()));
+        assert!(collected_ids.contains(&"test_meta_2".to_string()));
+    }
+
+    #[test]
+    async fn test_meta_operations_with_email() {
+        let (storage, _temp) = create_test_storage().await;
+        let email = create_test_email("test_combined");
+        let meta = create_test_metadata("test_combined");
+
+        // Store both email and metadata
+        storage.put(email.clone(), Status::DEFERRED).await.unwrap();
+        storage.put_meta("test_combined", &meta).await.unwrap();
+
+        // Verify both exist
+        let retrieved_email = storage
+            .get("test_combined", Status::DEFERRED)
+            .await
+            .unwrap();
+        let retrieved_meta = storage.get_meta("test_combined").await.unwrap();
+
+        assert!(retrieved_email.is_some());
+        assert!(retrieved_meta.is_some());
+        assert_eq!(retrieved_meta.unwrap().msg_id, "test_combined");
+
+        // Delete both
+        storage
+            .delete("test_combined", Status::DEFERRED)
+            .await
+            .unwrap();
+        storage.delete_meta("test_combined").await.unwrap();
+
+        // Verify both are gone
+        let email_not_found = storage
+            .get("test_combined", Status::DEFERRED)
+            .await
+            .unwrap();
+        let meta_not_found = storage.get_meta("test_combined").await.unwrap();
+
+        assert!(email_not_found.is_none());
+        assert!(meta_not_found.is_none());
+    }
+
+    #[test]
+    async fn test_meta_timing() {
+        let (storage, _temp) = create_test_storage().await;
+
+        // Create metadata with specific timing
+        let now = SystemTime::now();
+        let mut meta = create_test_metadata("test_timing");
+        meta.last_attempt = now - Duration::from_secs(3600); // 1 hour ago
+        meta.next_attempt = now + Duration::from_secs(3600); // 1 hour in future
+
+        storage.put_meta("test_timing", &meta).await.unwrap();
+
+        let retrieved = storage.get_meta("test_timing").await.unwrap().unwrap();
+        assert!(retrieved.last_attempt <= now);
+        assert!(retrieved.next_attempt > now);
     }
 }

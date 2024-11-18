@@ -620,6 +620,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hedwig"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "async-stream",
+ "async-trait",
+ "camino",
+ "config",
+ "deadpool",
+ "email-address-parser",
+ "futures",
+ "hickory-resolver",
+ "mail-parser",
+ "mail-send",
+ "miette",
+ "serde",
+ "serde_json",
+ "smtp",
+ "subtle",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls 0.26.0",
+ "ulid",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1514,33 +1541,6 @@ name = "smtp-proto"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51b8ad3dd187f0d4debab02ad65405a9919d6a4f7bce25bd64a258781063a53a"
-
-[[package]]
-name = "smtp-server"
-version = "0.1.0"
-dependencies = [
- "async-channel",
- "async-stream",
- "async-trait",
- "camino",
- "config",
- "deadpool",
- "email-address-parser",
- "futures",
- "hickory-resolver",
- "mail-parser",
- "mail-send",
- "miette",
- "serde",
- "serde_json",
- "smtp",
- "subtle",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-rustls 0.26.0",
- "ulid",
-]
 
 [[package]]
 name = "socket2"

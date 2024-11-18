@@ -14,7 +14,9 @@ use mail_send::{
 };
 use miette::{bail, Context, IntoDiagnostic, Result};
 use pool::SmtpClientPool;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
+use std::{sync::Arc, time::Duration};
 use tokio::fs;
 
 use crate::{
@@ -22,7 +24,16 @@ use crate::{
     storage::{Status, Storage},
 };
 
+pub mod deferred_worker;
 mod pool;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EmailMetadata {
+    pub attempts: u32,
+    pub last_attempt: SystemTime,
+    pub next_attempt: SystemTime,
+    pub msg_id: String,
+}
 
 pub struct Worker {
     channel: Receiver<Job>,
@@ -31,6 +42,8 @@ pub struct Worker {
     pool: SmtpClientPool,
     dkim: Option<CfgDKIM>,
     disable_outbound: bool,
+    initial_delay: Duration,
+    max_delay: Duration,
 }
 
 impl Worker {
@@ -51,6 +64,8 @@ impl Worker {
             pool,
             dkim,
             disable_outbound,
+            initial_delay: Duration::from_secs(60),
+            max_delay: Duration::from_secs(60 * 60 * 24),
         })
     }
 
@@ -90,24 +105,44 @@ impl Worker {
         }
 
         match self.send_email(&msg).await {
-            Ok(_) => self.storage.delete(&job.msg_id, Status::QUEUED).await,
+            Ok(_) => {
+                self.storage.delete(&job.msg_id, Status::QUEUED).await?;
+                // Delete any meta file in deferred.
+                self.storage
+                    .delete_meta(&job.msg_id)
+                    .await
+                    .wrap_err("deleting meta file")?;
+                Ok(())
+            }
             Err(e) => {
                 println!("Error sending email: {:?}", e);
-                self.defer_email(&job.msg_id).await
+                self.defer_email(job).await
             }
         }
     }
 
-    async fn defer_email(&self, msg_id: &str) -> Result<()> {
-        self.storage
-            .mv(msg_id, msg_id, Status::QUEUED, Status::DEFERRED)
-            .await
-            .wrap_err("moving email to deferred")?;
+    async fn defer_email(&self, job: &Job) -> Result<()> {
+        let delay = self.initial_delay * (2_u32.pow(job.attempts));
+        let delay = std::cmp::min(delay, self.max_delay);
+
+        let meta = EmailMetadata {
+            msg_id: job.msg_id.clone(),
+            attempts: job.attempts + 1,
+            last_attempt: SystemTime::now(),
+            next_attempt: SystemTime::now() + delay,
+        };
 
         self.storage
-            .delete(msg_id, Status::QUEUED)
+            .put_meta(&job.msg_id, &meta)
             .await
-            .wrap_err("deleting email from queued")
+            .wrap_err("storing meta file")?;
+
+        self.storage
+            .mv(&job.msg_id, &job.msg_id, Status::QUEUED, Status::DEFERRED)
+            .await
+            .wrap_err("moving from queued to deferred")?;
+
+        Ok(())
     }
 
     async fn send_email<'a>(&self, email: &'a Message<'a>) -> Result<()> {
@@ -197,10 +232,11 @@ impl Worker {
 #[derive(Clone)]
 pub struct Job {
     pub msg_id: String,
+    pub attempts: u32,
 }
 
 impl Job {
-    pub fn new(msg_id: String) -> Job {
-        Job { msg_id }
+    pub fn new(msg_id: String, attempts: u32) -> Job {
+        Job { msg_id, attempts }
     }
 }

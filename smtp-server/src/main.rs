@@ -8,6 +8,7 @@ use storage::{fs_storage::FileSystemStorage, Status, Storage, StoredEmail};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use ulid::Ulid;
+use worker::deferred_worker::DeferredWorker;
 use worker::{Job, Worker};
 
 mod config;
@@ -21,10 +22,12 @@ struct MySmtpCallbacks {
 }
 
 impl MySmtpCallbacks {
-    pub fn new(storage: Box<dyn Storage>, cfg: Cfg) -> Self {
-        let (sender_channel, receiver_channel) = async_channel::bounded(1);
-
-        let storage = Arc::new(storage);
+    pub fn new(
+        storage: Arc<Box<dyn Storage>>,
+        sender_channel: async_channel::Sender<Job>,
+        receiver_channel: async_channel::Receiver<Job>,
+        cfg: Cfg,
+    ) -> Self {
         // Start workers.
         for _ in 0..cfg.server.workers.unwrap_or(1) {
             let receiver_channel = receiver_channel.clone();
@@ -74,7 +77,7 @@ impl MySmtpCallbacks {
                 })?;
 
             // Send the email to the worker.
-            let job = Job::new(message_id.to_owned());
+            let job = Job::new(message_id.to_owned(), 0);
             self.sender_channel
                 .send(job)
                 .await
@@ -139,10 +142,32 @@ async fn main() -> Result<()> {
         println!("DKIM is enabled");
     }
 
+    // Initialize channels for background processing of emails.
+    let (sender_channel, receiver_channel) = async_channel::bounded(1);
+
+    // Initialize storage.
     let storage = get_storage_type(&cfg.storage)
         .await
         .wrap_err("error getting storage type")?;
-    let smtp_server = SmtpServer::new(MySmtpCallbacks::new(storage, cfg.clone()), true);
+    let storage = Arc::new(storage);
+    let smtp_server = SmtpServer::new(
+        MySmtpCallbacks::new(
+            storage.clone(),
+            sender_channel.clone(),
+            receiver_channel.clone(),
+            cfg.clone(),
+        ),
+        true,
+    );
+
+    // Start the deferred worker.
+    tokio::spawn(async move {
+        let worker = DeferredWorker::new(storage, sender_channel.clone());
+        let res = worker.process_deferred_jobs().await;
+        if let Err(e) = res {
+            eprintln!("Error running deferred worker: {:#}", e);
+        }
+    });
 
     let listener = TcpListener::bind(&cfg.server.addr)
         .await

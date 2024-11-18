@@ -1,5 +1,5 @@
 [package]
-name = "smtp-server"
+name = "hedwig"
 version = "0.1.0"
 edition = "2021"
 
