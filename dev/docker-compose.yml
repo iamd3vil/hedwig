@@ -1,0 +1,59 @@
+services:
+  dns:
+    image: coredns/coredns
+    command: -conf /etc/coredns/Corefile
+    volumes:
+      - ./Corefile:/etc/coredns/Corefile
+    networks:
+      smtp_test:
+        ipv4_address: 172.20.0.2
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025"
+    volumes:
+      - ./certs:/certs
+    environment:
+      - MP_SMTP_BIND_ADDR=0.0.0.0:25
+      - MP_SMTP_TLS_CERT=/certs/mailpit.pem
+      - MP_SMTP_TLS_KEY=/certs/mailpit-key.pem
+      - MP_SMTP_AUTH_ALLOW_INSECURE=true
+      - MP_MAX_MESSAGES=20
+    networks:
+      smtp_test:
+        ipv4_address: 172.20.0.3
+        aliases:
+          - mailpit
+
+  smtp:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ../:/app
+      - ../target:/app/target
+    environment:
+      - RUST_LOG=debug
+      - DNS_SERVER=172.20.0.2
+    dns:
+      - 172.20.0.2
+    networks:
+      smtp_test:
+        aliases:
+          - smtp
+    ports:
+      - "2525:2525"
+    depends_on:
+      - dns
+      - mailpit
+
+volumes:
+  target:
+
+networks:
+  smtp_test:
+    name: smtp_test
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

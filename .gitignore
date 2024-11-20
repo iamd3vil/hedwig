@@ -1,3 +1,4 @@
 /target
 /tmp
 config.toml
+certs/
