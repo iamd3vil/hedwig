@@ -11,6 +11,7 @@ use mail_send::{
         dkim::DkimSigner,
     },
     smtp::message::Message as EmailMessage,
+    Error,
 };
 use miette::{bail, Context, IntoDiagnostic, Result};
 use pool::SmtpClientPool;
@@ -115,8 +116,24 @@ impl Worker {
                 Ok(())
             }
             Err(e) => {
-                println!("Error sending email: {:?}", e);
-                self.defer_email(job).await
+                match e.downcast_ref::<Error>() {
+                    Some(Error::UnexpectedReply(resp)) => {
+                        if Self::is_retryable(resp.code()) {
+                            // Defer the email.
+                            println!("Error sending email: {:?}", e);
+                            self.defer_email(job).await?;
+                        }
+                        Ok(())
+                    }
+                    _ => {
+                        // Bounce the email.
+                        println!("Error sending email: {:?}", e);
+                        self.storage
+                            .mv(&job.msg_id, &job.msg_id, Status::QUEUED, Status::BOUNCED)
+                            .await
+                            .wrap_err("moving from queued to bounced")
+                    }
+                }
             }
         }
     }
@@ -177,59 +194,77 @@ impl Worker {
             if mx.iter().count() == 0 {
                 continue;
             }
-            // Sort by priority.
-            let mx = mx.iter().min_by_key(|mx| mx.preference()).unwrap();
 
             let raw_message = email.raw_message.clone();
-
-            // Send email to mx record.
             let message = EmailMessage::new(from.to_string(), vec![to.to_string()], raw_message);
 
-            let mut client = self
-                .pool
-                .get_client(mx.exchange().to_string().as_ref(), 25)
-                .await
-                .unwrap();
-
-            if let Some(dkim) = &self.dkim {
-                let priv_key = fs::read(&dkim.private_key)
+            // Try each MX record in order of preference
+            let mut success = false;
+            for mx_record in mx.iter().collect::<Vec<_>>() {
+                match self
+                    .pool
+                    .get_client(mx_record.exchange().to_string().as_ref(), 25)
                     .await
-                    .into_diagnostic()
-                    .wrap_err("reading private key")?;
+                {
+                    Ok(mut client) => {
+                        // If we get a client, try to send the email
+                        let result = if let Some(dkim) = &self.dkim {
+                            let priv_key = fs::read(&dkim.private_key)
+                                .await
+                                .into_diagnostic()
+                                .wrap_err("reading private key")?;
 
-                let priv_key_str = String::from_utf8(priv_key)
-                    .into_diagnostic()
-                    .wrap_err("converting private key to string")?;
+                            let priv_key_str = String::from_utf8(priv_key)
+                                .into_diagnostic()
+                                .wrap_err("converting private key to string")?;
 
-                let pk_rsa =
-                    RsaKey::<Sha256>::from_rsa_pem(&priv_key_str).expect("error reading priv key");
+                            let pk_rsa = RsaKey::<Sha256>::from_rsa_pem(&priv_key_str)
+                                .expect("error reading priv key");
 
-                let signer = DkimSigner::from_key(pk_rsa)
-                    .domain(&dkim.domain)
-                    .selector(&dkim.selector)
-                    .headers(["From", "To", "Subject"])
-                    .expiration(60 * 60 * 7);
+                            let signer = DkimSigner::from_key(pk_rsa)
+                                .domain(&dkim.domain)
+                                .selector(&dkim.selector)
+                                .headers(["From", "To", "Subject"])
+                                .expiration(60 * 60 * 7);
 
-                client
-                    .send_signed(message, &signer)
-                    .await
-                    .into_diagnostic()
-                    .wrap_err("sending email using client")?;
+                            client.send_signed(message.clone(), &signer).await
+                        } else {
+                            client.send(message.clone()).await
+                        };
 
-                println!("Email sent with DKIM");
-            } else {
-                client
-                    .send(message)
-                    .await
-                    .into_diagnostic()
-                    .wrap_err("sending email using client")?;
+                        match result {
+                            Ok(_) => {
+                                println!("Email sent via MX: {}", mx_record.exchange());
+                                success = true;
+                                break;
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                    Err(e) => {
+                        println!("Failed to connect to MX {}: {:?}", mx_record.exchange(), e);
+                        continue;
+                    }
+                }
+            }
+
+            if !success {
+                bail!("failed to send email through any MX server");
             }
         }
-        return Ok(());
+        Ok(())
+    }
+
+    fn is_retryable(code: u16) -> bool {
+        match code {
+            421 | 450 | 451 | 452 | 454 | 458 | 500 | 501 | 502 | 503 | 504 | 521 | 530 | 550
+            | 551 | 552 | 553 | 554 => true,
+            _ => false,
+        }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Job {
     pub msg_id: String,
     pub attempts: u32,

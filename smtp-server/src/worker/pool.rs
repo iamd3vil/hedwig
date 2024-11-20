@@ -19,6 +19,7 @@ impl Manager for SmtpClientManager {
     async fn create(&self) -> Result<Self::Type, Self::Error> {
         SmtpClientBuilder::new(self.domain.clone(), self.port)
             .helo_host("mailtest.alertify.sh")
+            .allow_invalid_certs()
             .implicit_tls(false)
             .connect()
             .await
