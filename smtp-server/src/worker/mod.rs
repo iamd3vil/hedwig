@@ -255,12 +255,20 @@ impl Worker {
         Ok(())
     }
 
+    /// Determines if a status code indicates the operation can be retried.
+    ///
+    /// Retryable codes include:
+    /// - 421: Service not available, closing transmission channel
+    /// - 450-452, 454, 458: Various temporary failures
+    /// - 500-504: Server errors
+    /// - 521: Server is down
+    /// - 530, 550-554: Authentication/policy failures
     fn is_retryable(code: u16) -> bool {
-        match code {
-            421 | 450 | 451 | 452 | 454 | 458 | 500 | 501 | 502 | 503 | 504 | 521 | 530 | 550
-            | 551 | 552 | 553 | 554 => true,
-            _ => false,
-        }
+        const RETRYABLE_CODES: &[u16] = &[
+            421, 450, 451, 452, 454, 458, 500, 501, 502, 503, 504, 521, 530, 550, 551, 552, 553,
+            554,
+        ];
+        RETRYABLE_CODES.contains(&code)
     }
 }
 
