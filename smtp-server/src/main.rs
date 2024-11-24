@@ -1,145 +1,38 @@
-use async_trait::async_trait;
-use config::{Cfg, CfgStorage};
-use mail_parser::MessageParser;
+use config::CfgStorage;
 use miette::{bail, Context, IntoDiagnostic, Result};
-use smtp::{Email, SmtpCallbacks, SmtpError, SmtpServer};
+use smtp::SmtpServer;
 use std::sync::Arc;
-use storage::{fs_storage::FileSystemStorage, Status, Storage, StoredEmail};
+use storage::{fs_storage::FileSystemStorage, Storage};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use ulid::Ulid;
+use tracing::{debug, error, info};
 use worker::deferred_worker::DeferredWorker;
-use worker::{Job, Worker};
 
+mod callbacks;
 mod config;
 mod storage;
 mod worker;
 
-struct MySmtpCallbacks {
-    cfg: Cfg,
-    storage: Arc<Box<dyn Storage>>,
-    sender_channel: async_channel::Sender<worker::Job>,
-}
-
-impl MySmtpCallbacks {
-    pub fn new(
-        storage: Arc<Box<dyn Storage>>,
-        sender_channel: async_channel::Sender<Job>,
-        receiver_channel: async_channel::Receiver<Job>,
-        cfg: Cfg,
-    ) -> Self {
-        // Start workers.
-        for _ in 0..cfg.server.workers.unwrap_or(1) {
-            let receiver_channel = receiver_channel.clone();
-            let storage_cloned = storage.clone();
-            let dkim = cfg.server.dkim.clone();
-            tokio::spawn(async move {
-                let mut worker = Worker::new(
-                    receiver_channel,
-                    storage_cloned.clone(),
-                    dkim,
-                    cfg.server.disable_outbound.unwrap_or(false),
-                )
-                .expect("Failed to create worker");
-                worker.run().await;
-            });
-        }
-
-        MySmtpCallbacks {
-            storage,
-            sender_channel,
-            cfg,
-        }
-    }
-
-    async fn process_email(&self, email: &Email) -> Result<(), SmtpError> {
-        // println!("Received email: {:?}", email);
-        // Parse email body.
-        let msg = MessageParser::default().parse(&email.body);
-        if let Some(msg) = msg {
-            // Print each header and html, text body.
-            // Check if message_id exists, or else let's generate one.
-            let ulid = Ulid::new().to_string();
-            let message_id = msg.message_id().unwrap_or(&ulid);
-            let stored_email = StoredEmail {
-                message_id: message_id.to_string(),
-                from: email.from.clone(),
-                to: email.to.clone(),
-                body: email.body.clone(),
-            };
-            // Map any error into a SmtpError.
-            self.storage
-                .put(stored_email, Status::QUEUED)
-                .await
-                .map_err(|e| SmtpError::ParseError {
-                    message: format!("Failed to store email: {}", e),
-                    span: (0, email.body.len()).into(),
-                })?;
-
-            // Send the email to the worker.
-            let job = Job::new(message_id.to_owned(), 0);
-            self.sender_channel
-                .send(job)
-                .await
-                .map_err(|e| SmtpError::ParseError {
-                    message: format!("Failed to send email to worker: {}", e),
-                    span: (0, email.body.len()).into(),
-                })?;
-        } else {
-            eprintln!("Error parsing email body, skipping");
-            return Err(SmtpError::ParseError {
-                message: "error parsing email body".into(),
-                span: (0, email.body.len()).into(),
-            });
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl SmtpCallbacks for MySmtpCallbacks {
-    async fn on_ehlo(&self, _domain: &str) -> Result<(), SmtpError> {
-        // println!("EHLO from {}", domain);
-        Ok(())
-    }
-
-    async fn on_auth(&self, username: &str, password: &str) -> Result<bool, SmtpError> {
-        match &self.cfg.server.auth {
-            Some(auth) => {
-                // Use constant-time comparison to prevent timing attacks
-                let username_match =
-                    constant_time_eq(username.as_bytes(), auth.username.as_bytes());
-                let password_match =
-                    constant_time_eq(password.as_bytes(), auth.password.as_bytes());
-                Ok(username_match && password_match)
-            }
-            None => Ok(true), // Authentication is disabled
-        }
-    }
-
-    async fn on_mail_from(&self, _from: &str) -> Result<(), SmtpError> {
-        // println!("Mail from: {}", from);
-        Ok(())
-    }
-
-    async fn on_rcpt_to(&self, _to: &str) -> Result<(), SmtpError> {
-        // println!("Rcpt to: {}", to);
-        Ok(())
-    }
-
-    async fn on_data(&self, email: &Email) -> Result<(), SmtpError> {
-        self.process_email(email).await?;
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize the tracing subscriber
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_line_number(false)
+        .with_level(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("HEDWIG_LOG_LEVEL")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("hedwig=info")),
+        )
+        .init();
+
     // Load the configuration from the file.
     let cfg = config::Cfg::load("config.toml").wrap_err("error loading configuration")?;
 
     if cfg.server.dkim.is_some() {
-        println!("DKIM is enabled");
+        info!("DKIM is enabled");
+    } else {
+        info!("DKIM is disabled");
     }
 
     // Initialize channels for background processing of emails.
@@ -151,7 +44,7 @@ async fn main() -> Result<()> {
         .wrap_err("error getting storage type")?;
     let storage = Arc::new(storage);
     let smtp_server = SmtpServer::new(
-        MySmtpCallbacks::new(
+        callbacks::Callbacks::new(
             storage.clone(),
             sender_channel.clone(),
             receiver_channel.clone(),
@@ -165,14 +58,17 @@ async fn main() -> Result<()> {
         let worker = DeferredWorker::new(storage, sender_channel.clone());
         let res = worker.process_deferred_jobs().await;
         if let Err(e) = res {
-            eprintln!("Error running deferred worker: {:#}", e);
+            error!("Error running deferred worker: {:#}", e);
         }
     });
 
     let listener = TcpListener::bind(&cfg.server.addr)
         .await
         .into_diagnostic()?;
-    println!("SMTP server listening on {}", cfg.server.addr);
+    info!(
+        storage_type = cfg.storage.storage_type,
+        "SMTP server listening on {}", cfg.server.addr
+    );
 
     loop {
         let (socket, _) = listener
@@ -180,10 +76,11 @@ async fn main() -> Result<()> {
             .await
             .into_diagnostic()
             .wrap_err("error accepting tcp connection")?;
+        debug!("Accepted connection");
         let server_clone = smtp_server.clone();
         tokio::spawn(async move {
             if let Err(e) = server_clone.handle_client(socket).await {
-                eprintln!("Error handling client: {:#}", e);
+                error!("Error handling client: {:#}", e);
             }
         });
     }

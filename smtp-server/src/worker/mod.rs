@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use std::{sync::Arc, time::Duration};
 use tokio::fs;
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::CfgDKIM,
@@ -54,6 +55,7 @@ impl Worker {
         dkim: Option<CfgDKIM>,
         disable_outbound: bool,
     ) -> Result<Self> {
+        info!("Initializing SMTP worker");
         let resolver = TokioAsyncResolver::tokio_from_system_conf()
             .into_diagnostic()
             .wrap_err("creating dns resolver")?;
@@ -87,10 +89,11 @@ impl Worker {
     }
 
     async fn process_job(&self, job: &Job) -> Result<()> {
+        debug!(msg_id = ?job.msg_id, "Processing job");
         let email = match self.storage.get(&job.msg_id, Status::QUEUED).await {
             Ok(Some(email)) => email,
             Ok(None) => {
-                println!("Email not found: {:?}", job.msg_id);
+                warn!(msg_id = ?job.msg_id, "Email not found in queue");
                 return self.storage.delete(&job.msg_id, Status::QUEUED).await;
             }
             Err(e) => return Err(e).wrap_err("failed to get email from storage"),
@@ -98,15 +101,23 @@ impl Worker {
 
         let msg = match MessageParser::default().parse(&email.body) {
             Some(msg) => msg,
-            None => bail!("failed to parse email body"),
+            None => {
+                error!(msg_id = ?job.msg_id, "Failed to parse email body");
+                bail!("failed to parse email body")
+            }
         };
 
         if self.disable_outbound {
+            info!(
+                msg_id = job.msg_id,
+                "Outbound mail disabled, dropping message"
+            );
             return self.storage.delete(&job.msg_id, Status::QUEUED).await;
         }
 
         match self.send_email(&msg).await {
             Ok(_) => {
+                info!(msg_id = job.msg_id, "Successfully sent email");
                 self.storage.delete(&job.msg_id, Status::QUEUED).await?;
                 // Delete any meta file in deferred.
                 self.storage
@@ -119,6 +130,11 @@ impl Worker {
                 match e.downcast_ref::<Error>() {
                     Some(Error::UnexpectedReply(resp)) => {
                         if Self::is_retryable(resp.code()) {
+                            warn!(
+                                msg_id = ?job.msg_id,
+                                code = resp.code(),
+                                "Retryable error encountered, deferring email"
+                            );
                             // Defer the email.
                             println!("Error sending email: {:?}", e);
                             self.defer_email(job).await?;
@@ -126,6 +142,7 @@ impl Worker {
                         Ok(())
                     }
                     _ => {
+                        error!(msg_id = ?job.msg_id, ?e, "Non-retryable error, bouncing email");
                         // Bounce the email.
                         println!("Error sending email: {:?}", e);
                         self.storage
@@ -141,6 +158,13 @@ impl Worker {
     async fn defer_email(&self, job: &Job) -> Result<()> {
         let delay = self.initial_delay * (2_u32.pow(job.attempts));
         let delay = std::cmp::min(delay, self.max_delay);
+
+        info!(
+            msg_id = ?job.msg_id,
+            attempts = job.attempts + 1,
+            ?delay,
+            "Deferring email"
+        );
 
         let meta = EmailMetadata {
             msg_id: job.msg_id.clone(),
@@ -174,7 +198,7 @@ impl Worker {
                 .address
                 .as_ref()
                 .unwrap();
-            println!("Sending email to: {}, from: {}", to, from);
+            info!(?to, ?from, "Attempting to send email");
             // Strip `<` and `>` from email address.
             let to = to.trim_matches(|c| c == '<' || c == '>');
             let parsed_email_id = EmailAddress::parse(to, None);
@@ -184,6 +208,8 @@ impl Worker {
 
             let parsed_email_id = parsed_email_id.unwrap();
 
+            debug!(?parsed_email_id, "Looking up MX records");
+
             // Resolve MX record for domain.
             let mx = self
                 .resolver
@@ -192,6 +218,7 @@ impl Worker {
                 .into_diagnostic()
                 .wrap_err("getting mx record")?;
             if mx.iter().count() == 0 {
+                warn!(domain = ?parsed_email_id.get_domain(), "No MX records found");
                 continue;
             }
 
@@ -201,6 +228,7 @@ impl Worker {
             // Try each MX record in order of preference
             let mut success = false;
             for mx_record in mx.iter().collect::<Vec<_>>() {
+                debug!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
                 match self
                     .pool
                     .get_client(mx_record.exchange().to_string().as_ref(), 25)
@@ -209,6 +237,7 @@ impl Worker {
                     Ok(mut client) => {
                         // If we get a client, try to send the email
                         let result = if let Some(dkim) = &self.dkim {
+                            debug!("Signing email with DKIM");
                             let priv_key = fs::read(&dkim.private_key)
                                 .await
                                 .into_diagnostic()
@@ -234,21 +263,25 @@ impl Worker {
 
                         match result {
                             Ok(_) => {
-                                println!("Email sent via MX: {}", mx_record.exchange());
+                                info!(mx = ?mx_record.exchange(), "Email sent successfully");
                                 success = true;
                                 break;
                             }
-                            Err(_) => continue,
+                            Err(e) => {
+                                warn!(mx = ?mx_record.exchange(), ?e, "Failed to send via MX server");
+                                continue;
+                            }
                         }
                     }
                     Err(e) => {
-                        println!("Failed to connect to MX {}: {:?}", mx_record.exchange(), e);
+                        warn!(mx = ?mx_record.exchange(), ?e, "Failed to connect to MX server");
                         continue;
                     }
                 }
             }
 
             if !success {
+                error!(to = ?to, "Failed to send email through any MX server");
                 bail!("failed to send email through any MX server");
             }
         }

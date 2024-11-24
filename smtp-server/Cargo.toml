@@ -30,3 +30,5 @@ tokio-rustls = { version = "0.26.0", features = [
 ], default-features = false }
 subtle = "2.6.1"
 tempfile = "3.13.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
