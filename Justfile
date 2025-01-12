@@ -27,3 +27,6 @@ dev:
     #!/usr/bin/env sh
     cd dev && docker compose up
     cd ..
+
+test:
+    cargo test

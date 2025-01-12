@@ -22,25 +22,24 @@ impl FileSystemStorage {
             .into_diagnostic()
             .wrap_err("creating base path")?;
 
+        // Create instance to use dir method
+        let storage = FileSystemStorage {
+            base_path: base_path.as_ref().to_owned(),
+        };
+
         // Create queued, deferred, and error directories.
         let status = [Status::QUEUED, Status::DEFERRED, Status::BOUNCED];
         for s in status.iter() {
-            fs::create_dir_all(base_path.as_ref().join(match s {
-                Status::QUEUED => "queued",
-                Status::DEFERRED => "deferred",
-                Status::BOUNCED => "bounced",
-            }))
-            .await
-            .into_diagnostic()
-            .wrap_err("creating status directory")?;
+            fs::create_dir_all(storage.dir(s))
+                .await
+                .into_diagnostic()
+                .wrap_err("creating status directory")?;
         }
 
-        Ok(FileSystemStorage {
-            base_path: base_path.as_ref().to_owned(),
-        })
+        Ok(storage)
     }
 
-    fn dir(&self, status: Status) -> Utf8PathBuf {
+    fn dir(&self, status: &Status) -> Utf8PathBuf {
         match status {
             Status::QUEUED => self.base_path.join("queued"),
             Status::DEFERRED => self.base_path.join("deferred"),
@@ -48,13 +47,13 @@ impl FileSystemStorage {
         }
     }
 
-    fn file_path(&self, key: &str, status: Status) -> Utf8PathBuf {
+    fn file_path(&self, key: &str, status: &Status) -> Utf8PathBuf {
         let base_path = self.dir(status);
         base_path.join(format!("{}.json", key))
     }
 
     fn meta_file_path(&self, key: &str) -> Utf8PathBuf {
-        let base_path = self.dir(Status::DEFERRED);
+        let base_path = self.dir(&Status::DEFERRED);
         base_path.join(format!("{}.meta.json", key))
     }
 
@@ -82,7 +81,7 @@ impl FileSystemStorage {
 #[async_trait]
 impl Storage for FileSystemStorage {
     async fn get(&self, key: &str, status: Status) -> Result<Option<StoredEmail>> {
-        let path = self.file_path(key, status);
+        let path = self.file_path(key, &status);
         if path.exists() {
             let contents = fs::read_to_string(&path).await.into_diagnostic()?;
             let email: StoredEmail = serde_json::from_str(&contents).into_diagnostic()?;
@@ -93,14 +92,14 @@ impl Storage for FileSystemStorage {
     }
 
     async fn put(&self, email: StoredEmail, status: Status) -> Result<Utf8PathBuf> {
-        let path = self.file_path(&email.message_id, status);
+        let path = self.file_path(&email.message_id, &status);
         let json = serde_json::to_string(&email).into_diagnostic()?;
         fs::write(&path, json).await.into_diagnostic()?;
         Ok(path)
     }
 
     async fn delete(&self, key: &str, status: Status) -> Result<()> {
-        let path = self.file_path(key, status);
+        let path = self.file_path(key, &status);
         if fs::metadata(&path).await.is_ok() {
             fs::remove_file(path).await.into_diagnostic()?;
         }
@@ -140,8 +139,8 @@ impl Storage for FileSystemStorage {
         src_status: Status,
         dest_status: Status,
     ) -> Result<()> {
-        let src_path = self.file_path(src_key, src_status);
-        let dest_path = self.file_path(dest_key, dest_status);
+        let src_path = self.file_path(src_key, &src_status);
+        let dest_path = self.file_path(dest_key, &dest_status);
         fs::rename(src_path, dest_path).await.into_diagnostic()?;
         Ok(())
     }

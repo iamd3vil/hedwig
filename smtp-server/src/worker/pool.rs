@@ -1,71 +1,58 @@
-use deadpool::managed::{Manager, Metrics, Object, Pool, PoolError};
-use mail_send::{SmtpClient, SmtpClientBuilder};
+use lettre::{transport::smtp::PoolConfig, AsyncSmtpTransport, Tokio1Executor};
 use miette::{Context, IntoDiagnostic, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio_rustls::client::TlsStream;
+use tokio::sync::{Mutex, RwLock};
 
-pub struct SmtpClientManager {
-    domain: String,
-    port: u16,
+pub struct PoolManager {
+    outbound_local: bool,
+    pools: Arc<RwLock<HashMap<String, AsyncSmtpTransport<Tokio1Executor>>>>,
 }
 
-impl Manager for SmtpClientManager {
-    type Type = SmtpClient<TlsStream<TcpStream>>;
-    type Error = miette::Error;
-
-    async fn create(&self) -> Result<Self::Type, Self::Error> {
-        SmtpClientBuilder::new(self.domain.clone(), self.port)
-            .helo_host("mailtest.alertify.sh")
-            .allow_invalid_certs()
-            .implicit_tls(false)
-            .connect()
-            .await
-            .into_diagnostic()
-            .wrap_err("error creating smtp client")
-    }
-
-    async fn recycle(
-        &self,
-        _client: &mut Self::Type,
-        _metrics: &Metrics,
-    ) -> deadpool::managed::RecycleResult<Self::Error> {
-        // For SMTP, we might want to check if the connection is still alive
-        // For simplicity, we'll assume it's always ok to reuse
-        Ok(())
-    }
-}
-
-pub struct SmtpClientPool {
-    pools: Arc<Mutex<HashMap<String, Pool<SmtpClientManager>>>>,
-}
-
-impl SmtpClientPool {
-    pub fn new() -> Self {
-        SmtpClientPool {
-            pools: Arc::new(Mutex::new(HashMap::new())),
+impl PoolManager {
+    pub fn new(outbound_local: bool) -> Self {
+        PoolManager {
+            outbound_local,
+            pools: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    pub async fn get_client(
-        &self,
-        domain: &str,
-        port: u16,
-    ) -> Result<Object<SmtpClientManager>, PoolError<miette::Error>> {
-        let mut pools = self.pools.lock().await;
-        if !pools.contains_key(domain) {
-            let manager = SmtpClientManager {
-                domain: domain.to_string(),
-                port,
-            };
-            let pool = Pool::builder(manager)
-                .max_size(10) // Adjust this value as needed
-                .build()
-                .expect("Failed to build pool");
-            pools.insert(domain.to_string(), pool);
+    pub async fn get(&self, key: &str) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
+        let pools = self.pools.read().await;
+
+        if let Some(transport) = pools.get(key) {
+            Ok(transport.clone())
+        } else {
+            // Drop the read lock before acquiring the write lock.
+            drop(pools);
+
+            let mut pools = self.pools.write().await;
+            // Create a new transport
+            let new_transport = self.get_smtp_client(key).wrap_err("creating transport")?;
+            pools.insert(key.to_string(), new_transport.clone());
+            Ok(new_transport)
         }
-        pools.get(domain).unwrap().get().await
+    }
+
+    pub fn get_smtp_client(&self, domain: &str) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
+        // If outbound_local is set, use builder_dangerous to create a client.
+        if self.outbound_local {
+            return Ok(AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(domain).build());
+        }
+
+        // Try relay first, if it doesn't work let's try starttls.
+        match AsyncSmtpTransport::<Tokio1Executor>::relay(domain) {
+            Ok(transport) => {
+                let pool_cfg = PoolConfig::new().min_idle(10).max_size(100);
+                Ok(transport.pool_config(pool_cfg).build())
+            }
+            Err(_) => {
+                let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(domain)
+                    .into_diagnostic()
+                    .wrap_err("creating transport")?
+                    .build();
+                Ok(transport)
+            }
+        }
     }
 }

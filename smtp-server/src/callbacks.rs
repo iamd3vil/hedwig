@@ -37,6 +37,7 @@ impl Callbacks {
                     storage_cloned.clone(),
                     dkim,
                     cfg.server.disable_outbound.unwrap_or(false),
+                    cfg.server.outbound_local.unwrap_or(false),
                 )
                 .expect("Failed to create worker");
                 worker.run().await;

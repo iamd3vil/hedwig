@@ -4,17 +4,17 @@ use hickory_resolver::{
     name_server::{GenericConnector, TokioRuntimeProvider},
     AsyncResolver, TokioAsyncResolver,
 };
-use mail_parser::{Message, MessageParser};
-use mail_send::{
-    mail_auth::{
-        common::crypto::{RsaKey, Sha256},
-        dkim::DkimSigner,
-    },
-    smtp::message::Message as EmailMessage,
-    Error,
+use lettre::{address::Envelope, Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
+use mail_auth::common::headers::HeaderWriter;
+use mail_auth::{
+    common::crypto::{RsaKey, Sha256},
+    dkim::DkimSigner,
 };
+use mail_parser::{Message, MessageParser};
+use mail_send::Error;
 use miette::{bail, Context, IntoDiagnostic, Result};
-use pool::SmtpClientPool;
+// use pool::SmtpClientPool;
+use pool::PoolManager;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use std::{sync::Arc, time::Duration};
@@ -41,10 +41,20 @@ pub struct Worker {
     channel: Receiver<Job>,
     storage: Arc<Box<dyn Storage>>,
     resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
-    pool: SmtpClientPool,
+    pool: PoolManager,
     dkim: Option<CfgDKIM>,
+
+    /// outbound_local when set true, all outbound smtp connections will use unencrypted
+    /// connections to the local smtp server. This is useful for testing.
+    // outbound_local: bool,
+
+    /// disable_outbound when set true, all outbound emails will be discarded.
     disable_outbound: bool,
+
+    /// initial_delay is the initial delay before retrying a deferred email.
     initial_delay: Duration,
+
+    /// max_delay is the maximum delay before retrying a deferred email.
     max_delay: Duration,
 }
 
@@ -54,12 +64,13 @@ impl Worker {
         storage: Arc<Box<dyn Storage>>,
         dkim: Option<CfgDKIM>,
         disable_outbound: bool,
+        outbound_local: bool,
     ) -> Result<Self> {
         info!("Initializing SMTP worker");
         let resolver = TokioAsyncResolver::tokio_from_system_conf()
             .into_diagnostic()
             .wrap_err("creating dns resolver")?;
-        let pool = SmtpClientPool::new();
+        let pool = PoolManager::new(outbound_local);
         Ok(Worker {
             channel,
             storage,
@@ -222,62 +233,81 @@ impl Worker {
                 continue;
             }
 
-            let raw_message = email.raw_message.clone();
-            let message = EmailMessage::new(from.to_string(), vec![to.to_string()], raw_message);
+            // let raw_message = email.raw_message.clone();
+            // let emessage = EmailMessage::new(from.to_string(), vec![to.to_string()], raw_message);
+
+            let from: String = email
+                .from()
+                .unwrap()
+                .first()
+                .unwrap()
+                .address()
+                .as_ref()
+                .unwrap()
+                .to_string();
+
+            let from_address: Address = from.as_str().parse().unwrap();
+            let to_address: Address = to.to_string().parse().unwrap();
+
+            let envelope = Envelope::new(Some(from_address), vec![to_address]).unwrap();
 
             // Try each MX record in order of preference
             let mut success = false;
             for mx_record in mx.iter().collect::<Vec<_>>() {
-                debug!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
-                match self
-                    .pool
-                    .get_client(mx_record.exchange().to_string().as_ref(), 25)
-                    .await
-                {
-                    Ok(mut client) => {
-                        // If we get a client, try to send the email
-                        let result = if let Some(dkim) = &self.dkim {
-                            debug!("Signing email with DKIM");
-                            let priv_key = fs::read(&dkim.private_key)
-                                .await
-                                .into_diagnostic()
-                                .wrap_err("reading private key")?;
+                info!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
+                // let transport: AsyncSmtpTransport<Tokio1Executor> =
+                //     AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(
+                //         mx_record.exchange().to_string(),
+                //     )
+                //     // .into_diagnostic()
+                //     // .wrap_err("creating transport")?
+                //     .build();
 
-                            let priv_key_str = String::from_utf8(priv_key)
-                                .into_diagnostic()
-                                .wrap_err("converting private key to string")?;
+                let transport: AsyncSmtpTransport<Tokio1Executor> =
+                    self.pool.get(&mx_record.exchange().to_string()).await?;
 
-                            let pk_rsa = RsaKey::<Sha256>::from_rsa_pem(&priv_key_str)
-                                .expect("error reading priv key");
+                if let Some(dkim) = &self.dkim {
+                    debug!("Signing email with DKIM");
+                    let priv_key = fs::read(&dkim.private_key)
+                        .await
+                        .into_diagnostic()
+                        .wrap_err("reading private key")?;
 
-                            let signer = DkimSigner::from_key(pk_rsa)
-                                .domain(&dkim.domain)
-                                .selector(&dkim.selector)
-                                .headers(["From", "To", "Subject"])
-                                .expiration(60 * 60 * 7);
+                    let priv_key_str = String::from_utf8(priv_key)
+                        .into_diagnostic()
+                        .wrap_err("converting private key to string")?;
 
-                            client.send_signed(message.clone(), &signer).await
-                        } else {
-                            client.send(message.clone()).await
-                        };
+                    let pk_rsa = RsaKey::<Sha256>::from_rsa_pem(&priv_key_str)
+                        .expect("error reading priv key");
 
-                        match result {
-                            Ok(_) => {
-                                info!(mx = ?mx_record.exchange(), "Email sent successfully");
-                                success = true;
-                                break;
-                            }
-                            Err(e) => {
-                                warn!(mx = ?mx_record.exchange(), ?e, "Failed to send via MX server");
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(mx = ?mx_record.exchange(), ?e, "Failed to connect to MX server");
-                        continue;
-                    }
-                }
+                    let signature = DkimSigner::from_key(pk_rsa)
+                        .domain(&dkim.domain)
+                        .selector(&dkim.selector)
+                        .headers(["From", "To", "Subject"])
+                        .expiration(60 * 60 * 7)
+                        .sign(&email.raw_message())
+                        .into_diagnostic()
+                        .wrap_err("signing message")?
+                        .to_header();
+
+                    let raw_email = &email.raw_message();
+                    // Insert DKIM signature.
+                    let raw_email = Self::insert_dkim_signature(raw_email, &signature)?;
+
+                    transport
+                        .send_raw(&envelope, &raw_email)
+                        .await
+                        .into_diagnostic()
+                        .wrap_err("sending raw message")?;
+                    success = true
+                } else {
+                    transport
+                        .send_raw(&envelope, &email.raw_message())
+                        .await
+                        .into_diagnostic()
+                        .wrap_err("sending raw message")?;
+                    success = true
+                };
             }
 
             if !success {
@@ -302,6 +332,51 @@ impl Worker {
             554,
         ];
         RETRYABLE_CODES.contains(&code)
+    }
+
+    /// Inserts a DKIM signature into a raw email body.
+    /// The signature should be inserted after the last existing header but before the message body.
+    pub fn insert_dkim_signature(raw_email: &[u8], dkim_signature: &str) -> Result<Vec<u8>> {
+        // Convert raw email to string for easier manipulation
+        let email_str = String::from_utf8(raw_email.to_vec()).into_diagnostic()?;
+
+        // Find the boundary between headers and body
+        // Headers and body are separated by \r\n\r\n according to RFC 5322
+        let parts: Vec<&str> = email_str.split("\r\n\r\n").collect();
+
+        if parts.len() < 2 {
+            bail!("Invalid email format: Could not find header-body boundary");
+        }
+
+        // Split headers into lines
+        let headers = parts[0];
+        let body = parts[1];
+
+        // Format DKIM signature as a proper header
+        // Remove any existing DKIM-Signature header if present
+        let headers: Vec<&str> = headers
+            .lines()
+            .filter(|line| !line.starts_with("DKIM-Signature:"))
+            .collect();
+
+        // Construct new email with DKIM signature
+        let mut new_email = String::with_capacity(email_str.len() + dkim_signature.len() + 100);
+
+        // Add existing headers
+        for header in headers {
+            new_email.push_str(header);
+            new_email.push_str("\r\n");
+        }
+
+        // Add DKIM signature
+        new_email.push_str(dkim_signature);
+        new_email.push_str("\r\n");
+
+        // Add separator and body
+        new_email.push_str("\r\n");
+        new_email.push_str(body);
+
+        Ok(new_email.into_bytes())
     }
 }
 

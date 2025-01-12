@@ -15,6 +15,7 @@ pub struct CfgServer {
     pub auth: Option<CfgAuth>,
     pub dkim: Option<CfgDKIM>,
     pub disable_outbound: Option<bool>,
+    pub outbound_local: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
