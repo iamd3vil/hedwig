@@ -9,7 +9,7 @@ use crate::worker::EmailMetadata;
 
 pub mod fs_storage;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct StoredEmail {
     pub message_id: String,
     pub from: String,

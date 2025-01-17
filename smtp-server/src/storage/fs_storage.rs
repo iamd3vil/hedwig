@@ -376,4 +376,47 @@ mod tests {
         assert!(retrieved.last_attempt <= now);
         assert!(retrieved.next_attempt > now);
     }
+
+    #[tokio::test]
+    async fn test_list() -> Result<()> {
+        let (storage, _temp_dir) = create_test_storage().await;
+
+        // Create and store test emails with different statuses
+        let email1 = create_test_email("test1");
+        let email2 = create_test_email("test2");
+        let email3 = create_test_email("test3");
+
+        storage.put(email1.clone(), Status::QUEUED).await?;
+        storage.put(email2.clone(), Status::QUEUED).await?;
+        storage.put(email3.clone(), Status::DEFERRED).await?;
+
+        // Test listing queued emails
+        let mut queued_emails = Vec::new();
+        let mut stream = storage.list(Status::QUEUED);
+        while let Some(email) = stream.next().await {
+            queued_emails.push(email?);
+        }
+        assert_eq!(queued_emails.len(), 2);
+        assert!(queued_emails.contains(&email1));
+        assert!(queued_emails.contains(&email2));
+
+        // Test listing deferred emails
+        let mut deferred_emails = Vec::new();
+        let mut stream = storage.list(Status::DEFERRED);
+        while let Some(email) = stream.next().await {
+            deferred_emails.push(email?);
+        }
+        assert_eq!(deferred_emails.len(), 1);
+        assert!(deferred_emails.contains(&email3));
+
+        // Test listing bounced emails (should be empty)
+        let mut bounced_emails = Vec::new();
+        let mut stream = storage.list(Status::BOUNCED);
+        while let Some(email) = stream.next().await {
+            bounced_emails.push(email?);
+        }
+        assert_eq!(bounced_emails.len(), 0);
+
+        Ok(())
+    }
 }
