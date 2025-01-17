@@ -16,6 +16,7 @@ pub struct CfgServer {
     pub dkim: Option<CfgDKIM>,
     pub disable_outbound: Option<bool>,
     pub outbound_local: Option<bool>,
+    pub pool_size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

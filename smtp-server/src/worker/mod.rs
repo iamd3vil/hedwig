@@ -41,6 +41,7 @@ pub struct Worker {
     channel: Receiver<Job>,
     storage: Arc<Box<dyn Storage>>,
     resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
+
     pool: PoolManager,
     dkim: Option<CfgDKIM>,
 
@@ -65,12 +66,13 @@ impl Worker {
         dkim: Option<CfgDKIM>,
         disable_outbound: bool,
         outbound_local: bool,
+        pool_size: u64,
     ) -> Result<Self> {
         info!("Initializing SMTP worker");
         let resolver = TokioAsyncResolver::tokio_from_system_conf()
             .into_diagnostic()
             .wrap_err("creating dns resolver")?;
-        let pool = PoolManager::new(outbound_local);
+        let pool = PoolManager::new(pool_size, outbound_local);
         Ok(Worker {
             channel,
             storage,

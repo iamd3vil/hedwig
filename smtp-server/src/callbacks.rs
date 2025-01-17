@@ -38,6 +38,7 @@ impl Callbacks {
                     dkim,
                     cfg.server.disable_outbound.unwrap_or(false),
                     cfg.server.outbound_local.unwrap_or(false),
+                    cfg.server.pool_size.unwrap_or(100),
                 )
                 .expect("Failed to create worker");
                 worker.run().await;

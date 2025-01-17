@@ -1,40 +1,40 @@
 use lettre::{transport::smtp::PoolConfig, AsyncSmtpTransport, Tokio1Executor};
 use miette::{Context, IntoDiagnostic, Result};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use moka::future::Cache;
 
 pub struct PoolManager {
     outbound_local: bool,
-    pools: Arc<RwLock<HashMap<String, AsyncSmtpTransport<Tokio1Executor>>>>,
+    pools: Cache<String, AsyncSmtpTransport<Tokio1Executor>>,
 }
 
 impl PoolManager {
-    pub fn new(outbound_local: bool) -> Self {
+    pub fn new(pool_size: u64, outbound_local: bool) -> Self {
+        let cache: Cache<String, AsyncSmtpTransport<Tokio1Executor>> = Cache::new(pool_size);
         PoolManager {
             outbound_local,
-            pools: Arc::new(RwLock::new(HashMap::new())),
+            // pools: Arc::new(RwLock::new(HashMap::new())),
+            pools: cache,
         }
     }
 
     pub async fn get(&self, key: &str) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
-        let pools = self.pools.read().await;
+        let transport = self
+            .pools
+            .try_get_with(key.to_string(), async {
+                self.get_smtp_client(key)
+                    .await
+                    .wrap_err("Failed to create SMTP transport")
+            })
+            .await
+            .map_err(|e| miette::Error::msg(e.to_string()))?;
 
-        if let Some(transport) = pools.get(key) {
-            Ok(transport.clone())
-        } else {
-            // Drop the read lock before acquiring the write lock.
-            drop(pools);
-
-            let mut pools = self.pools.write().await;
-            // Create a new transport
-            let new_transport = self.get_smtp_client(key).wrap_err("creating transport")?;
-            pools.insert(key.to_string(), new_transport.clone());
-            Ok(new_transport)
-        }
+        Ok(transport)
     }
 
-    pub fn get_smtp_client(&self, domain: &str) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
+    pub async fn get_smtp_client(
+        &self,
+        domain: &str,
+    ) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
         // If outbound_local is set, use builder_dangerous to create a client.
         if self.outbound_local {
             return Ok(AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(domain).build());

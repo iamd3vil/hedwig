@@ -1,12 +1,13 @@
 use config::CfgStorage;
+use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
 use smtp::SmtpServer;
 use std::sync::Arc;
-use storage::{fs_storage::FileSystemStorage, Storage};
+use storage::{fs_storage::FileSystemStorage, Status, Storage};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
-use worker::deferred_worker::DeferredWorker;
+use worker::{deferred_worker::DeferredWorker, Job};
 
 mod callbacks;
 mod config;
@@ -52,6 +53,21 @@ async fn main() -> Result<()> {
         ),
         true,
     );
+
+    // Check if there are any emails to process.
+    // Spawn a task to process the emails.
+    info!("checking for any emails to process in queue");
+    let mut emails = storage.list(Status::QUEUED);
+    while let Some(email) = emails.next().await {
+        let email = email.unwrap();
+        let job = Job::new(email.message_id, 0);
+        sender_channel
+            .send(job)
+            .await
+            .into_diagnostic()
+            .wrap_err("error sending job to receiver channel")?;
+    }
+    info!("processed queued emails");
 
     // Start the deferred worker.
     tokio::spawn(async move {

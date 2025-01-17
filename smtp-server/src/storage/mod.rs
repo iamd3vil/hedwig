@@ -38,6 +38,6 @@ pub trait Storage: Send + Sync {
         src_status: Status,
         dest_status: Status,
     ) -> Result<()>;
-    // fn list(&self, status: Status) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>>;
+    fn list(&self, status: Status) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>>;
     fn list_meta(&self) -> Pin<Box<dyn Stream<Item = Result<EmailMetadata>> + Send>>;
 }

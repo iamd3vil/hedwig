@@ -76,6 +76,26 @@ impl FileSystemStorage {
             }
         })
     }
+
+    fn create_list_stream(
+        &self,
+        status: Status,
+    ) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>> {
+        let dir = self.dir(&status).clone();
+        Box::pin(async_stream::try_stream! {
+            let mut entries = fs::read_dir(&dir).await.into_diagnostic()?;
+            while let Some(entry) = entries.next_entry().await.into_diagnostic()? {
+                let path = entry.path();
+                if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
+                    if file_name.ends_with(".json") {
+                        let contents = fs::read_to_string(&path).await.into_diagnostic()?;
+                        let email: StoredEmail = serde_json::from_str(&contents).into_diagnostic()?;
+                        yield email;
+                    }
+                }
+            }
+        })
+    }
 }
 
 #[async_trait]
@@ -145,9 +165,9 @@ impl Storage for FileSystemStorage {
         Ok(())
     }
 
-    // fn list(&self, status: Status) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>> {
-    //     Self::create_list_stream(self.base_path.clone(), status)
-    // }
+    fn list(&self, status: Status) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>> {
+        self.create_list_stream(status)
+    }
 
     fn list_meta(&self) -> Pin<Box<dyn Stream<Item = Result<EmailMetadata>> + Send>> {
         Self::create_meta_list_stream(self.base_path.clone())
