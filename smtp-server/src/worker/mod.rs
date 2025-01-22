@@ -235,9 +235,6 @@ impl Worker {
                 continue;
             }
 
-            // let raw_message = email.raw_message.clone();
-            // let emessage = EmailMessage::new(from.to_string(), vec![to.to_string()], raw_message);
-
             let from: String = email
                 .from()
                 .unwrap()
@@ -256,14 +253,7 @@ impl Worker {
             // Try each MX record in order of preference
             let mut success = false;
             for mx_record in mx.iter().collect::<Vec<_>>() {
-                info!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
-                // let transport: AsyncSmtpTransport<Tokio1Executor> =
-                //     AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(
-                //         mx_record.exchange().to_string(),
-                //     )
-                //     // .into_diagnostic()
-                //     // .wrap_err("creating transport")?
-                //     .build();
+                debug!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
 
                 let transport: AsyncSmtpTransport<Tokio1Executor> =
                     self.pool.get(&mx_record.exchange().to_string()).await?;
@@ -300,7 +290,8 @@ impl Worker {
                         .send_raw(&envelope, &raw_email)
                         .await
                         .into_diagnostic()
-                        .wrap_err("sending raw message")?;
+                        .wrap_err("sending raw message, with dkim")?;
+                    info!("Successfully sent email with DKIM signature");
                     success = true
                 } else {
                     transport
@@ -310,6 +301,10 @@ impl Worker {
                         .wrap_err("sending raw message")?;
                     success = true
                 };
+
+                if success {
+                    break;
+                }
             }
 
             if !success {

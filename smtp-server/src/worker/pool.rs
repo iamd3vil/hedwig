@@ -1,4 +1,7 @@
-use lettre::{transport::smtp::PoolConfig, AsyncSmtpTransport, Tokio1Executor};
+use lettre::{
+    transport::smtp::{client::TlsParameters, PoolConfig},
+    AsyncSmtpTransport, Tokio1Executor,
+};
 use miette::{Context, IntoDiagnostic, Result};
 use moka::future::Cache;
 
@@ -40,19 +43,16 @@ impl PoolManager {
             return Ok(AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(domain).build());
         }
 
-        // Try relay first, if it doesn't work let's try starttls.
-        match AsyncSmtpTransport::<Tokio1Executor>::relay(domain) {
-            Ok(transport) => {
-                let pool_cfg = PoolConfig::new().min_idle(10).max_size(100);
-                Ok(transport.pool_config(pool_cfg).build())
-            }
-            Err(_) => {
-                let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(domain)
-                    .into_diagnostic()
-                    .wrap_err("creating transport")?
-                    .build();
-                Ok(transport)
-            }
-        }
+        let pool_cfg = PoolConfig::new().min_idle(10).max_size(100);
+        let tls_params = TlsParameters::new(domain.into())
+            .into_diagnostic()
+            .wrap_err("tls params")?;
+        let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(domain)
+            .port(25)
+            .tls(lettre::transport::smtp::client::Tls::Required(tls_params))
+            .timeout(Some(std::time::Duration::from_secs(10)))
+            .pool_config(pool_cfg)
+            .build();
+        Ok(transport)
     }
 }
