@@ -29,6 +29,8 @@ use crate::{
 pub mod deferred_worker;
 mod pool;
 
+const DKIM_HEADERS: [&str; 5] = ["From", "To", "Subject", "Date", "Message-ID"];
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct EmailMetadata {
     pub attempts: u32,
@@ -128,7 +130,7 @@ impl Worker {
             return self.storage.delete(&job.msg_id, Status::QUEUED).await;
         }
 
-        match self.send_email(&msg).await {
+        match self.send_email(&msg, &email.body).await {
             Ok(_) => {
                 info!(msg_id = job.msg_id, "Successfully sent email");
                 self.storage.delete(&job.msg_id, Status::QUEUED).await?;
@@ -199,7 +201,7 @@ impl Worker {
         Ok(())
     }
 
-    async fn send_email<'a>(&self, email: &'a Message<'a>) -> Result<()> {
+    async fn send_email<'a>(&self, email: &'a Message<'a>, body: &str) -> Result<()> {
         // Parse to address for each.
         for to in email.to().iter() {
             let to = to.first().unwrap().address.as_ref().unwrap();
@@ -272,17 +274,19 @@ impl Worker {
                     let pk_rsa = RsaKey::<Sha256>::from_rsa_pem(&priv_key_str)
                         .expect("error reading priv key");
 
+                    let raw_email = body.as_bytes();
                     let signature = DkimSigner::from_key(pk_rsa)
                         .domain(&dkim.domain)
                         .selector(&dkim.selector)
-                        .headers(["From", "To", "Subject"])
+                        .headers(DKIM_HEADERS)
                         .expiration(60 * 60 * 7)
-                        .sign(&email.raw_message())
+                        .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                        .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                        .sign(raw_email)
                         .into_diagnostic()
                         .wrap_err("signing message")?
                         .to_header();
 
-                    let raw_email = &email.raw_message();
                     // Insert DKIM signature.
                     let raw_email = Self::insert_dkim_signature(raw_email, &signature)?;
 
@@ -295,7 +299,7 @@ impl Worker {
                     success = true
                 } else {
                     transport
-                        .send_raw(&envelope, &email.raw_message())
+                        .send_raw(&envelope, &body.as_bytes())
                         .await
                         .into_diagnostic()
                         .wrap_err("sending raw message")?;
@@ -347,7 +351,6 @@ impl Worker {
 
         // Split headers into lines
         let headers = parts[0];
-        let body = parts[1];
 
         // Format DKIM signature as a proper header
         // Remove any existing DKIM-Signature header if present
@@ -367,11 +370,17 @@ impl Worker {
 
         // Add DKIM signature
         new_email.push_str(dkim_signature);
+        // new_email.push_str("\r\n");
         new_email.push_str("\r\n");
+        new_email.push_str(parts[1]);
 
-        // Add separator and body
-        new_email.push_str("\r\n");
-        new_email.push_str(body);
+        // If there are more parts, add all the remaining parts of the email.
+        if parts.len() > 2 {
+            for part in parts.iter().skip(2) {
+                new_email.push_str("\r\n\r\n");
+                new_email.push_str(part);
+            }
+        }
 
         Ok(new_email.into_bytes())
     }
