@@ -4,7 +4,7 @@ use nom::{
     bytes::complete::{tag_no_case, take_while1},
     combinator::{map, opt},
     sequence::preceded,
-    IResult,
+    IResult, Parser,
 };
 
 /// Represents valid SMTP commands that can be received from a client
@@ -53,13 +53,15 @@ pub(crate) fn parse_command(input: &str, state: &SessionState) -> Result<SmtpCom
 fn parse_auth_username(input: &str) -> IResult<&str, SmtpCommand> {
     map(take_while1(|c: char| c.is_ascii()), |s: &str| {
         SmtpCommand::AuthUsername(s.to_string())
-    })(input)
+    })
+    .parse(input)
 }
 
 fn parse_auth_password(input: &str) -> IResult<&str, SmtpCommand> {
     map(take_while1(|c: char| c.is_ascii()), |s: &str| {
         SmtpCommand::AuthPassword(s.to_string())
-    })(input)
+    })
+    .parse(input)
 }
 
 fn parse_normal_command(input: &str) -> IResult<&str, SmtpCommand> {
@@ -70,7 +72,8 @@ fn parse_normal_command(input: &str) -> IResult<&str, SmtpCommand> {
         parse_mail_from,
         parse_rcpt_to,
         parse_simple_command,
-    ))(input)
+    ))
+    .parse(input)
 }
 
 fn parse_ehlo(input: &str) -> IResult<&str, SmtpCommand> {
@@ -80,7 +83,8 @@ fn parse_ehlo(input: &str) -> IResult<&str, SmtpCommand> {
             take_while1(is_alphanumeric),
         ),
         |domain: &str| SmtpCommand::Ehlo(domain.to_string()),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn parse_auth_plain(input: &str) -> IResult<&str, SmtpCommand> {
@@ -90,25 +94,28 @@ fn parse_auth_plain(input: &str) -> IResult<&str, SmtpCommand> {
             take_while1(|c: char| c.is_ascii()),
         ),
         |s: &str| SmtpCommand::AuthPlain(s.to_string()),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn parse_auth_login(input: &str) -> IResult<&str, SmtpCommand> {
-    map(tag_no_case("AUTH LOGIN"), |_| SmtpCommand::AuthLogin)(input)
+    map(tag_no_case("AUTH LOGIN"), |_| SmtpCommand::AuthLogin).parse(input)
 }
 
 fn parse_mail_from(input: &str) -> IResult<&str, SmtpCommand> {
     map(
         preceded(tag_no_case("MAIL FROM:"), opt(take_while1(is_alphanumeric))),
         |_| SmtpCommand::MailFrom(input.trim_start_matches("MAIL FROM:").to_string()),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn parse_rcpt_to(input: &str) -> IResult<&str, SmtpCommand> {
     map(
         preceded(tag_no_case("RCPT TO:"), opt(take_while1(is_alphanumeric))),
         |_| SmtpCommand::RcptTo(input.trim_start_matches("RCPT TO:").to_string()),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn parse_simple_command(input: &str) -> IResult<&str, SmtpCommand> {
@@ -117,7 +124,8 @@ fn parse_simple_command(input: &str) -> IResult<&str, SmtpCommand> {
         map(tag_no_case("QUIT"), |_| SmtpCommand::Quit),
         map(tag_no_case("RSET"), |_| SmtpCommand::Rset),
         map(tag_no_case("NOOP"), |_| SmtpCommand::Noop),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Checks if a character is valid char.

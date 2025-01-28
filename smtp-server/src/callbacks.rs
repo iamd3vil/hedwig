@@ -1,3 +1,7 @@
+/// This file defines the callbacks for the SMTP server.
+///
+/// This module implements the `SmtpCallbacks` trait, providing the logic for
+/// handling SMTP commands such as `EHLO`, `AUTH`, `MAIL FROM`, `RCPT TO`, and `DATA`.
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,6 +17,7 @@ use crate::{
     worker::{self, Job, Worker},
 };
 
+/// The Callbacks struct holds the configuration, storage, and sender channel.
 pub struct Callbacks {
     cfg: Cfg,
     storage: Arc<Box<dyn Storage>>,
@@ -20,6 +25,7 @@ pub struct Callbacks {
 }
 
 impl Callbacks {
+    /// Creates a new Callbacks instance.
     pub fn new(
         storage: Arc<Box<dyn Storage>>,
         sender_channel: async_channel::Sender<Job>,
@@ -52,6 +58,7 @@ impl Callbacks {
         }
     }
 
+    /// Processes an email by parsing it, storing it, and sending it to a worker.
     async fn process_email(&self, email: &Email) -> Result<(), SmtpError> {
         // println!("Received email: {:?}", email);
         // Parse email body.
@@ -96,13 +103,16 @@ impl Callbacks {
     }
 }
 
+// Implements the SmtpCallbacks trait for the Callbacks struct.
 #[async_trait]
 impl SmtpCallbacks for Callbacks {
+    // Handles the EHLO command.
     async fn on_ehlo(&self, _domain: &str) -> Result<(), SmtpError> {
         // println!("EHLO from {}", domain);
         Ok(())
     }
 
+    // Handles the AUTH command.
     async fn on_auth(&self, username: &str, password: &str) -> Result<bool, SmtpError> {
         match &self.cfg.server.auth {
             Some(auth) => {
@@ -117,16 +127,19 @@ impl SmtpCallbacks for Callbacks {
         }
     }
 
+    // Handles the MAIL FROM command.
     async fn on_mail_from(&self, _from: &str) -> Result<(), SmtpError> {
         // println!("Mail from: {}", from);
         Ok(())
     }
 
+    // Handles the RCPT TO command.
     async fn on_rcpt_to(&self, _to: &str) -> Result<(), SmtpError> {
         // println!("Rcpt to: {}", to);
         Ok(())
     }
 
+    // Handles the DATA command.
     async fn on_data(&self, email: &Email) -> Result<(), SmtpError> {
         self.process_email(email).await?;
         Ok(())

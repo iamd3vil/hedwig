@@ -1,3 +1,8 @@
+/// File system based storage implementation for email handling.
+///
+/// This module provides a file system based implementation of the `Storage` trait,
+/// allowing emails to be stored and managed on disk in JSON format. Emails are organized
+/// into different directories based on their status (queued, deferred, or bounced).
 use crate::{
     storage::{Status, Storage, StoredEmail},
     worker::EmailMetadata,
@@ -10,11 +15,28 @@ use serde_json;
 use std::pin::Pin;
 use tokio::fs;
 
+/// A storage implementation that uses the file system to store emails and metadata.
+///
+/// Each email is stored as a JSON file, organized in directories based on their status
+/// (queued, deferred, or bounced). The base path contains these status-specific directories.
 pub struct FileSystemStorage {
+    /// Root directory for all email storage
     base_path: Utf8PathBuf,
 }
 
 impl FileSystemStorage {
+    /// Creates a new FileSystemStorage instance with the specified base path.
+    ///
+    /// This will create the necessary directory structure if it doesn't exist:
+    /// - base_path/queued/   - for queued emails
+    /// - base_path/deferred/ - for deferred emails
+    /// - base_path/bounced/  - for bounced emails
+    ///
+    /// # Arguments
+    /// * `base_path` - The root directory path for email storage
+    ///
+    /// # Returns
+    /// * `Result<Self>` - A new FileSystemStorage instance or an error if directory creation fails
     pub async fn new<P: AsRef<Utf8Path>>(base_path: P) -> Result<Self> {
         // Create the base path if it doesn't exist.
         fs::create_dir_all(base_path.as_ref())
@@ -39,6 +61,10 @@ impl FileSystemStorage {
         Ok(storage)
     }
 
+    /// Returns the directory path for a given email status.
+    ///
+    /// # Arguments
+    /// * `status` - The status (QUEUED, DEFERRED, or BOUNCED) to get the directory for
     fn dir(&self, status: &Status) -> Utf8PathBuf {
         match status {
             Status::QUEUED => self.base_path.join("queued"),
@@ -47,16 +73,32 @@ impl FileSystemStorage {
         }
     }
 
+    /// Constructs the full file path for an email with the given key and status.
+    ///
+    /// # Arguments
+    /// * `key` - The email message ID
+    /// * `status` - The status of the email
     fn file_path(&self, key: &str, status: &Status) -> Utf8PathBuf {
         let base_path = self.dir(status);
         base_path.join(format!("{}.json", key))
     }
 
+    /// Constructs the full file path for email metadata with the given key.
+    ///
+    /// # Arguments
+    /// * `key` - The email message ID
     fn meta_file_path(&self, key: &str) -> Utf8PathBuf {
         let base_path = self.dir(&Status::DEFERRED);
         base_path.join(format!("{}.meta.json", key))
     }
 
+    /// Creates a stream that yields email metadata from the deferred directory.
+    ///
+    /// This function reads all .meta.json files from the deferred directory and
+    /// yields their contents as EmailMetadata objects.
+    ///
+    /// # Arguments
+    /// * `base_path` - The root directory containing the deferred subdirectory
     fn create_meta_list_stream(
         base_path: Utf8PathBuf,
     ) -> Pin<Box<dyn Stream<Item = Result<EmailMetadata>> + Send>> {
@@ -77,6 +119,13 @@ impl FileSystemStorage {
         })
     }
 
+    /// Creates a stream that yields stored emails from a specific status directory.
+    ///
+    /// This function reads all .json files from the specified status directory and
+    /// yields their contents as StoredEmail objects.
+    ///
+    /// # Arguments
+    /// * `status` - The status directory to read emails from
     fn create_list_stream(
         &self,
         status: Status,
@@ -100,6 +149,14 @@ impl FileSystemStorage {
 
 #[async_trait]
 impl Storage for FileSystemStorage {
+    /// Retrieves an email by its key and status.
+    ///
+    /// # Arguments
+    /// * `key` - The email message ID
+    /// * `status` - The status of the email to retrieve
+    ///
+    /// # Returns
+    /// * `Result<Option<StoredEmail>>` - The email if found, None if not found
     async fn get(&self, key: &str, status: Status) -> Result<Option<StoredEmail>> {
         let path = self.file_path(key, &status);
         if path.exists() {
@@ -111,6 +168,14 @@ impl Storage for FileSystemStorage {
         }
     }
 
+    /// Stores an email with the specified status.
+    ///
+    /// # Arguments
+    /// * `email` - The email to store
+    /// * `status` - The status to store the email under
+    ///
+    /// # Returns
+    /// * `Result<Utf8PathBuf>` - The path where the email was stored
     async fn put(&self, email: StoredEmail, status: Status) -> Result<Utf8PathBuf> {
         let path = self.file_path(&email.message_id, &status);
         let json = serde_json::to_string(&email).into_diagnostic()?;
@@ -118,6 +183,11 @@ impl Storage for FileSystemStorage {
         Ok(path)
     }
 
+    /// Deletes an email by its key and status.
+    ///
+    /// # Arguments
+    /// * `key` - The email message ID
+    /// * `status` - The status of the email to delete
     async fn delete(&self, key: &str, status: Status) -> Result<()> {
         let path = self.file_path(key, &status);
         if fs::metadata(&path).await.is_ok() {
@@ -126,6 +196,13 @@ impl Storage for FileSystemStorage {
         Ok(())
     }
 
+    /// Retrieves metadata for an email by its key.
+    ///
+    /// # Arguments
+    /// * `key` - The email message ID
+    ///
+    /// # Returns
+    /// * `Result<Option<EmailMetadata>>` - The metadata if found, None if not found
     async fn get_meta(&self, key: &str) -> Result<Option<EmailMetadata>> {
         let path = self.meta_file_path(key);
         if fs::metadata(&path).await.is_ok() {
@@ -137,6 +214,14 @@ impl Storage for FileSystemStorage {
         }
     }
 
+    /// Stores metadata for an email.
+    ///
+    /// # Arguments
+    /// * `key` - The email message ID
+    /// * `meta` - The metadata to store
+    ///
+    /// # Returns
+    /// * `Result<Utf8PathBuf>` - The path where the metadata was stored
     async fn put_meta(&self, key: &str, meta: &EmailMetadata) -> Result<Utf8PathBuf> {
         let path = self.meta_file_path(key);
         let json = serde_json::to_string(meta).into_diagnostic()?;
@@ -144,6 +229,10 @@ impl Storage for FileSystemStorage {
         Ok(path)
     }
 
+    /// Deletes metadata for an email.
+    ///
+    /// # Arguments
+    /// * `key` - The email message ID
     async fn delete_meta(&self, key: &str) -> Result<()> {
         let path = self.meta_file_path(key);
         if path.exists() {
@@ -152,6 +241,13 @@ impl Storage for FileSystemStorage {
         Ok(())
     }
 
+    /// Moves an email from one status to another, potentially with a new key.
+    ///
+    /// # Arguments
+    /// * `src_key` - The source email message ID
+    /// * `dest_key` - The destination email message ID
+    /// * `src_status` - The source status
+    /// * `dest_status` - The destination status
     async fn mv(
         &self,
         src_key: &str,
@@ -165,10 +261,21 @@ impl Storage for FileSystemStorage {
         Ok(())
     }
 
+    /// Lists all emails with a specific status.
+    ///
+    /// # Arguments
+    /// * `status` - The status of emails to list
+    ///
+    /// # Returns
+    /// * Stream of StoredEmail results
     fn list(&self, status: Status) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>> {
         self.create_list_stream(status)
     }
 
+    /// Lists metadata for all emails in the deferred state.
+    ///
+    /// # Returns
+    /// * Stream of EmailMetadata results
     fn list_meta(&self) -> Pin<Box<dyn Stream<Item = Result<EmailMetadata>> + Send>> {
         Self::create_meta_list_stream(self.base_path.clone())
     }

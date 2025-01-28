@@ -5,21 +5,34 @@ use lettre::{
 use miette::{Context, IntoDiagnostic, Result};
 use moka::future::Cache;
 
+/// Manages a pool of SMTP transports.
 pub struct PoolManager {
+    /// Indicates if the outbound connection is to a local server.
     outbound_local: bool,
+    /// A cache of SMTP transports, keyed by domain.
     pools: Cache<String, AsyncSmtpTransport<Tokio1Executor>>,
 }
 
 impl PoolManager {
+    /// Creates a new `PoolManager`.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool_size` - The maximum number of SMTP transports to cache.
+    /// * `outbound_local` - If true, the manager will create a client without TLS.
     pub fn new(pool_size: u64, outbound_local: bool) -> Self {
         let cache: Cache<String, AsyncSmtpTransport<Tokio1Executor>> = Cache::new(pool_size);
         PoolManager {
             outbound_local,
-            // pools: Arc::new(RwLock::new(HashMap::new())),
             pools: cache,
         }
     }
 
+    /// Retrieves an SMTP transport from the pool, creating one if it doesn't exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The domain to get the transport for.
     pub async fn get(&self, key: &str) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
         let transport = self
             .pools
@@ -34,6 +47,11 @@ impl PoolManager {
         Ok(transport)
     }
 
+    /// Creates a new SMTP client.
+    ///
+    /// # Arguments
+    ///
+    /// * `domain` - The domain to create the client for.
     pub async fn get_smtp_client(
         &self,
         domain: &str,

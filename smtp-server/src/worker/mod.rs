@@ -47,10 +47,6 @@ pub struct Worker {
     pool: PoolManager,
     dkim: Option<CfgDKIM>,
 
-    /// outbound_local when set true, all outbound smtp connections will use unencrypted
-    /// connections to the local smtp server. This is useful for testing.
-    // outbound_local: bool,
-
     /// disable_outbound when set true, all outbound emails will be discarded.
     disable_outbound: bool,
 
