@@ -2,7 +2,7 @@ use super::*;
 use nom::{
     branch::alt,
     bytes::complete::{tag_no_case, take_while1},
-    combinator::{map, opt},
+    combinator::{map, opt, verify},
     sequence::preceded,
     IResult, Parser,
 };
@@ -26,6 +26,7 @@ pub(crate) enum SmtpCommand {
     RcptTo(String),
     /// DATA command
     Data,
+    StartTls,
     /// QUIT command
     Quit,
     /// RSET command
@@ -72,6 +73,8 @@ fn parse_normal_command(input: &str) -> IResult<&str, SmtpCommand> {
         parse_mail_from,
         parse_rcpt_to,
         parse_simple_command,
+        // Changed this line to be exact
+        map(tag_no_case("STARTTLS\r\n"), |_| SmtpCommand::StartTls),
     ))
     .parse(input)
 }
@@ -80,7 +83,7 @@ fn parse_ehlo(input: &str) -> IResult<&str, SmtpCommand> {
     map(
         preceded(
             alt((tag_no_case("EHLO "), tag_no_case("HELO "))),
-            take_while1(is_alphanumeric),
+            verify(take_while1(is_alphanumeric), |s: &str| s.len() <= 255),
         ),
         |domain: &str| SmtpCommand::Ehlo(domain.to_string()),
     )
@@ -299,5 +302,118 @@ mod tests {
             parse_command("EHLO a.b.c", &SessionState::Connected).unwrap(),
             SmtpCommand::Ehlo("a.b.c".to_string())
         );
+    }
+
+    #[test]
+    fn test_starttls_command() {
+        // Basic STARTTLS command
+        assert_eq!(
+            parse_command("STARTTLS\r\n", &SessionState::Connected).unwrap(),
+            SmtpCommand::StartTls
+        );
+
+        // Case insensitive
+        assert_eq!(
+            parse_command("starttls\r\n", &SessionState::Connected).unwrap(),
+            SmtpCommand::StartTls
+        );
+
+        // Should fail without CRLF
+        assert!(parse_command("STARTTLS", &SessionState::Connected).is_err());
+
+        // Should fail with parameters
+        assert!(parse_command("STARTTLS param\r\n", &SessionState::Connected).is_err());
+
+        // Should fail with extra spaces
+        assert!(parse_command("STARTTLS \r\n", &SessionState::Connected).is_err());
+        assert!(parse_command(" STARTTLS\r\n", &SessionState::Connected).is_err());
+    }
+
+    #[test]
+    fn test_command_sequence() {
+        // Test typical command sequence
+        let commands = [
+            (
+                "EHLO example.com\r\n",
+                SessionState::Connected,
+                SmtpCommand::Ehlo("example.com".to_string()),
+            ),
+            ("STARTTLS\r\n", SessionState::Greeted, SmtpCommand::StartTls),
+            (
+                "EHLO example.com\r\n",
+                SessionState::Connected,
+                SmtpCommand::Ehlo("example.com".to_string()),
+            ),
+            (
+                "AUTH LOGIN\r\n",
+                SessionState::Greeted,
+                SmtpCommand::AuthLogin,
+            ),
+            (
+                "dXNlcg==\r\n",
+                SessionState::AuthenticatingUsername,
+                SmtpCommand::AuthUsername("dXNlcg==\r\n".to_string()),
+            ),
+            (
+                "cGFzcw==\r\n",
+                SessionState::AuthenticatingPassword("user".to_string()),
+                SmtpCommand::AuthPassword("cGFzcw==\r\n".to_string()),
+            ),
+            (
+                "MAIL FROM:<sender@example.com>\r\n",
+                SessionState::Authenticated,
+                SmtpCommand::MailFrom("<sender@example.com>\r\n".to_string()), // Include CRLF
+            ),
+            (
+                "RCPT TO:<recipient@example.com>\r\n",
+                SessionState::ReceivingMailFrom,
+                SmtpCommand::RcptTo("<recipient@example.com>\r\n".to_string()), // Include CRLF
+            ),
+            ("DATA\r\n", SessionState::ReceivingRcptTo, SmtpCommand::Data),
+        ];
+
+        for (input, state, expected) in commands {
+            assert_eq!(
+                parse_command(input, &state).unwrap(),
+                expected,
+                "Failed to parse '{}' in state {:?}",
+                input,
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn test_state_specific_commands() {
+        // Test that AUTH commands are only valid in certain states
+        assert!(parse_command("dXNlcg==", &SessionState::Connected).is_err());
+
+        // Fix: Only parse username in AuthenticatingUsername state
+        assert!(parse_command("QUIT", &SessionState::Connected).is_ok());
+        assert_eq!(
+            parse_command("QUIT", &SessionState::Connected).unwrap(),
+            SmtpCommand::Quit
+        );
+
+        // Test that DATA is parsed in any state
+        assert_eq!(
+            parse_command("DATA", &SessionState::ReceivingRcptTo).unwrap(),
+            SmtpCommand::Data
+        );
+    }
+
+    #[test]
+    fn test_command_boundaries() {
+        // Test commands with maximum allowed lengths
+        let long_domain = "a".repeat(255); // Maximum domain length
+        assert!(parse_command(&format!("EHLO {}", long_domain), &SessionState::Connected).is_ok());
+
+        // Test with very long input that should fail
+        let too_long_domain = "a".repeat(256);
+        assert!(parse_command(
+            &format!("EHLO {}", too_long_domain),
+            &SessionState::Connected
+        )
+        .is_err());
     }
 }

@@ -1,7 +1,7 @@
 use config::CfgStorage;
 use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
-use smtp::SmtpServer;
+use smtp::{SmtpServer, SmtpStream};
 use std::sync::Arc;
 use storage::{fs_storage::FileSystemStorage, Status, Storage};
 use subtle::ConstantTimeEq;
@@ -95,7 +95,8 @@ async fn main() -> Result<()> {
         debug!("Accepted connection");
         let server_clone = smtp_server.clone();
         tokio::spawn(async move {
-            if let Err(e) = server_clone.handle_client(socket).await {
+            let mut boxed_socket: Box<dyn SmtpStream> = Box::new(socket);
+            if let Err(e) = server_clone.handle_client(&mut boxed_socket).await {
                 error!("Error handling client: {:#}", e);
             }
         });

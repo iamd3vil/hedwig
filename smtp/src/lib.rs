@@ -1,13 +1,52 @@
 use async_trait::async_trait;
 use base64::prelude::*;
 use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
+use std::os::unix::io::AsRawFd; // or windows equivalent
+use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+use rustls::pki_types::CertificateDer;
+use std::path::Path;
+use tokio_rustls::rustls::{self, ServerConfig};
+use tokio_rustls::{server::TlsStream, TlsAcceptor};
 
 mod parser;
 use parser::{parse_command, SmtpCommand};
+
+#[async_trait]
+pub trait SmtpStream: AsyncRead + AsyncWrite + Unpin + Send {
+    async fn write_line(&mut self, line: &[u8]) -> Result<()> {
+        self.write_all(line).await.into_diagnostic()?;
+        Ok(())
+    }
+
+    async fn upgrade_to_tls(
+        &mut self,
+        _acceptor: &TlsAcceptor,
+    ) -> Result<Option<TlsStream<TcpStream>>> {
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl SmtpStream for TcpStream {
+    async fn upgrade_to_tls(
+        &mut self,
+        acceptor: &TlsAcceptor,
+    ) -> Result<Option<TlsStream<TcpStream>>> {
+        let fd = self.as_raw_fd();
+        let stream = unsafe { TcpStream::from_std(std::net::TcpStream::from_raw_fd(fd)) }
+            .into_diagnostic()?;
+        let tls_stream = acceptor.accept(stream).await.into_diagnostic()?;
+        Ok(Some(tls_stream))
+    }
+}
+
+#[async_trait]
+impl SmtpStream for TlsStream<TcpStream> {}
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum SmtpError {
@@ -99,6 +138,9 @@ pub struct SmtpServer {
     callbacks: Arc<dyn SmtpCallbacks>,
     // Indicates whether authentication is enabled for this server.
     auth_enabled: bool,
+
+    // TLS acceptor for handling encrypted connections.
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl SmtpServer {
@@ -116,7 +158,38 @@ impl SmtpServer {
         SmtpServer {
             callbacks: Arc::new(callbacks),
             auth_enabled,
+            tls_acceptor: None,
         }
+    }
+
+    pub fn with_tls(
+        mut self,
+        cert_path: impl AsRef<Path>,
+        key_path: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let cert_file = std::fs::File::open(cert_path)
+            .into_diagnostic()
+            .wrap_err("Failed to open certificate file")?;
+        let key_file = std::fs::File::open(key_path)
+            .into_diagnostic()
+            .wrap_err("Failed to open private key file")?;
+
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+                .collect::<std::io::Result<Vec<_>>>()
+                .into_diagnostic()?;
+
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
+            .into_diagnostic()?
+            .ok_or_else(|| miette::miette!("No private key found"))?;
+
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .into_diagnostic()?;
+
+        self.tls_acceptor = Some(TlsAcceptor::from(Arc::new(config)));
+        Ok(self)
     }
 
     /// Handles a client connection.
@@ -130,18 +203,26 @@ impl SmtpServer {
     /// # Returns
     ///
     /// A `Result` indicating success or failure of the client handling process.
-    pub async fn handle_client(&self, mut socket: TcpStream) -> Result<()> {
+    pub async fn handle_client(&self, socket: &mut Box<dyn SmtpStream>) -> Result<()> {
         let mut session = SmtpSession::new();
+
+        socket
+            .write_line(b"220 localhost ESMTP server ready\r\n")
+            .await?;
+
+        self.handle_connection(&mut session, socket).await
+    }
+
+    async fn handle_connection(
+        &self,
+        session: &mut SmtpSession,
+        stream: &mut Box<dyn SmtpStream>,
+    ) -> Result<()> {
         let mut buffer = [0; 4028];
         let mut data_buffer = Vec::new();
 
-        socket
-            .write_all(b"220 localhost ESMTP server ready\r\n")
-            .await
-            .into_diagnostic()?;
-
         loop {
-            let n = socket.read(&mut buffer).await.into_diagnostic()?;
+            let n = stream.read(&mut buffer).await.into_diagnostic()?;
             if n == 0 {
                 return Ok(());
             }
@@ -155,7 +236,7 @@ impl SmtpServer {
                     let email_body = String::from_utf8_lossy(&data_buffer[..end_index]).to_string();
                     session.email.body = email_body;
                     self.callbacks.on_data(&session.email).await?;
-                    socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+                    stream.write_line(b"250 OK\r\n").await?;
                     session.state = SessionState::Authenticated;
                     data_buffer.clear();
                     continue;
@@ -164,16 +245,15 @@ impl SmtpServer {
                 let command = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
                 match parse_command(&command, &session.state) {
                     Ok(cmd) => {
-                        if self.handle_command(&mut session, cmd, &mut socket).await? {
+                        if self.handle_command(session, cmd, stream).await? {
                             return Ok(());
                         }
                     }
                     Err(e) => {
                         eprintln!("Parse error: {}", e);
-                        socket
-                            .write_all(b"500 Syntax error, command unrecognized\r\n")
-                            .await
-                            .into_diagnostic()?;
+                        stream
+                            .write_line(b"500 Syntax error, command unrecognized\r\n")
+                            .await?;
                     }
                 }
             }
@@ -184,15 +264,17 @@ impl SmtpServer {
         &self,
         session: &mut SmtpSession,
         command: SmtpCommand,
-        socket: &mut TcpStream,
+        stream: &mut Box<dyn SmtpStream>,
     ) -> Result<bool> {
         match (&session.state, command) {
             (SessionState::Connected, SmtpCommand::Ehlo(domain)) => {
                 self.callbacks.on_ehlo(&domain).await?;
-                socket
-                    .write_all(b"250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n")
-                    .await
-                    .into_diagnostic()?;
+                let mut response = String::from("250-localhost\r\n");
+                if self.tls_acceptor.is_some() {
+                    response.push_str("250-STARTTLS\r\n");
+                }
+                response.push_str("250-AUTH PLAIN LOGIN\r\n250 OK\r\n");
+                stream.write_line(response.as_bytes()).await?;
                 if self.auth_enabled {
                     session.state = SessionState::Greeted;
                 } else {
@@ -200,41 +282,35 @@ impl SmtpServer {
                 }
             }
             (SessionState::Greeted, SmtpCommand::AuthPlain(auth_data)) => {
-                self.handle_auth_plain(session, auth_data, socket).await?;
+                self.handle_auth_plain(session, auth_data, stream).await?;
             }
             (SessionState::Greeted, SmtpCommand::AuthLogin) => {
                 session.state = SessionState::AuthenticatingUsername;
-                socket
-                    .write_all(b"334 VXNlcm5hbWU6\r\n")
-                    .await
-                    .into_diagnostic()?;
+                stream.write_line(b"334 VXNlcm5hbWU6\r\n").await?;
             }
             (SessionState::AuthenticatingUsername, SmtpCommand::AuthUsername(username)) => {
                 let decoded_username = decode_base64(&username)?;
                 session.state = SessionState::AuthenticatingPassword(decoded_username);
-                socket
-                    .write_all(b"334 UGFzc3dvcmQ6\r\n")
-                    .await
-                    .into_diagnostic()?;
+                stream.write_line(b"334 UGFzc3dvcmQ6\r\n").await?;
             }
             (
                 SessionState::AuthenticatingPassword(username),
                 SmtpCommand::AuthPassword(password),
             ) => {
-                self.handle_auth_login(session, username.to_string(), password, socket)
+                self.handle_auth_login(session, username.to_string(), password, stream)
                     .await?;
             }
             (SessionState::Authenticated, SmtpCommand::MailFrom(from)) => {
                 self.callbacks.on_mail_from(&from).await?;
                 session.email.from = from;
-                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+                stream.write_line(b"250 OK\r\n").await?;
                 session.state = SessionState::ReceivingMailFrom;
             }
             (SessionState::ReceivingMailFrom, SmtpCommand::RcptTo(to))
             | (SessionState::ReceivingRcptTo, SmtpCommand::RcptTo(to)) => {
                 self.callbacks.on_rcpt_to(&to).await?;
                 session.email.to.push(to); // Consider changing this to a Vec<String> to support multiple recipients
-                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+                stream.write_line(b"250 OK\r\n").await?;
                 session.state = SessionState::ReceivingRcptTo;
             }
             (SessionState::ReceivingRcptTo, SmtpCommand::MailFrom(from)) => {
@@ -245,40 +321,54 @@ impl SmtpServer {
                     to: Vec::with_capacity(1),
                     body: String::new(),
                 };
-                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+                stream.write_line(b"250 OK\r\n").await?;
                 session.state = SessionState::ReceivingMailFrom;
             }
             (SessionState::ReceivingRcptTo, SmtpCommand::Data) => {
-                socket
-                    .write_all(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n")
-                    .await
-                    .into_diagnostic()?;
+                stream
+                    .write_line(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n")
+                    .await?;
                 session.state = SessionState::ReceivingData;
             }
+            (_, SmtpCommand::StartTls) => {
+                if let Some(acceptor) = &self.tls_acceptor {
+                    stream.write_line(b"220 Ready to start TLS\r\n").await?;
+
+                    if let Some(tls_stream) = stream.upgrade_to_tls(acceptor).await? {
+                        session.state = SessionState::Connected;
+                        let mut new_stream = Box::new(tls_stream) as Box<dyn SmtpStream>;
+                        // Wrap the recursive call in Box::pin
+                        Box::pin(self.handle_connection(session, &mut new_stream)).await?;
+                        return Ok(true);
+                    } else {
+                        stream
+                            .write_line(b"454 TLS not available due to temporary reason\r\n")
+                            .await?;
+                    }
+                } else {
+                    stream.write_line(b"502 STARTTLS not supported\r\n").await?;
+                }
+            }
             (_, SmtpCommand::Quit) => {
-                socket.write_all(b"221 Bye\r\n").await.into_diagnostic()?;
+                stream.write_line(b"221 Bye\r\n").await?;
                 return Ok(true);
             }
             (_, SmtpCommand::Rset) => {
                 // Reset the session state
                 session.reset();
-                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+                stream.write_line(b"250 OK\r\n").await?;
             }
             (_, SmtpCommand::Noop) => {
-                socket.write_all(b"250 OK\r\n").await.into_diagnostic()?;
+                stream.write_line(b"250 OK\r\n").await?;
             }
             cmd => {
                 if !session.can_accept_mail_commands() {
-                    socket
-                        .write_all(b"530 Authentication required\r\n")
-                        .await
-                        .into_diagnostic()?;
+                    stream
+                        .write_line(b"530 Authentication required\r\n")
+                        .await?;
                 } else {
                     eprintln!("Unknown command: {:?}", cmd);
-                    socket
-                        .write_all(b"500 Unknown command\r\n")
-                        .await
-                        .into_diagnostic()?;
+                    stream.write_line(b"500 Unknown command\r\n").await?;
                 }
             }
         }
@@ -289,14 +379,14 @@ impl SmtpServer {
         &self,
         session: &mut SmtpSession,
         auth_data: String,
-        socket: &mut TcpStream,
+        stream: &mut Box<dyn SmtpStream>,
     ) -> Result<()> {
         let decoded = decode_base64(&auth_data)?;
         let parts: Vec<&str> = decoded.split('\0').collect();
         if parts.len() != 3 {
             bail!("Invalid AUTH PLAIN data");
         }
-        self.handle_authentication(session, parts[1], parts[2], socket)
+        self.handle_authentication(session, parts[1], parts[2], stream)
             .await
     }
 
@@ -305,10 +395,10 @@ impl SmtpServer {
         session: &mut SmtpSession,
         username: String,
         password: String,
-        socket: &mut TcpStream,
+        stream: &mut Box<dyn SmtpStream>,
     ) -> Result<()> {
         let decoded_password = decode_base64(&password)?;
-        self.handle_authentication(session, &username, &decoded_password, socket)
+        self.handle_authentication(session, &username, &decoded_password, stream)
             .await
     }
 
@@ -317,22 +407,20 @@ impl SmtpServer {
         session: &mut SmtpSession,
         username: &str,
         password: &str,
-        socket: &mut TcpStream,
+        stream: &mut Box<dyn SmtpStream>,
     ) -> Result<()> {
         match self.callbacks.on_auth(username, password).await {
             Ok(true) => {
                 session.state = SessionState::Authenticated;
-                socket
-                    .write_all(b"235 Authentication successful\r\n")
-                    .await
-                    .into_diagnostic()?;
+                stream
+                    .write_line(b"235 Authentication successful\r\n")
+                    .await?;
             }
             Ok(false) | Err(_) => {
                 session.state = SessionState::Greeted;
-                socket
-                    .write_all(b"535 Authentication failed\r\n")
+                stream
+                    .write_line(b"535 Authentication failed\r\n")
                     .await
-                    .into_diagnostic()
                     .wrap_err("Authentication failed")?;
             }
         }
