@@ -17,6 +17,7 @@ pub struct CfgServer {
     pub disable_outbound: Option<bool>,
     pub outbound_local: Option<bool>,
     pub pool_size: Option<u64>,
+    pub tls: Option<CfgTls>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -36,6 +37,12 @@ pub struct CfgDKIM {
 pub struct CfgAuth {
     pub username: String,
     pub password: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CfgTls {
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 impl Cfg {

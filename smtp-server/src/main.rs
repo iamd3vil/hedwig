@@ -2,6 +2,9 @@ use config::CfgStorage;
 use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
 use smtp::{SmtpServer, SmtpStream};
+use rustls::pki_types::CertificateDer;
+use tokio_rustls::rustls::{self, ServerConfig};
+use tokio_rustls::TlsAcceptor;
 use std::sync::Arc;
 use storage::{fs_storage::FileSystemStorage, Status, Storage};
 use subtle::ConstantTimeEq;
@@ -44,6 +47,37 @@ async fn main() -> Result<()> {
         .await
         .wrap_err("error getting storage type")?;
     let storage = Arc::new(storage);
+    // Initialize TLS if configured
+    let tls_acceptor = if let Some(tls_config) = &cfg.server.tls {
+        let cert_file = tokio::fs::File::open(&tls_config.cert_path)
+            .await
+            .into_diagnostic()
+            .wrap_err("Failed to open certificate file")?;
+        let key_file = tokio::fs::File::open(&tls_config.key_path)
+            .await
+            .into_diagnostic()
+            .wrap_err("Failed to open private key file")?;
+
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(
+            &mut std::io::BufReader::new(cert_file.into_std().await)
+        ).collect::<std::io::Result<Vec<_>>>()
+        .into_diagnostic()?;
+
+        let key = rustls_pemfile::private_key(
+            &mut std::io::BufReader::new(key_file.into_std().await)
+        ).into_diagnostic()?
+        .ok_or_else(|| miette::miette!("No private key found"))?;
+
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .into_diagnostic()?;
+
+        Some(TlsAcceptor::from(Arc::new(config)))
+    } else {
+        None
+    };
+
     let smtp_server = SmtpServer::new(
         callbacks::Callbacks::new(
             storage.clone(),
@@ -94,8 +128,21 @@ async fn main() -> Result<()> {
             .wrap_err("error accepting tcp connection")?;
         debug!("Accepted connection");
         let server_clone = smtp_server.clone();
+        let tls_acceptor = tls_acceptor.clone();
+
         tokio::spawn(async move {
-            let mut boxed_socket: Box<dyn SmtpStream> = Box::new(socket);
+            let mut boxed_socket: Box<dyn SmtpStream> = if let Some(acceptor) = tls_acceptor {
+                match acceptor.accept(socket).await {
+                    Ok(tls_stream) => Box::new(tls_stream),
+                    Err(e) => {
+                        error!("TLS handshake failed: {}", e);
+                        return;
+                    }
+                }
+            } else {
+                Box::new(socket)
+            };
+
             if let Err(e) = server_clone.handle_client(&mut boxed_socket).await {
                 error!("Error handling client: {:#}", e);
             }
