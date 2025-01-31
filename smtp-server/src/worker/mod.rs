@@ -275,7 +275,12 @@ impl<'a> Worker<'a> {
                             DkimSigner::from_key(pk_rsa)
                         }
                         DkimKeyType::Ed25519 => {
-                            let pk_ed25519 = mail_auth::common::crypto::Ed25519Key::from_pkcs8_pem(&priv_key_str)
+                            // Parse PEM to get DER bytes
+                            let pem = pem::parse(&priv_key_str)
+                                .into_diagnostic()
+                                .wrap_err("parsing Ed25519 PEM")?;
+                            
+                            let pk_ed25519 = mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(&pem.contents)
                                 .expect("error reading Ed25519 priv key");
                             DkimSigner::from_key(pk_ed25519)
                         }
