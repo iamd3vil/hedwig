@@ -269,11 +269,21 @@ impl<'a> Worker<'a> {
                         .wrap_err("converting private key to string")?;
 
                     let raw_email = body.as_bytes();
-                    let signer: Box<dyn mail_auth::dkim::DkimSigner> = match dkim.key_type {
+                    let signature = match dkim.key_type {
                         DkimKeyType::Rsa => {
                             let pk_rsa = RsaKey::<Sha256>::from_rsa_pem(&priv_key_str)
                                 .expect("error reading RSA priv key");
-                            Box::new(DkimSigner::from_key(pk_rsa))
+                            DkimSigner::from_key(pk_rsa)
+                                .domain(&dkim.domain)
+                                .selector(&dkim.selector)
+                                .headers(DKIM_HEADERS)
+                                .expiration(60 * 60 * 7)
+                                .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                                .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                                .sign(raw_email)
+                                .into_diagnostic()
+                                .wrap_err("signing message with RSA")?
+                                .to_header()
                         }
                         DkimKeyType::Ed25519 => {
                             // Parse PEM to get DER bytes
@@ -283,21 +293,19 @@ impl<'a> Worker<'a> {
                             
                             let pk_ed25519 = mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(pem.contents())
                                 .expect("error reading Ed25519 priv key");
-                            Box::new(DkimSigner::from_key(pk_ed25519))
+                            DkimSigner::from_key(pk_ed25519)
+                                .domain(&dkim.domain)
+                                .selector(&dkim.selector)
+                                .headers(DKIM_HEADERS)
+                                .expiration(60 * 60 * 7)
+                                .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                                .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                                .sign(raw_email)
+                                .into_diagnostic()
+                                .wrap_err("signing message with Ed25519")?
+                                .to_header()
                         }
                     };
-
-                    let signature = signer
-                        .domain(&dkim.domain)
-                        .selector(&dkim.selector)
-                        .headers(DKIM_HEADERS)
-                        .expiration(60 * 60 * 7)
-                        .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
-                        .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
-                        .sign(raw_email)
-                        .into_diagnostic()
-                        .wrap_err("signing message")?
-                        .to_header();
 
                     // Insert DKIM signature.
                     let raw_email = Self::insert_dkim_signature(raw_email, &signature)?;
