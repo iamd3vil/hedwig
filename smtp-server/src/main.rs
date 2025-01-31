@@ -227,18 +227,26 @@ async fn generate_rsa_keys(dkim_config: &CfgDKIM) -> Result<()> {
 }
 
 async fn generate_ed25519_keys(dkim_config: &CfgDKIM) -> Result<()> {
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{SigningKey, SecretKey};
+    use rand::RngCore;
     
     let mut rng = OsRng;
-    let signing_key = SigningKey::generate(&mut rng);
+    
+    // Generate random bytes for the secret key
+    let mut secret_bytes = [0u8; 32];
+    rng.fill_bytes(&mut secret_bytes);
+    
+    // Create signing key from random bytes
+    let signing_key = SigningKey::from_bytes(&secret_bytes);
     let verifying_key = signing_key.verifying_key();
 
     // Convert to PKCS8 PEM
-    let private_key_bytes = signing_key.to_pkcs8_bytes();
-    let private_key_pem = pem::encode(&pem::Pem {
-        tag: "PRIVATE KEY".to_string(),
-        contents: private_key_bytes,
-    });
+    let private_key_bytes = signing_key.to_bytes().to_vec();
+    let pem = pem::Pem::new(
+        "PRIVATE KEY",
+        private_key_bytes
+    );
+    let private_key_pem = pem::encode(&pem);
 
     tokio::fs::write(&dkim_config.private_key, private_key_pem.as_bytes())
         .await
