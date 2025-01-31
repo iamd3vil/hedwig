@@ -29,6 +29,7 @@ tokio-rustls = { version = "0.26.0", features = [
 ], default-features = false }
 subtle = "2.6.1"
 tempfile = "3.13.0"
+pkcs8 = "0.10.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lettre = { version = "0.11.11", features = [
@@ -46,3 +47,8 @@ moka = { version = "0.12.10", features = ["future"] }
 tokio-util = { version = "0.7.13", features = ["io"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2.2.0"
+clap = { version = "4", features = ["derive"] }
+base64 = "0.21"
+ring = "0.17.8"
+rsa = "0.9"
+rand = "0.8"

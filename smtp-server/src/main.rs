@@ -1,6 +1,13 @@
+use base64::Engine;
+use clap::Parser;
 use config::CfgStorage;
 use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
+use rand::rngs::OsRng;
+use rsa::{
+    pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
+    RsaPrivateKey,
+};
 use rustls::pki_types::CertificateDer;
 use smtp::{SmtpServer, SmtpStream};
 use std::sync::Arc;
@@ -17,8 +24,37 @@ mod config;
 mod storage;
 mod worker;
 
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Path to config file
+    #[arg(short, long, default_value = "config.toml")]
+    config: String,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(clap::Subcommand)]
+enum Commands {
+    /// Start the SMTP server (default)
+    Server,
+    /// Generate DKIM keys
+    DkimGenerate,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse command line arguments
+    let args = Args::parse();
+
+    match args.command.unwrap_or(Commands::Server) {
+        Commands::Server => run_server(&args.config).await,
+        Commands::DkimGenerate => generate_dkim_keys(&args.config).await,
+    }
+}
+
+async fn run_server(config_path: &str) -> Result<()> {
     // Initialize the tracing subscriber
     tracing_subscriber::fmt()
         .with_target(false)
@@ -31,7 +67,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Load the configuration from the file.
-    let cfg = config::Cfg::load("config.toml").wrap_err("error loading configuration")?;
+    let cfg = config::Cfg::load(config_path).wrap_err("error loading configuration")?;
 
     if cfg.server.dkim.is_some() {
         info!("DKIM is enabled");
@@ -148,6 +184,58 @@ async fn main() -> Result<()> {
             }
         });
     }
+}
+
+async fn generate_dkim_keys(config_path: &str) -> Result<()> {
+    // Load the configuration from the file
+    let cfg = config::Cfg::load(config_path).wrap_err("error loading configuration")?;
+
+    // Check if DKIM config exists
+    let dkim_config = match &cfg.server.dkim {
+        Some(config) => config,
+        None => bail!("DKIM configuration is missing in config file"),
+    };
+
+    // Generate a new RSA key pair
+    let mut rng = OsRng;
+    let bits = 4096; // Using 4096 bits for better security
+    let private_key = RsaPrivateKey::new(&mut rng, bits)
+        .into_diagnostic()
+        .wrap_err("Failed to generate RSA key pair")?;
+
+    // Convert to PKCS8 PEM format
+    let private_key_pem = private_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .into_diagnostic()
+        .wrap_err("Failed to encode private key to PEM")?;
+
+    // Save private key to the configured path
+    tokio::fs::write(&dkim_config.private_key, private_key_pem.as_bytes())
+        .await
+        .into_diagnostic()
+        .wrap_err("Failed to write private key")?;
+
+    // Extract public key components for DNS record
+    let public_key = private_key.to_public_key();
+    let public_key_der = public_key
+        .to_public_key_der()
+        .into_diagnostic()
+        .wrap_err("Failed to encode public key")?;
+
+    // Generate DNS record
+    let public_key_base64 =
+        base64::engine::general_purpose::STANDARD.encode(public_key_der.as_bytes());
+    let dns_record = format!(
+        "{}._domainkey.{} IN TXT \"v=DKIM1; k=rsa; p={}\"",
+        dkim_config.selector, dkim_config.domain, public_key_base64
+    );
+
+    println!("DKIM keys generated successfully!");
+    println!("Private key saved to: {}", dkim_config.private_key);
+    println!("\nAdd the following TXT record to your DNS configuration:");
+    println!("{}", dns_record);
+
+    Ok(())
 }
 
 async fn get_storage_type(cfg: &CfgStorage) -> Result<Arc<dyn Storage>> {

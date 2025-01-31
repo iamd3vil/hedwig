@@ -4,3 +4,4 @@ config.toml
 certs/
 .envrc
 .aider*
+*.key
