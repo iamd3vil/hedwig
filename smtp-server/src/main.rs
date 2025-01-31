@@ -1,6 +1,6 @@
 use base64::Engine;
 use clap::Parser;
-use config::{CfgStorage, CfgDKIM, DkimKeyType};
+use config::{CfgDKIM, CfgStorage, DkimKeyType};
 use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
 use rand::rngs::OsRng;
@@ -23,6 +23,8 @@ mod callbacks;
 mod config;
 mod storage;
 mod worker;
+
+const DEFAULT_DKIM_KEY_BITS: usize = 2048;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -202,8 +204,7 @@ async fn generate_dkim_keys(config_path: &str) -> Result<()> {
 
 async fn generate_rsa_keys(dkim_config: &CfgDKIM) -> Result<()> {
     let mut rng = OsRng;
-    let bits = 4096;
-    let private_key = RsaPrivateKey::new(&mut rng, bits)
+    let private_key = RsaPrivateKey::new(&mut rng, DEFAULT_DKIM_KEY_BITS)
         .into_diagnostic()
         .wrap_err("Failed to generate RSA key pair")?;
 
@@ -223,29 +224,26 @@ async fn generate_rsa_keys(dkim_config: &CfgDKIM) -> Result<()> {
         .into_diagnostic()
         .wrap_err("Failed to encode public key")?;
 
-    output_dns_record(dkim_config, &public_key_der.as_bytes(), "rsa")
+    output_dns_record(dkim_config, public_key_der.as_bytes(), "rsa")
 }
 
 async fn generate_ed25519_keys(dkim_config: &CfgDKIM) -> Result<()> {
     use ed25519_dalek::SigningKey;
     use rand::RngCore;
-    
+
     let mut rng = OsRng;
-    
+
     // Generate random bytes for the secret key
     let mut secret_bytes = [0u8; 32];
     rng.fill_bytes(&mut secret_bytes);
-    
+
     // Create signing key from random bytes
     let signing_key = SigningKey::from_bytes(&secret_bytes);
     let verifying_key = signing_key.verifying_key();
 
     // Convert to PKCS8 PEM
     let private_key_bytes = signing_key.to_bytes().to_vec();
-    let pem = pem::Pem::new(
-        "PRIVATE KEY",
-        private_key_bytes
-    );
+    let pem = pem::Pem::new("PRIVATE KEY", private_key_bytes);
     let private_key_pem = pem::encode(&pem);
 
     tokio::fs::write(&dkim_config.private_key, private_key_pem.as_bytes())
