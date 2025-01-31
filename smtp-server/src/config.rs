@@ -27,10 +27,18 @@ pub struct CfgStorage {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum DkimKeyType {
+    Rsa,
+    Ed25519,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct CfgDKIM {
     pub domain: String,
     pub selector: String,
     pub private_key: String,
+    pub key_type: DkimKeyType,
 }
 
 #[derive(Debug, Deserialize, Clone)]

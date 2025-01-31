@@ -187,47 +187,75 @@ async fn run_server(config_path: &str) -> Result<()> {
 }
 
 async fn generate_dkim_keys(config_path: &str) -> Result<()> {
-    // Load the configuration from the file
     let cfg = config::Cfg::load(config_path).wrap_err("error loading configuration")?;
 
-    // Check if DKIM config exists
     let dkim_config = match &cfg.server.dkim {
         Some(config) => config,
         None => bail!("DKIM configuration is missing in config file"),
     };
 
-    // Generate a new RSA key pair
+    match dkim_config.key_type {
+        DkimKeyType::Rsa => generate_rsa_keys(dkim_config).await,
+        DkimKeyType::Ed25519 => generate_ed25519_keys(dkim_config).await,
+    }
+}
+
+async fn generate_rsa_keys(dkim_config: &CfgDKIM) -> Result<()> {
     let mut rng = OsRng;
-    let bits = 4096; // Using 4096 bits for better security
+    let bits = 4096;
     let private_key = RsaPrivateKey::new(&mut rng, bits)
         .into_diagnostic()
         .wrap_err("Failed to generate RSA key pair")?;
 
-    // Convert to PKCS8 PEM format
     let private_key_pem = private_key
         .to_pkcs8_pem(LineEnding::LF)
         .into_diagnostic()
         .wrap_err("Failed to encode private key to PEM")?;
 
-    // Save private key to the configured path
     tokio::fs::write(&dkim_config.private_key, private_key_pem.as_bytes())
         .await
         .into_diagnostic()
         .wrap_err("Failed to write private key")?;
 
-    // Extract public key components for DNS record
     let public_key = private_key.to_public_key();
     let public_key_der = public_key
         .to_public_key_der()
         .into_diagnostic()
         .wrap_err("Failed to encode public key")?;
 
-    // Generate DNS record
-    let public_key_base64 =
-        base64::engine::general_purpose::STANDARD.encode(public_key_der.as_bytes());
+    output_dns_record(dkim_config, &public_key_der.as_bytes(), "rsa")
+}
+
+async fn generate_ed25519_keys(dkim_config: &CfgDKIM) -> Result<()> {
+    use ed25519_dalek::{Keypair, SigningKey};
+    
+    let mut rng = OsRng;
+    let signing_key = SigningKey::generate(&mut rng);
+    let keypair = Keypair {
+        secret: signing_key,
+        public: (&signing_key).into(),
+    };
+
+    // Convert to PKCS8 PEM
+    let private_key_bytes = keypair.to_pkcs8_bytes();
+    let private_key_pem = pem::encode(&pem::Pem {
+        tag: "PRIVATE KEY".to_string(),
+        contents: private_key_bytes,
+    });
+
+    tokio::fs::write(&dkim_config.private_key, private_key_pem.as_bytes())
+        .await
+        .into_diagnostic()
+        .wrap_err("Failed to write private key")?;
+
+    output_dns_record(dkim_config, &keypair.public.to_bytes(), "ed25519")
+}
+
+fn output_dns_record(dkim_config: &CfgDKIM, public_key_bytes: &[u8], key_type: &str) -> Result<()> {
+    let public_key_base64 = base64::engine::general_purpose::STANDARD.encode(public_key_bytes);
     let dns_record = format!(
-        "{}._domainkey.{} IN TXT \"v=DKIM1; k=rsa; p={}\"",
-        dkim_config.selector, dkim_config.domain, public_key_base64
+        "{}._domainkey.{} IN TXT \"v=DKIM1; k={}; p={}\"",
+        dkim_config.selector, dkim_config.domain, key_type, public_key_base64
     );
 
     println!("DKIM keys generated successfully!");

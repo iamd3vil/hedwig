@@ -267,11 +267,21 @@ impl<'a> Worker<'a> {
                         .into_diagnostic()
                         .wrap_err("converting private key to string")?;
 
-                    let pk_rsa = RsaKey::<Sha256>::from_rsa_pem(&priv_key_str)
-                        .expect("error reading priv key");
-
                     let raw_email = body.as_bytes();
-                    let signature = DkimSigner::from_key(pk_rsa)
+                    let signer = match dkim.key_type {
+                        DkimKeyType::Rsa => {
+                            let pk_rsa = RsaKey::<Sha256>::from_rsa_pem(&priv_key_str)
+                                .expect("error reading RSA priv key");
+                            DkimSigner::from_key(pk_rsa)
+                        }
+                        DkimKeyType::Ed25519 => {
+                            let pk_ed25519 = mail_auth::common::crypto::Ed25519Key::from_pkcs8_pem(&priv_key_str)
+                                .expect("error reading Ed25519 priv key");
+                            DkimSigner::from_key(pk_ed25519)
+                        }
+                    };
+
+                    let signature = signer
                         .domain(&dkim.domain)
                         .selector(&dkim.selector)
                         .headers(DKIM_HEADERS)
