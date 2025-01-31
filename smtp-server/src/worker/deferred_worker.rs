@@ -9,7 +9,7 @@ use crate::storage::{Status, Storage};
 use super::{EmailMetadata, Job};
 
 pub struct DeferredWorker {
-    storage: Arc<Box<dyn Storage>>,
+    storage: Arc<dyn Storage>,
 
     max_attempts: u32,
 
@@ -18,7 +18,7 @@ pub struct DeferredWorker {
 }
 
 impl DeferredWorker {
-    pub fn new(storage: Arc<Box<dyn Storage>>, channel: Sender<Job>) -> Self {
+    pub fn new(storage: Arc<dyn Storage>, channel: Sender<Job>) -> Self {
         Self {
             storage,
             channel,
@@ -61,7 +61,7 @@ impl DeferredWorker {
     // Helper methods
     async fn handle_permanent_failure(&self, msg_id: &str) -> Result<()> {
         self.storage
-            .mv(msg_id, msg_id, Status::DEFERRED, Status::BOUNCED)
+            .mv(msg_id, msg_id, Status::Deferred, Status::Bounced)
             .await
             .wrap_err("moving from deferred to error")
     }
@@ -71,8 +71,8 @@ impl DeferredWorker {
             .mv(
                 &metadata.msg_id,
                 &metadata.msg_id,
-                Status::DEFERRED,
-                Status::QUEUED,
+                Status::Deferred,
+                Status::Queued,
             )
             .await
             .wrap_err("moving from deferred to queued")?;
@@ -101,7 +101,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let storage = Arc::new(Box::new(storage) as Box<dyn Storage>);
+        let storage = Arc::new(storage);
         let (sender, receiver) = bounded(100);
         let worker = DeferredWorker::new(storage, sender);
         (worker, receiver, temp_dir)
@@ -127,7 +127,7 @@ mod tests {
             to: vec!["recipient@example.com".to_string()],
             body: "Test email".to_string(),
         };
-        worker.storage.put(email, Status::DEFERRED).await.unwrap();
+        worker.storage.put(email, Status::Deferred).await.unwrap();
 
         // Process deferred jobs
         worker.process_deferred_jobs().await.unwrap();
@@ -158,14 +158,14 @@ mod tests {
             to: vec!["recipient@example.com".to_string()],
             body: "Test email".to_string(),
         };
-        worker.storage.put(email, Status::DEFERRED).await.unwrap();
+        worker.storage.put(email, Status::Deferred).await.unwrap();
 
         // Process deferred jobs
         worker.process_deferred_jobs().await.unwrap();
 
         // Verify the email was moved to error status
-        let deferred_email = worker.storage.get("test2", Status::DEFERRED).await.unwrap();
-        let error_email = worker.storage.get("test2", Status::BOUNCED).await.unwrap();
+        let deferred_email = worker.storage.get("test2", Status::Deferred).await.unwrap();
+        let error_email = worker.storage.get("test2", Status::Bounced).await.unwrap();
 
         assert!(deferred_email.is_none());
         assert!(error_email.is_some());
@@ -191,14 +191,14 @@ mod tests {
             to: vec!["recipient@example.com".to_string()],
             body: "Test email".to_string(),
         };
-        worker.storage.put(email, Status::DEFERRED).await.unwrap();
+        worker.storage.put(email, Status::Deferred).await.unwrap();
 
         // Process deferred jobs
         worker.process_deferred_jobs().await.unwrap();
 
         // Verify the email is still in deferred status and not in queued
-        let deferred_email = worker.storage.get("test3", Status::DEFERRED).await.unwrap();
-        let queued_email = worker.storage.get("test3", Status::QUEUED).await.unwrap();
+        let deferred_email = worker.storage.get("test3", Status::Deferred).await.unwrap();
+        let queued_email = worker.storage.get("test3", Status::Queued).await.unwrap();
 
         assert!(deferred_email.is_some());
         assert!(queued_email.is_none());
@@ -215,7 +215,7 @@ mod tests {
             to: vec!["recipient@example.com".to_string()],
             body: "Test email".to_string(),
         };
-        worker.storage.put(email, Status::DEFERRED).await.unwrap();
+        worker.storage.put(email, Status::Deferred).await.unwrap();
 
         // Process deferred jobs
         worker.process_deferred_jobs().await.unwrap();

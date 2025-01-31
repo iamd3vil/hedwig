@@ -39,13 +39,13 @@ pub struct EmailMetadata {
     pub msg_id: String,
 }
 
-pub struct Worker {
+pub struct Worker<'a> {
     channel: Receiver<Job>,
-    storage: Arc<Box<dyn Storage>>,
+    storage: Arc<dyn Storage>,
     resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
 
     pool: PoolManager,
-    dkim: Option<CfgDKIM>,
+    dkim: &'a Option<CfgDKIM>,
 
     /// disable_outbound when set true, all outbound emails will be discarded.
     disable_outbound: bool,
@@ -57,11 +57,11 @@ pub struct Worker {
     max_delay: Duration,
 }
 
-impl Worker {
+impl<'a> Worker<'a> {
     pub fn new(
         channel: Receiver<Job>,
-        storage: Arc<Box<dyn Storage>>,
-        dkim: Option<CfgDKIM>,
+        storage: Arc<dyn Storage>,
+        dkim: &'a Option<CfgDKIM>,
         disable_outbound: bool,
         outbound_local: bool,
         pool_size: u64,
@@ -101,11 +101,11 @@ impl Worker {
 
     async fn process_job(&self, job: &Job) -> Result<()> {
         debug!(msg_id = ?job.msg_id, "Processing job");
-        let email = match self.storage.get(&job.msg_id, Status::QUEUED).await {
+        let email = match self.storage.get(&job.msg_id, Status::Queued).await {
             Ok(Some(email)) => email,
             Ok(None) => {
                 warn!(msg_id = ?job.msg_id, "Email not found in queue");
-                return self.storage.delete(&job.msg_id, Status::QUEUED).await;
+                return self.storage.delete(&job.msg_id, Status::Queued).await;
             }
             Err(e) => return Err(e).wrap_err("failed to get email from storage"),
         };
@@ -123,13 +123,13 @@ impl Worker {
                 msg_id = job.msg_id,
                 "Outbound mail disabled, dropping message"
             );
-            return self.storage.delete(&job.msg_id, Status::QUEUED).await;
+            return self.storage.delete(&job.msg_id, Status::Queued).await;
         }
 
         match self.send_email(&msg, &email.body).await {
             Ok(_) => {
                 info!(msg_id = job.msg_id, "Successfully sent email");
-                self.storage.delete(&job.msg_id, Status::QUEUED).await?;
+                self.storage.delete(&job.msg_id, Status::Queued).await?;
                 // Delete any meta file in deferred.
                 self.storage
                     .delete_meta(&job.msg_id)
@@ -157,7 +157,7 @@ impl Worker {
                         // Bounce the email.
                         println!("Error sending email: {:?}", e);
                         self.storage
-                            .mv(&job.msg_id, &job.msg_id, Status::QUEUED, Status::BOUNCED)
+                            .mv(&job.msg_id, &job.msg_id, Status::Queued, Status::Bounced)
                             .await
                             .wrap_err("moving from queued to bounced")
                     }
@@ -190,14 +190,14 @@ impl Worker {
             .wrap_err("storing meta file")?;
 
         self.storage
-            .mv(&job.msg_id, &job.msg_id, Status::QUEUED, Status::DEFERRED)
+            .mv(&job.msg_id, &job.msg_id, Status::Queued, Status::Deferred)
             .await
             .wrap_err("moving from queued to deferred")?;
 
         Ok(())
     }
 
-    async fn send_email<'a>(&self, email: &'a Message<'a>, body: &str) -> Result<()> {
+    async fn send_email<'b>(&self, email: &'b Message<'b>, body: &str) -> Result<()> {
         // Parse to address for each.
         for to in email.to().iter() {
             let to = to.first().unwrap().address.as_ref().unwrap();
@@ -213,7 +213,7 @@ impl Worker {
             // Strip `<` and `>` from email address.
             let to = to.trim_matches(|c| c == '<' || c == '>');
             let parsed_email_id = EmailAddress::parse(to, None);
-            if let None = parsed_email_id {
+            if parsed_email_id.is_none() {
                 continue;
             }
 
@@ -295,7 +295,7 @@ impl Worker {
                     success = true
                 } else {
                     transport
-                        .send_raw(&envelope, &body.as_bytes())
+                        .send_raw(&envelope, body.as_bytes())
                         .await
                         .into_diagnostic()
                         .wrap_err("sending raw message")?;

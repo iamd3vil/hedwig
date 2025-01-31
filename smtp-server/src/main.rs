@@ -1,14 +1,14 @@
 use config::CfgStorage;
 use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
-use smtp::{SmtpServer, SmtpStream};
 use rustls::pki_types::CertificateDer;
-use tokio_rustls::rustls::{self, ServerConfig};
-use tokio_rustls::TlsAcceptor;
+use smtp::{SmtpServer, SmtpStream};
 use std::sync::Arc;
 use storage::{fs_storage::FileSystemStorage, Status, Storage};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
+use tokio_rustls::rustls::{self, ServerConfig};
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 use worker::{deferred_worker::DeferredWorker, Job};
 
@@ -58,15 +58,15 @@ async fn main() -> Result<()> {
             .into_diagnostic()
             .wrap_err("Failed to open private key file")?;
 
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(
-            &mut std::io::BufReader::new(cert_file.into_std().await)
-        ).collect::<std::io::Result<Vec<_>>>()
-        .into_diagnostic()?;
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file.into_std().await))
+                .collect::<std::io::Result<Vec<_>>>()
+                .into_diagnostic()?;
 
-        let key = rustls_pemfile::private_key(
-            &mut std::io::BufReader::new(key_file.into_std().await)
-        ).into_diagnostic()?
-        .ok_or_else(|| miette::miette!("No private key found"))?;
+        let key =
+            rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file.into_std().await))
+                .into_diagnostic()?
+                .ok_or_else(|| miette::miette!("No private key found"))?;
 
         let config = ServerConfig::builder()
             .with_no_client_auth()
@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
 
     let smtp_server = SmtpServer::new(
         callbacks::Callbacks::new(
-            storage.clone(),
+            Arc::clone(&storage),
             sender_channel.clone(),
             receiver_channel.clone(),
             cfg.clone(),
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
     // Check if there are any emails to process.
     // Spawn a task to process the emails.
     info!("checking for any emails to process in queue");
-    let mut emails = storage.list(Status::QUEUED);
+    let mut emails = storage.list(Status::Queued);
     while let Some(email) = emails.next().await {
         let email = email.unwrap();
         let job = Job::new(email.message_id, 0);
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
 
     // Start the deferred worker.
     tokio::spawn(async move {
-        let worker = DeferredWorker::new(storage, sender_channel.clone());
+        let worker = DeferredWorker::new(Arc::clone(&storage), sender_channel.clone());
         let res = worker.process_deferred_jobs().await;
         if let Err(e) = res {
             error!("Error running deferred worker: {:#}", e);
@@ -150,11 +150,11 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn get_storage_type(cfg: &CfgStorage) -> Result<Box<dyn Storage>> {
+async fn get_storage_type(cfg: &CfgStorage) -> Result<Arc<dyn Storage>> {
     match cfg.storage_type.as_ref() {
         "fs" => {
             let st = FileSystemStorage::new(cfg.base_path.clone()).await?;
-            Ok(Box::new(st))
+            Ok(Arc::new(st))
         }
         _ => bail!("Unknown storage type: {}", cfg.storage_type),
     }

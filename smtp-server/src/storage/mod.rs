@@ -18,9 +18,9 @@ pub struct StoredEmail {
 }
 
 pub enum Status {
-    QUEUED,
-    DEFERRED,
-    BOUNCED,
+    Queued,
+    Deferred,
+    Bounced,
 }
 
 #[async_trait]

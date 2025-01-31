@@ -20,20 +20,21 @@ use crate::{
 /// The Callbacks struct holds the configuration, storage, and sender channel.
 pub struct Callbacks {
     cfg: Cfg,
-    storage: Arc<Box<dyn Storage>>,
+    storage: Arc<dyn Storage>,
     sender_channel: async_channel::Sender<worker::Job>,
 }
 
 impl Callbacks {
     /// Creates a new Callbacks instance.
     pub fn new(
-        storage: Arc<Box<dyn Storage>>,
+        storage: Arc<dyn Storage>,
         sender_channel: async_channel::Sender<Job>,
         receiver_channel: async_channel::Receiver<Job>,
         cfg: Cfg,
     ) -> Self {
         // Start workers.
-        for _ in 0..cfg.server.workers.unwrap_or(1) {
+        let worker_count = cfg.server.workers.unwrap_or(1).max(1);
+        for _ in 0..worker_count {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
             let dkim = cfg.server.dkim.clone();
@@ -41,7 +42,7 @@ impl Callbacks {
                 let mut worker = Worker::new(
                     receiver_channel,
                     storage_cloned.clone(),
-                    dkim,
+                    &dkim,
                     cfg.server.disable_outbound.unwrap_or(false),
                     cfg.server.outbound_local.unwrap_or(false),
                     cfg.server.pool_size.unwrap_or(100),
@@ -76,7 +77,7 @@ impl Callbacks {
             };
             // Map any error into a SmtpError.
             self.storage
-                .put(stored_email, Status::QUEUED)
+                .put(stored_email, Status::Queued)
                 .await
                 .map_err(|e| SmtpError::ParseError {
                     message: format!("Failed to store email: {}", e),
@@ -123,7 +124,7 @@ impl SmtpCallbacks for Callbacks {
                     constant_time_eq(password.as_bytes(), auth.password.as_bytes());
                 Ok(username_match && password_match)
             }
-            None => Ok(true), // Authentication is disabled
+            None => Ok(false), // Authentication is disabled
         }
     }
 

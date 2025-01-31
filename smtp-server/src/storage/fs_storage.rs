@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::Stream;
 use miette::{Context, IntoDiagnostic, Result};
-use serde_json;
 use std::pin::Pin;
 use tokio::fs;
 
@@ -50,7 +49,7 @@ impl FileSystemStorage {
         };
 
         // Create queued, deferred, and error directories.
-        let status = [Status::QUEUED, Status::DEFERRED, Status::BOUNCED];
+        let status = [Status::Queued, Status::Deferred, Status::Bounced];
         for s in status.iter() {
             fs::create_dir_all(storage.dir(s))
                 .await
@@ -67,9 +66,9 @@ impl FileSystemStorage {
     /// * `status` - The status (QUEUED, DEFERRED, or BOUNCED) to get the directory for
     fn dir(&self, status: &Status) -> Utf8PathBuf {
         match status {
-            Status::QUEUED => self.base_path.join("queued"),
-            Status::DEFERRED => self.base_path.join("deferred"),
-            Status::BOUNCED => self.base_path.join("bounced"),
+            Status::Queued => self.base_path.join("queued"),
+            Status::Deferred => self.base_path.join("deferred"),
+            Status::Bounced => self.base_path.join("bounced"),
         }
     }
 
@@ -88,7 +87,7 @@ impl FileSystemStorage {
     /// # Arguments
     /// * `key` - The email message ID
     fn meta_file_path(&self, key: &str) -> Utf8PathBuf {
-        let base_path = self.dir(&Status::DEFERRED);
+        let base_path = self.dir(&Status::Deferred);
         base_path.join(format!("{}.meta.json", key))
     }
 
@@ -161,6 +160,7 @@ impl Storage for FileSystemStorage {
         let path = self.file_path(key, &status);
         if path.exists() {
             let contents = fs::read_to_string(&path).await.into_diagnostic()?;
+            // let email: StoredEmail = bincode::deserialize(contents.as_bytes()).into_diagnostic()?;
             let email: StoredEmail = serde_json::from_str(&contents).into_diagnostic()?;
             Ok(Some(email))
         } else {
@@ -178,8 +178,8 @@ impl Storage for FileSystemStorage {
     /// * `Result<Utf8PathBuf>` - The path where the email was stored
     async fn put(&self, email: StoredEmail, status: Status) -> Result<Utf8PathBuf> {
         let path = self.file_path(&email.message_id, &status);
-        let json = serde_json::to_string(&email).into_diagnostic()?;
-        fs::write(&path, json).await.into_diagnostic()?;
+        let serialized = serde_json::to_string(&email).into_diagnostic()?;
+        fs::write(&path, &serialized).await.into_diagnostic()?;
         Ok(path)
     }
 
@@ -314,16 +314,16 @@ mod tests {
         let email = create_test_email("test1");
 
         // Test put
-        let path = storage.put(email.clone(), Status::QUEUED).await.unwrap();
+        let path = storage.put(email.clone(), Status::Queued).await.unwrap();
         assert!(path.exists());
 
         // Test get
-        let retrieved = storage.get("test1", Status::QUEUED).await.unwrap();
+        let retrieved = storage.get("test1", Status::Queued).await.unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().message_id, "test1");
 
         // Test get non-existent
-        let not_found = storage.get("nonexistent", Status::QUEUED).await.unwrap();
+        let not_found = storage.get("nonexistent", Status::Queued).await.unwrap();
         assert!(not_found.is_none());
     }
 
@@ -332,10 +332,10 @@ mod tests {
         let (storage, _temp) = create_test_storage().await;
         let email = create_test_email("test2");
 
-        storage.put(email, Status::QUEUED).await.unwrap();
-        storage.delete("test2", Status::QUEUED).await.unwrap();
+        storage.put(email, Status::Queued).await.unwrap();
+        storage.delete("test2", Status::Queued).await.unwrap();
 
-        let not_found = storage.get("test2", Status::QUEUED).await.unwrap();
+        let not_found = storage.get("test2", Status::Queued).await.unwrap();
         assert!(not_found.is_none());
     }
 
@@ -344,16 +344,16 @@ mod tests {
         let (storage, _temp) = create_test_storage().await;
         let email = create_test_email("test3");
 
-        storage.put(email, Status::QUEUED).await.unwrap();
+        storage.put(email, Status::Queued).await.unwrap();
         storage
-            .mv("test3", "test3", Status::QUEUED, Status::BOUNCED)
+            .mv("test3", "test3", Status::Queued, Status::Bounced)
             .await
             .unwrap();
 
-        let not_found = storage.get("test3", Status::QUEUED).await.unwrap();
+        let not_found = storage.get("test3", Status::Queued).await.unwrap();
         assert!(not_found.is_none());
 
-        let found = storage.get("test3", Status::BOUNCED).await.unwrap();
+        let found = storage.get("test3", Status::Bounced).await.unwrap();
         assert!(found.is_some());
     }
 
@@ -435,12 +435,12 @@ mod tests {
         let meta = create_test_metadata("test_combined");
 
         // Store both email and metadata
-        storage.put(email.clone(), Status::DEFERRED).await.unwrap();
+        storage.put(email.clone(), Status::Deferred).await.unwrap();
         storage.put_meta("test_combined", &meta).await.unwrap();
 
         // Verify both exist
         let retrieved_email = storage
-            .get("test_combined", Status::DEFERRED)
+            .get("test_combined", Status::Deferred)
             .await
             .unwrap();
         let retrieved_meta = storage.get_meta("test_combined").await.unwrap();
@@ -451,14 +451,14 @@ mod tests {
 
         // Delete both
         storage
-            .delete("test_combined", Status::DEFERRED)
+            .delete("test_combined", Status::Deferred)
             .await
             .unwrap();
         storage.delete_meta("test_combined").await.unwrap();
 
         // Verify both are gone
         let email_not_found = storage
-            .get("test_combined", Status::DEFERRED)
+            .get("test_combined", Status::Deferred)
             .await
             .unwrap();
         let meta_not_found = storage.get_meta("test_combined").await.unwrap();
@@ -493,13 +493,13 @@ mod tests {
         let email2 = create_test_email("test2");
         let email3 = create_test_email("test3");
 
-        storage.put(email1.clone(), Status::QUEUED).await?;
-        storage.put(email2.clone(), Status::QUEUED).await?;
-        storage.put(email3.clone(), Status::DEFERRED).await?;
+        storage.put(email1.clone(), Status::Queued).await?;
+        storage.put(email2.clone(), Status::Queued).await?;
+        storage.put(email3.clone(), Status::Deferred).await?;
 
         // Test listing queued emails
         let mut queued_emails = Vec::new();
-        let mut stream = storage.list(Status::QUEUED);
+        let mut stream = storage.list(Status::Queued);
         while let Some(email) = stream.next().await {
             queued_emails.push(email?);
         }
@@ -509,7 +509,7 @@ mod tests {
 
         // Test listing deferred emails
         let mut deferred_emails = Vec::new();
-        let mut stream = storage.list(Status::DEFERRED);
+        let mut stream = storage.list(Status::Deferred);
         while let Some(email) = stream.next().await {
             deferred_emails.push(email?);
         }
@@ -518,7 +518,7 @@ mod tests {
 
         // Test listing bounced emails (should be empty)
         let mut bounced_emails = Vec::new();
-        let mut stream = storage.list(Status::BOUNCED);
+        let mut stream = storage.list(Status::Bounced);
         while let Some(email) = stream.next().await {
             bounced_emails.push(email?);
         }
