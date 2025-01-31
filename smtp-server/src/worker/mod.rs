@@ -272,7 +272,7 @@ impl<'a> Worker<'a> {
                         DkimKeyType::Rsa => {
                             let pk_rsa = RsaKey::<Sha256>::from_rsa_pem(&priv_key_str)
                                 .expect("error reading RSA priv key");
-                            DkimSigner::from_key(pk_rsa)
+                            Box::new(DkimSigner::from_key(pk_rsa)) as Box<dyn mail_auth::dkim::DkimSign>
                         }
                         DkimKeyType::Ed25519 => {
                             // Parse PEM to get DER bytes
@@ -282,7 +282,7 @@ impl<'a> Worker<'a> {
                             
                             let pk_ed25519 = mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(&pem.contents)
                                 .expect("error reading Ed25519 priv key");
-                            DkimSigner::from_key(pk_ed25519)
+                            Box::new(DkimSigner::from_key(pk_ed25519)) as Box<dyn mail_auth::dkim::DkimSign>
                         }
                     };
 
