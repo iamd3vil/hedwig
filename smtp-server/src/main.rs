@@ -1,6 +1,6 @@
 use base64::Engine;
 use clap::Parser;
-use config::CfgStorage;
+use config::{CfgStorage, CfgDKIM, DkimKeyType};
 use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
 use rand::rngs::OsRng;
@@ -227,7 +227,7 @@ async fn generate_rsa_keys(dkim_config: &CfgDKIM) -> Result<()> {
 }
 
 async fn generate_ed25519_keys(dkim_config: &CfgDKIM) -> Result<()> {
-    use ed25519_dalek::{SigningKey, SecretKey};
+    use ed25519_dalek::SigningKey;
     use rand::RngCore;
     
     let mut rng = OsRng;
