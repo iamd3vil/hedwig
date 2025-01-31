@@ -1014,6 +1014,7 @@ dependencies = [
  "camino",
  "clap",
  "config",
+ "ed25519-dalek",
  "email-address-parser",
  "futures",
  "hickory-resolver",
@@ -1023,9 +1024,9 @@ dependencies = [
  "mail-send",
  "miette",
  "moka",
+ "pem",
  "pkcs8",
  "rand",
- "ring 0.17.8",
  "rsa",
  "rustls 0.23.22",
  "rustls-pemfile 2.2.0",
@@ -1873,6 +1874,16 @@ checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest",
  "hmac",
+]
+
+[[package]]
+name = "pem"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e459365e590736a54c3fa561947c84837534b8e9af6fc5bf781307e82658fae"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
 ]
 
 [[package]]
