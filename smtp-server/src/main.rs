@@ -227,17 +227,14 @@ async fn generate_rsa_keys(dkim_config: &CfgDKIM) -> Result<()> {
 }
 
 async fn generate_ed25519_keys(dkim_config: &CfgDKIM) -> Result<()> {
-    use ed25519_dalek::{Keypair, SigningKey};
+    use ed25519_dalek::SigningKey;
     
     let mut rng = OsRng;
     let signing_key = SigningKey::generate(&mut rng);
-    let keypair = Keypair {
-        secret: signing_key,
-        public: (&signing_key).into(),
-    };
+    let verifying_key = signing_key.verifying_key();
 
     // Convert to PKCS8 PEM
-    let private_key_bytes = keypair.to_pkcs8_bytes();
+    let private_key_bytes = signing_key.to_pkcs8_bytes();
     let private_key_pem = pem::encode(&pem::Pem {
         tag: "PRIVATE KEY".to_string(),
         contents: private_key_bytes,
@@ -248,7 +245,7 @@ async fn generate_ed25519_keys(dkim_config: &CfgDKIM) -> Result<()> {
         .into_diagnostic()
         .wrap_err("Failed to write private key")?;
 
-    output_dns_record(dkim_config, &keypair.public.to_bytes(), "ed25519")
+    output_dns_record(dkim_config, verifying_key.as_bytes(), "ed25519")
 }
 
 fn output_dns_record(dkim_config: &CfgDKIM, public_key_bytes: &[u8], key_type: &str) -> Result<()> {
