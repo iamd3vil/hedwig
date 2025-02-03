@@ -26,7 +26,7 @@ This SMTP server is designed with a focus on speed and simplicity. It provides a
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/yourusername/hedwig.git
+   git clone https://github.com/iamd3vil/hedwig.git
    cd hedwig
    ```
 
