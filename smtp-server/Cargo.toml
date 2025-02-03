@@ -31,7 +31,8 @@ subtle = "2.6.1"
 tempfile = "3.13.0"
 pkcs8 = "0.10.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-serde = "0.2"
 lettre = { version = "0.11.11", features = [
     "smtp-transport",
     "pool",

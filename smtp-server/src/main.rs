@@ -16,7 +16,7 @@ use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, Level};
 use worker::{deferred_worker::DeferredWorker, Job};
 
 mod callbacks;
@@ -57,19 +57,42 @@ async fn main() -> Result<()> {
 }
 
 async fn run_server(config_path: &str) -> Result<()> {
+    // Load the configuration from the file.
+    let cfg = config::Cfg::load(config_path).wrap_err("error loading configuration")?;
+
+    let level: Level = cfg
+        .log
+        .level
+        .parse()
+        .into_diagnostic()
+        .wrap_err("error parsing log level")?;
+
     // Initialize the tracing subscriber
-    tracing_subscriber::fmt()
+    let ts = tracing_subscriber::fmt()
+        .with_max_level(level)
         .with_target(false)
         .with_line_number(false)
         .with_level(true)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("HEDWIG_LOG_LEVEL")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("hedwig=info")),
-        )
-        .init();
+        );
 
-    // Load the configuration from the file.
-    let cfg = config::Cfg::load(config_path).wrap_err("error loading configuration")?;
+    if cfg.log.format == "json" {
+        ts.json().init();
+    } else {
+        ts.init();
+    }
+
+    // tracing_subscriber::fmt()
+    //     .with_target(false)
+    //     .with_line_number(false)
+    //     .with_level(true)
+    //     .with_env_filter(
+    //         tracing_subscriber::EnvFilter::try_from_env("HEDWIG_LOG_LEVEL")
+    //             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("hedwig=info")),
+    //     )
+    //     .init();
 
     if cfg.server.dkim.is_some() {
         info!("DKIM is enabled");

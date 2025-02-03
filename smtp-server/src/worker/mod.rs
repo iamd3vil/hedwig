@@ -1,3 +1,4 @@
+use crate::config::DkimKeyType;
 use async_channel::Receiver;
 use email_address_parser::EmailAddress;
 use hickory_resolver::{
@@ -6,7 +7,6 @@ use hickory_resolver::{
 };
 use lettre::{address::Envelope, Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use mail_auth::common::headers::HeaderWriter;
-use crate::config::DkimKeyType;
 use mail_auth::{
     common::crypto::{RsaKey, Sha256},
     dkim::DkimSigner,
@@ -290,9 +290,11 @@ impl<'a> Worker<'a> {
                             let pem = pem::parse(&priv_key_str)
                                 .into_diagnostic()
                                 .wrap_err("parsing Ed25519 PEM")?;
-                            
-                            let pk_ed25519 = mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(pem.contents())
-                                .expect("error reading Ed25519 priv key");
+
+                            let pk_ed25519 = mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(
+                                pem.contents(),
+                            )
+                            .expect("error reading Ed25519 priv key");
                             DkimSigner::from_key(pk_ed25519)
                                 .domain(&dkim.domain)
                                 .selector(&dkim.selector)

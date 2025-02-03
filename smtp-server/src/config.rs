@@ -1,9 +1,12 @@
 use config::{Config, File};
 use miette::{IntoDiagnostic, Result};
 use serde::Deserialize;
+use tracing::Level;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Cfg {
+    #[serde(default)]
+    pub log: CfgLog,
     pub server: CfgServer,
     pub storage: CfgStorage,
 }
@@ -36,6 +39,21 @@ pub enum DkimKeyType {
 impl Default for DkimKeyType {
     fn default() -> Self {
         DkimKeyType::Rsa
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CfgLog {
+    pub level: String,
+    pub format: String,
+}
+
+impl Default for CfgLog {
+    fn default() -> Self {
+        CfgLog {
+            level: Level::INFO.to_string(),
+            format: "fmt".to_string(),
+        }
     }
 }
 
