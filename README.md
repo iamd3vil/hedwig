@@ -67,7 +67,7 @@ This SMTP server is designed with a focus on speed and simplicity. It provides a
 
 4. Run the server:
    ```bash
-   HEDWIG_LOG_LEVEL=info ./target/release/smtp-server
+   HEDWIG_LOG_LEVEL=info ./target/release/hedwig
    ```
 
 ## Configuration
