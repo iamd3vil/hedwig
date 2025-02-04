@@ -1,6 +1,13 @@
-# <img src="logo.png" alt="Hedwig Logo" width="25"> Hedwig
+<p align="center">
+  <img src="logo.png" alt="Hedwig" width="75"/>
+  <h1 align="center">Hedwig</h1>
+</p>
 
-A high-performance, minimalist SMTP server implemented in Rust.
+<p align="center">
+   Hedwig - A high-performance, minimalist SMTP server implemented in Rust.
+</p>
+
+---
 
 ## Overview
 
