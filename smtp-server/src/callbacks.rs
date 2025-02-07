@@ -5,9 +5,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use mail_parser::MessageParser;
 use smtp::{Email, SmtpCallbacks, SmtpError};
-use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
@@ -61,45 +59,33 @@ impl Callbacks {
 
     /// Processes an email by parsing it, storing it, and sending it to a worker.
     async fn process_email(&self, email: &Email) -> Result<(), SmtpError> {
-        // println!("Received email: {:?}", email);
-        // Parse email body.
-        let msg = MessageParser::default().parse(&email.body);
-        if let Some(msg) = msg {
-            // Print each header and html, text body.
-            // Check if message_id exists, or else let's generate one.
-            let ulid = Ulid::new().to_string();
-            let message_id = msg.message_id().unwrap_or(&ulid);
-            let stored_email = StoredEmail {
-                message_id: message_id.to_string(),
-                from: email.from.clone(),
-                to: email.to.clone(),
-                body: email.body.clone(),
-            };
-            // Map any error into a SmtpError.
-            self.storage
-                .put(stored_email, Status::Queued)
-                .await
-                .map_err(|e| SmtpError::ParseError {
-                    message: format!("Failed to store email: {}", e),
-                    span: (0, email.body.len()).into(),
-                })?;
-
-            // Send the email to the worker.
-            let job = Job::new(message_id.to_owned(), 0);
-            self.sender_channel
-                .send(job)
-                .await
-                .map_err(|e| SmtpError::ParseError {
-                    message: format!("Failed to send email to worker: {}", e),
-                    span: (0, email.body.len()).into(),
-                })?;
-        } else {
-            warn!("Error parsing email body, skipping");
-            return Err(SmtpError::ParseError {
-                message: "error parsing email body".into(),
+        let ulid = Ulid::new().to_string();
+        // We are using ulid as the message id instead of message_id from the email.
+        // The issue is we can't depend on the email client to provide a unique message id.
+        let stored_email = StoredEmail {
+            message_id: ulid.clone(),
+            from: email.from.clone(),
+            to: email.to.clone(),
+            body: email.body.clone(),
+        };
+        // Map any error into a SmtpError.
+        self.storage
+            .put(stored_email, Status::Queued)
+            .await
+            .map_err(|e| SmtpError::ParseError {
+                message: format!("Failed to store email: {}", e),
                 span: (0, email.body.len()).into(),
-            });
-        }
+            })?;
+
+        // Send the email to the worker.
+        let job = Job::new(ulid, 0);
+        self.sender_channel
+            .send(job)
+            .await
+            .map_err(|e| SmtpError::ParseError {
+                message: format!("Failed to send email to worker: {}", e),
+                span: (0, email.body.len()).into(),
+            })?;
         Ok(())
     }
 }

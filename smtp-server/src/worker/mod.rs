@@ -101,12 +101,12 @@ impl<'a> Worker<'a> {
     }
 
     async fn process_job(&self, job: &Job) -> Result<()> {
-        debug!(msg_id = ?job.msg_id, "Processing job");
-        let email = match self.storage.get(&job.msg_id, Status::Queued).await {
+        debug!(msg_id = ?job.job_id, "Processing job");
+        let email = match self.storage.get(&job.job_id, Status::Queued).await {
             Ok(Some(email)) => email,
             Ok(None) => {
-                warn!(msg_id = ?job.msg_id, "Email not found in queue");
-                return self.storage.delete(&job.msg_id, Status::Queued).await;
+                warn!(msg_id = ?job.job_id, "Email not found in queue");
+                return self.storage.delete(&job.job_id, Status::Queued).await;
             }
             Err(e) => return Err(e).wrap_err("failed to get email from storage"),
         };
@@ -114,26 +114,26 @@ impl<'a> Worker<'a> {
         let msg = match MessageParser::default().parse(&email.body) {
             Some(msg) => msg,
             None => {
-                error!(msg_id = ?job.msg_id, "Failed to parse email body");
+                error!(msg_id = ?job.job_id, "Failed to parse email body");
                 bail!("failed to parse email body")
             }
         };
 
         if self.disable_outbound {
             info!(
-                msg_id = job.msg_id,
+                msg_id = job.job_id,
                 "Outbound mail disabled, dropping message"
             );
-            return self.storage.delete(&job.msg_id, Status::Queued).await;
+            return self.storage.delete(&job.job_id, Status::Queued).await;
         }
 
         match self.send_email(&msg, &email.body).await {
             Ok(_) => {
-                info!(msg_id = job.msg_id, "Successfully sent email");
-                self.storage.delete(&job.msg_id, Status::Queued).await?;
+                info!(msg_id = job.job_id, "Successfully sent email");
+                self.storage.delete(&job.job_id, Status::Queued).await?;
                 // Delete any meta file in deferred.
                 self.storage
-                    .delete_meta(&job.msg_id)
+                    .delete_meta(&job.job_id)
                     .await
                     .wrap_err("deleting meta file")?;
                 Ok(())
@@ -143,7 +143,7 @@ impl<'a> Worker<'a> {
                     Some(Error::UnexpectedReply(resp)) => {
                         if Self::is_retryable(resp.code()) {
                             warn!(
-                                msg_id = ?job.msg_id,
+                                msg_id = ?job.job_id,
                                 code = resp.code(),
                                 "Retryable error encountered, deferring email"
                             );
@@ -154,11 +154,11 @@ impl<'a> Worker<'a> {
                         Ok(())
                     }
                     _ => {
-                        error!(msg_id = ?job.msg_id, ?e, "Non-retryable error, bouncing email");
+                        error!(msg_id = ?job.job_id, ?e, "Non-retryable error, bouncing email");
                         // Bounce the email.
                         println!("Error sending email: {:?}", e);
                         self.storage
-                            .mv(&job.msg_id, &job.msg_id, Status::Queued, Status::Bounced)
+                            .mv(&job.job_id, &job.job_id, Status::Queued, Status::Bounced)
                             .await
                             .wrap_err("moving from queued to bounced")
                     }
@@ -172,26 +172,26 @@ impl<'a> Worker<'a> {
         let delay = std::cmp::min(delay, self.max_delay);
 
         info!(
-            msg_id = ?job.msg_id,
+            msg_id = ?job.job_id,
             attempts = job.attempts + 1,
             ?delay,
             "Deferring email"
         );
 
         let meta = EmailMetadata {
-            msg_id: job.msg_id.clone(),
+            msg_id: job.job_id.clone(),
             attempts: job.attempts + 1,
             last_attempt: SystemTime::now(),
             next_attempt: SystemTime::now() + delay,
         };
 
         self.storage
-            .put_meta(&job.msg_id, &meta)
+            .put_meta(&job.job_id, &meta)
             .await
             .wrap_err("storing meta file")?;
 
         self.storage
-            .mv(&job.msg_id, &job.msg_id, Status::Queued, Status::Deferred)
+            .mv(&job.job_id, &job.job_id, Status::Queued, Status::Deferred)
             .await
             .wrap_err("moving from queued to deferred")?;
 
@@ -410,12 +410,15 @@ impl<'a> Worker<'a> {
 
 #[derive(Clone, Debug)]
 pub struct Job {
-    pub msg_id: String,
+    pub job_id: String,
     pub attempts: u32,
 }
 
 impl Job {
     pub fn new(msg_id: String, attempts: u32) -> Job {
-        Job { msg_id, attempts }
+        Job {
+            job_id: msg_id,
+            attempts,
+        }
     }
 }

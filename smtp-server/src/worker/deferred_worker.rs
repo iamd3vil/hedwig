@@ -134,7 +134,7 @@ mod tests {
 
         // Check if a job was queued
         let received_job = receiver.recv().await.unwrap();
-        assert_eq!(received_job.msg_id, "test1");
+        assert_eq!(received_job.job_id, "test1");
         assert_eq!(received_job.attempts, 1);
     }
 
