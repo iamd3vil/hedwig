@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use base64::prelude::*;
+use bytes::BytesMut;
+use memchr::{memchr, memchr_iter};
 use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
 use std::os::unix::io::AsRawFd; // or windows equivalent
 use std::os::unix::io::FromRawFd;
@@ -218,43 +220,73 @@ impl SmtpServer {
         session: &mut SmtpSession,
         stream: &mut Box<dyn SmtpStream>,
     ) -> Result<()> {
-        let mut buffer = [0; 4028];
-        let mut data_buffer = Vec::new();
+        let mut buf = BytesMut::with_capacity(32768); // 32kb
+        let mut data_buffer = BytesMut::new();
 
         loop {
-            let n = stream.read(&mut buffer).await.into_diagnostic()?;
+            let n = stream.read_buf(&mut buf).await.into_diagnostic()?;
             if n == 0 {
                 return Ok(());
             }
 
             if session.state == SessionState::ReceivingData {
-                data_buffer.extend_from_slice(&buffer[..n]);
-                if let Some(end_index) = data_buffer
-                    .windows(5)
-                    .position(|window| window == b"\r\n.\r\n")
-                {
-                    let email_body = String::from_utf8_lossy(&data_buffer[..end_index]).to_string();
-                    session.email.body = email_body;
-                    self.callbacks.on_data(&session.email).await?;
-                    stream.write_line(b"250 OK\r\n").await?;
-                    session.state = SessionState::Authenticated;
-                    data_buffer.clear();
+                // Accumulate all incoming data into data_buffer.
+                data_buffer.extend_from_slice(&buf[..]);
+                buf.clear();
+
+                // Scan for the full termination sequence ("\r\n.\r\n") in data_buffer.
+                let mut termination_found = false;
+                for pos in memchr_iter(b'\r', &data_buffer) {
+                    if pos + 5 <= data_buffer.len() && &data_buffer[pos..pos + 5] == b"\r\n.\r\n" {
+                        // We've found the termination sequence.
+                        let email_body = String::from_utf8_lossy(&data_buffer[..pos]).to_string();
+                        session.email.body = email_body;
+                        self.callbacks.on_data(&session.email).await?;
+                        stream.write_line(b"250 OK\r\n").await?;
+                        session.state = SessionState::Authenticated;
+                        data_buffer.clear();
+                        termination_found = true;
+                        break;
+                    }
+                }
+                if termination_found {
                     continue;
                 }
-            } else {
-                let command = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
-                match parse_command(&command, &session.state) {
-                    Ok(cmd) => {
-                        if self.handle_command(session, cmd, stream).await? {
-                            return Ok(());
+                // Else, continue reading more DATA.
+                continue;
+            }
+
+            // Process normal commands by scanning for CRLF in buf.
+            while let Some(cr) = memchr(b'\r', &buf) {
+                if cr + 1 < buf.len() && buf[cr + 1] == b'\n' {
+                    // Extract the complete line, including CRLF.
+                    let line = buf.split_to(cr + 2);
+                    // Remove CRLF.
+                    let line = &line[..line.len().saturating_sub(2)];
+                    let command = std::str::from_utf8(line)
+                        .map_err(|err| SmtpError::ParseError {
+                            message: format!("Invalid UTF-8 sequence: {}", err),
+                            span: (0, line.len()).into(),
+                        })?
+                        .trim()
+                        .to_string();
+
+                    match parse_command(&command, &session.state) {
+                        Ok(cmd) => {
+                            if self.handle_command(session, cmd, stream).await? {
+                                return Ok(());
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Parse error: {}", e);
+                            stream
+                                .write_line(b"500 Syntax error, command unrecognized\r\n")
+                                .await?;
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Parse error: {}", e);
-                        stream
-                            .write_line(b"500 Syntax error, command unrecognized\r\n")
-                            .await?;
-                    }
+                } else {
+                    // If we find a CR that isn’t followed by LF, break and wait for more data.
+                    break;
                 }
             }
         }

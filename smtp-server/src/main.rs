@@ -84,16 +84,6 @@ async fn run_server(config_path: &str) -> Result<()> {
         ts.init();
     }
 
-    // tracing_subscriber::fmt()
-    //     .with_target(false)
-    //     .with_line_number(false)
-    //     .with_level(true)
-    //     .with_env_filter(
-    //         tracing_subscriber::EnvFilter::try_from_env("HEDWIG_LOG_LEVEL")
-    //             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("hedwig=info")),
-    //     )
-    //     .init();
-
     if cfg.server.dkim.is_some() {
         info!("DKIM is enabled");
     } else {
