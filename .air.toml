@@ -1,0 +1,15 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "cargo build -r"
+bin = "./target/release/hedwig"
+include_ext = ["rs", "toml"]
+exclude_dir = ["target", "tmp"]
+delay = 1000                    # in milliseconds
+
+[screen]
+clear_on_rebuild = true
+
+[misc]
+clean_on_exit = true
