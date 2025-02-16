@@ -257,17 +257,17 @@ impl Worker {
     }
 
     async fn send_email<'b>(&self, email: &'b Message<'b>, body: &str) -> Result<()> {
+        let from = email
+            .from()
+            .and_then(|f| f.first())
+            .and_then(|f| f.address())
+            .ok_or_else(|| miette::miette!("Invalid from address"))?;
         // Parse to address for each.
         for to in email.to().iter() {
             let to = to
                 .first()
                 .and_then(|t| t.address.as_ref())
                 .ok_or_else(|| miette::miette!("Invalid to address"))?;
-            let from = email
-                .from()
-                .and_then(|f| f.first())
-                .and_then(|f| f.address())
-                .ok_or_else(|| miette::miette!("Invalid from address"))?;
             info!(?to, ?from, "Attempting to send email");
             // Strip `<` and `>` from email address.
             let to = to.trim_matches(|c| c == '<' || c == '>');
