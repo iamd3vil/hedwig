@@ -262,6 +262,31 @@ impl Worker {
             .and_then(|f| f.first())
             .and_then(|f| f.address())
             .ok_or_else(|| miette::miette!("Invalid from address"))?;
+
+        let body = body.as_bytes();
+        let signed_email;
+        let raw_email = match &self.dkim_signer {
+            Some(signer) => {
+                debug!("Signing email with DKIM");
+                let signature = match &signer {
+                    DkimSignerType::Rsa(signer) => signer
+                        .sign(body)
+                        .into_diagnostic()
+                        .wrap_err("signing email with dkim")?
+                        .to_header(),
+                    DkimSignerType::Ed25519(signer) => signer
+                        .sign(body)
+                        .into_diagnostic()
+                        .wrap_err("signing email with dkim")?
+                        .to_header(),
+                };
+
+                signed_email = Self::insert_dkim_signature(&body, &signature)?;
+                signed_email.as_slice()
+            }
+            None => body,
+        };
+
         // Parse to address for each.
         for to in email.to().iter() {
             let to = to
@@ -315,40 +340,12 @@ impl Worker {
                 let transport: AsyncSmtpTransport<Tokio1Executor> =
                     self.pool.get(&mx_record.exchange().to_string()).await?;
 
-                if let Some(signer) = &self.dkim_signer {
-                    debug!("Signing email with DKIM");
-                    let raw_email = body.as_bytes();
-                    let signature = match &signer {
-                        DkimSignerType::Rsa(signer) => signer
-                            .sign(&raw_email)
-                            .into_diagnostic()
-                            .wrap_err("signing email with dkim")?
-                            .to_header(),
-                        DkimSignerType::Ed25519(signer) => signer
-                            .sign(&raw_email)
-                            .into_diagnostic()
-                            .wrap_err("signing email with dkim")?
-                            .to_header(),
-                    };
-
-                    // Insert DKIM signature.
-                    let raw_email = Self::insert_dkim_signature(raw_email, &signature)?;
-
-                    transport
-                        .send_raw(&envelope, &raw_email)
-                        .await
-                        .into_diagnostic()
-                        .wrap_err("sending raw message, with dkim")?;
-                    info!("Successfully sent email with DKIM signature");
-                    success = true
-                } else {
-                    transport
-                        .send_raw(&envelope, body.as_bytes())
-                        .await
-                        .into_diagnostic()
-                        .wrap_err("sending raw message")?;
-                    success = true
-                };
+                transport
+                    .send_raw(&envelope, raw_email)
+                    .await
+                    .into_diagnostic()
+                    .wrap_err("sending raw message")?;
+                success = true;
 
                 if success {
                     break;
