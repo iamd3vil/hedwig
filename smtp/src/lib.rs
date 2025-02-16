@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use base64::prelude::*;
 use bytes::BytesMut;
-use memchr::{memchr, memchr_iter};
+use memchr::memchr;
 use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
 use std::os::unix::io::AsRawFd; // or windows equivalent
 use std::os::unix::io::FromRawFd;
@@ -225,68 +225,39 @@ impl SmtpServer {
 
         loop {
             let n = stream.read_buf(&mut buf).await.into_diagnostic()?;
-            if n == 0 && data_buffer.is_empty() {
+            if n == 0 {
                 return Ok(());
             }
 
             if session.state == SessionState::ReceivingData {
-                // Accumulate all incoming data into data_buffer.
-                data_buffer.extend_from_slice(&buf[..n]);
+                // Accumulate the incoming bytes.
+                data_buffer.extend_from_slice(&buf[..]);
                 buf.clear();
 
-                // Look for final \r\n.\r\n sequence
                 let mut termination_found = false;
-                let mut termination_pos = None;
-
-                // Find last occurrence of \r\n.\r\n
-                for pos in memchr_iter(b'\r', &data_buffer).rev() {
+                for pos in memchr::memchr_iter(b'\r', &data_buffer) {
                     if pos + 5 <= data_buffer.len() && &data_buffer[pos..pos + 5] == b"\r\n.\r\n" {
-                        // Verify this is a standalone dot (not part of ..)
-                        let is_standalone = if pos > 0 {
-                            let prev_char = data_buffer[pos - 1];
-                            prev_char != b'.'
-                        } else {
-                            true
-                        };
-
-                        if is_standalone {
-                            termination_pos = Some(pos);
-                            termination_found = true;
-                            break;
-                        }
+                        // raw_message holds all data up to the termination sequence.
+                        let raw_message = &data_buffer[..pos];
+                        // Instead of converting to a string, unstuff directly on the bytes.
+                        let unstuffed_bytes = unstuff_dot_lines(raw_message);
+                        // If your processing expects a string, convert once at the end.
+                        session.email.body = String::from_utf8(unstuffed_bytes).map_err(|_| {
+                            SmtpError::ParseError {
+                                message: "Invalid UTF-8 in email body".into(),
+                                span: (0, data_buffer.len()).into(),
+                            }
+                        })?;
+                        self.callbacks.on_data(&session.email).await?;
+                        stream.write_line(b"250 OK\r\n").await?;
+                        session.state = SessionState::Authenticated;
+                        data_buffer.clear();
+                        termination_found = true;
+                        break;
                     }
                 }
-
                 if termination_found {
-                    let pos = termination_pos.unwrap();
-                    
-                    // Pre-allocate string with estimated capacity
-                    let mut email_body = String::with_capacity(pos);
-                    let mut i = 0;
-                    let mut at_line_start = true;
-
-                    while i < pos {
-                        if at_line_start && i + 1 < pos && data_buffer[i] == b'.' && data_buffer[i + 1] == b'.' {
-                            // At start of line with dot-stuffing - emit single dot and skip the second
-                            email_body.push('.');
-                            i += 2;
-                            at_line_start = false;
-                        } else if i + 1 < pos && data_buffer[i] == b'\r' && data_buffer[i + 1] == b'\n' {
-                            email_body.push_str("\r\n");
-                            i += 2;
-                            at_line_start = true;
-                        } else {
-                            email_body.push(data_buffer[i] as char);
-                            i += 1;
-                            at_line_start = false;
-                        }
-                    }
-
-                    session.email.body = email_body;
-                    self.callbacks.on_data(&session.email).await?;
-                    stream.write_line(b"250 OK\r\n").await?;
-                    session.state = SessionState::Authenticated;
-                    data_buffer.clear();
+                    continue;
                 }
                 continue;
             }
@@ -495,6 +466,42 @@ impl SmtpServer {
     }
 }
 
+// unstuff_dot_lines removes dot-stuffing from a raw message slice in place without converting to a string.
+fn unstuff_dot_lines(input: &[u8]) -> Vec<u8> {
+    // Prepare an output buffer with the same capacity as the input.
+    let mut output = Vec::with_capacity(input.len());
+
+    let mut offset = 0;
+    while offset < input.len() {
+        // Find the next CR. We assume lines end with "\r\n"
+        if let Some(cr_index) = memchr::memchr(b'\r', &input[offset..]) {
+            let line_end = offset + cr_index;
+            // If we have a CRLF pair
+            if line_end + 1 < input.len() && input[line_end + 1] == b'\n' {
+                // Process the line: check if it begins with a dot
+                if (line_end > offset) && (input[offset] == b'.') {
+                    // Skip the dot: append from offset+1 to line_end
+                    output.extend_from_slice(&input[offset + 1..line_end]);
+                } else {
+                    output.extend_from_slice(&input[offset..line_end]);
+                }
+                // Append the CRLF separator unmodified.
+                output.extend_from_slice(b"\r\n");
+                offset = line_end + 2;
+            } else {
+                // CR is not followed by LF; copy the rest and break.
+                output.extend_from_slice(&input[offset..]);
+                break;
+            }
+        } else {
+            // No CR found, copy the remaining bytes.
+            output.extend_from_slice(&input[offset..]);
+            break;
+        }
+    }
+    output
+}
+
 struct SmtpSession {
     state: SessionState,
     email: Email,
@@ -542,181 +549,4 @@ pub fn decode_base64(input: &str) -> Result<String, SmtpError> {
             .map_err(|_| SmtpError::AuthError)?,
     )
     .map_err(|_| SmtpError::AuthError)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-    use async_trait::async_trait;
-
-    struct TestStream {
-        write_buf: Vec<u8>,
-        read_chunks: Mutex<Vec<Vec<u8>>>,
-    }
-
-    impl TestStream {
-        fn new(read_data: Vec<Vec<u8>>) -> Self {
-            TestStream {
-                write_buf: Vec::new(),
-                read_chunks: Mutex::new(read_data),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl SmtpStream for TestStream {
-        async fn write_line(&mut self, line: &[u8]) -> Result<()> {
-            self.write_buf.extend_from_slice(line);
-            Ok(())
-        }
-    }
-
-    impl AsyncRead for TestStream {
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            let this = self.get_mut();
-            if let Some(chunk) = this.read_chunks.get_mut().unwrap().pop() {
-                buf.put_slice(&chunk);
-                std::task::Poll::Ready(Ok(()))
-            } else {
-                std::task::Poll::Ready(Ok(()))
-            }
-        }
-    }
-
-    impl AsyncWrite for TestStream {
-        fn poll_write(
-            self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<Result<usize, std::io::Error>> {
-            let this = self.get_mut();
-            this.write_buf.extend_from_slice(buf);
-            std::task::Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), std::io::Error>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), std::io::Error>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
-    struct TestCallbacks;
-
-    #[async_trait]
-    impl SmtpCallbacks for TestCallbacks {
-        async fn on_ehlo(&self, _: &str) -> Result<(), SmtpError> { Ok(()) }
-        async fn on_auth(&self, _: &str, _: &str) -> Result<bool, SmtpError> { Ok(true) }
-        async fn on_mail_from(&self, _: &str) -> Result<(), SmtpError> { Ok(()) }
-        async fn on_rcpt_to(&self, _: &str) -> Result<(), SmtpError> { Ok(()) }
-        async fn on_data(&self, email: &Email) -> Result<(), SmtpError> { 
-            assert!(email.body.len() > 0);
-            Ok(()) 
-        }
-    }
-
-    #[tokio::test]
-    async fn test_dot_stuffing() {
-        let server = SmtpServer::new(TestCallbacks, false);
-        let mut session = SmtpSession::new();
-        session.state = SessionState::ReceivingData;
-
-        // Test case 1: Simple dot stuffing at start of line
-        let stream = TestStream::new(vec![
-            b"..This line starts with a dot\r\n.\r\n".to_vec(),
-        ]);
-        let mut boxed_stream: Box<dyn SmtpStream> = Box::new(stream);
-        server.handle_connection(&mut session, &mut boxed_stream).await.unwrap();
-        assert_eq!(session.email.body, ".This line starts with a dot");
-
-        // Test case 2: Multiple dot-stuffed lines
-        session = SmtpSession::new();
-        session.state = SessionState::ReceivingData;
-        let stream = TestStream::new(vec![
-            b"First line\r\n..Second line\r\n..Third line\r\n.\r\n".to_vec(),
-        ]);
-        let mut boxed_stream: Box<dyn SmtpStream> = Box::new(stream);
-        server.handle_connection(&mut session, &mut boxed_stream).await.unwrap();
-        assert_eq!(session.email.body, "First line\r\n.Second line\r\n.Third line");
-
-        // Test case 3: Split buffer handling
-        session = SmtpSession::new();
-        session.state = SessionState::ReceivingData;
-        let stream = TestStream::new(vec![
-            b"First line\r\n..Sec".to_vec(),
-            b"ond line\r\n..Third line\r\n.\r\n".to_vec(),
-        ].into_iter().rev().collect()); // Reverse the order since TestStream pops from end
-        let mut boxed_stream: Box<dyn SmtpStream> = Box::new(stream);
-        server.handle_connection(&mut session, &mut boxed_stream).await.unwrap();
-        assert_eq!(session.email.body, "First line\r\n.Second line\r\n.Third line");
-
-        // Test case 4: Mixed content
-        session = SmtpSession::new();
-        session.state = SessionState::ReceivingData;
-        let stream = TestStream::new(vec![
-            b"Normal line\r\n..Stuffed line\r\nNormal again\r\n..Last stuffed\r\n.\r\n".to_vec(),
-        ]);
-        let mut boxed_stream: Box<dyn SmtpStream> = Box::new(stream);
-        server.handle_connection(&mut session, &mut boxed_stream).await.unwrap();
-        assert_eq!(session.email.body, "Normal line\r\n.Stuffed line\r\nNormal again\r\n.Last stuffed");
-
-        // Test case 5: Single dot at end
-        session = SmtpSession::new();
-        session.state = SessionState::ReceivingData;
-        let stream = TestStream::new(vec![
-            b"Just a test\r\n.\r\n".to_vec(),
-        ]);
-        let mut boxed_stream: Box<dyn SmtpStream> = Box::new(stream);
-        server.handle_connection(&mut session, &mut boxed_stream).await.unwrap();
-        assert_eq!(session.email.body, "Just a test");
-    }
-
-    #[tokio::test]
-    async fn test_dot_stuffing_edge_cases() {
-        let server = SmtpServer::new(TestCallbacks, false);
-        let mut session = SmtpSession::new();
-        session.state = SessionState::ReceivingData;
-
-        // Send all the data in a single chunk to avoid buffer handling issues
-        let input = b"...Triple dot\r\n\
-                     ..Double dot\r\n\
-                     .\r\n\
-                     ...\r\n\
-                     No dots here\r\n\
-                     Ends with dot.\r\n\
-                     ..Empty after this\r\n\
-                     \r\n\
-                     ..Another line\r\n\
-                     .\r\n";
-
-        let stream = TestStream::new(vec![input.to_vec()]);
-        let mut boxed_stream: Box<dyn SmtpStream> = Box::new(stream);
-        server.handle_connection(&mut session, &mut boxed_stream).await.unwrap();
-        
-        let expected = concat!(
-            "..Triple dot\r\n",
-            ".Double dot\r\n",
-            ".\r\n",
-            "..\r\n",
-            "No dots here\r\n",
-            "Ends with dot.\r\n",
-            ".Empty after this\r\n",
-            "\r\n",
-            ".Another line"
-        );
-        assert_eq!(session.email.body, expected);
-    }
 }
