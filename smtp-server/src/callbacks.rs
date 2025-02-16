@@ -123,7 +123,6 @@ impl SmtpCallbacks for Callbacks {
 
     // Handles the RCPT TO command.
     async fn on_rcpt_to(&self, _to: &str) -> Result<(), SmtpError> {
-        // println!("Rcpt to: {}", to);
         Ok(())
     }
 

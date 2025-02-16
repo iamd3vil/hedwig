@@ -129,6 +129,10 @@ async fn run_server(config_path: &str) -> Result<()> {
         None
     };
 
+    let auth_enabled = cfg.server.auth.is_some();
+
+    info!("Auth enabled: {}", auth_enabled);
+
     let smtp_server = SmtpServer::new(
         callbacks::Callbacks::new(
             Arc::clone(&storage),
@@ -136,7 +140,7 @@ async fn run_server(config_path: &str) -> Result<()> {
             receiver_channel.clone(),
             cfg.clone(),
         ),
-        true,
+        auth_enabled,
     );
 
     // Check if there are any emails to process.

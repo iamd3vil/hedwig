@@ -311,7 +311,11 @@ impl SmtpServer {
                 if self.tls_acceptor.is_some() {
                     response.push_str("250-STARTTLS\r\n");
                 }
-                response.push_str("250-AUTH PLAIN LOGIN\r\n250 OK\r\n");
+                // Add AUTH support if enabled.
+                if self.auth_enabled {
+                    response.push_str("250-AUTH PLAIN LOGIN\r\n");
+                }
+                response.push_str("250 OK\r\n");
                 stream.write_line(response.as_bytes()).await?;
                 if self.auth_enabled {
                     session.state = SessionState::Greeted;
