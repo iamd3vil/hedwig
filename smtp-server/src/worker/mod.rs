@@ -15,6 +15,7 @@ use mail_parser::{Message, MessageParser};
 use mail_send::Error;
 use miette::{bail, Context, IntoDiagnostic, Result};
 // use pool::SmtpClientPool;
+use memchr::memmem;
 use pool::PoolManager;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
@@ -360,51 +361,37 @@ impl<'a> Worker<'a> {
     /// Inserts a DKIM signature into a raw email body.
     /// The signature should be inserted after the last existing header but before the message body.
     pub fn insert_dkim_signature(raw_email: &[u8], dkim_signature: &str) -> Result<Vec<u8>> {
-        // Convert raw email to string for easier manipulation
-        let email_str = String::from_utf8(raw_email.to_vec()).into_diagnostic()?;
+        // Find the boundary of headers and body.
+        let separator = b"\r\n\r\n";
+        let boundary = memmem::find(raw_email, separator).ok_or_else(|| {
+            miette::miette!("Invalid email format: header–body boundary not found")
+        })?;
 
-        // Find the boundary between headers and body
-        // Headers and body are separated by \r\n\r\n according to RFC 5322
-        let parts: Vec<&str> = email_str.split("\r\n\r\n").collect();
-
-        if parts.len() < 2 {
-            bail!("Invalid email format: Could not find header-body boundary");
-        }
-
-        // Split headers into lines
-        let headers = parts[0];
-
-        // Format DKIM signature as a proper header
-        // Remove any existing DKIM-Signature header if present
-        let headers: Vec<&str> = headers
-            .lines()
-            .filter(|line| !line.starts_with("DKIM-Signature:"))
-            .collect();
-
-        // Construct new email with DKIM signature
-        let mut new_email = String::with_capacity(email_str.len() + dkim_signature.len() + 100);
-
-        // Add existing headers
-        for header in headers {
-            new_email.push_str(header);
-            new_email.push_str("\r\n");
-        }
-
-        // Add DKIM signature
-        new_email.push_str(dkim_signature);
-        // new_email.push_str("\r\n");
-        new_email.push_str("\r\n");
-        new_email.push_str(parts[1]);
-
-        // If there are more parts, add all the remaining parts of the email.
-        if parts.len() > 2 {
-            for part in parts.iter().skip(2) {
-                new_email.push_str("\r\n\r\n");
-                new_email.push_str(part);
+        // Copy the header part while filtering out any existing "DKIM-Signature:" lines.
+        let mut new_email = Vec::with_capacity(raw_email.len() + dkim_signature.len() + 100);
+        {
+            // Process headers line by line.
+            for line in raw_email[..boundary].split(|&b| b == b'\n') {
+                // Trim trailing carriage returns, if any.
+                if let Some(line) = line.strip_suffix(&[b'\r']) {
+                    if !line.starts_with(b"DKIM-Signature:") {
+                        new_email.extend_from_slice(line);
+                        new_email.extend_from_slice(b"\r\n");
+                    }
+                } else if !line.starts_with(b"DKIM-Signature:") {
+                    new_email.extend_from_slice(line);
+                    new_email.extend_from_slice(b"\r\n");
+                }
             }
         }
 
-        Ok(new_email.into_bytes())
+        // Insert DKIM signature.
+        new_email.extend_from_slice(dkim_signature.as_bytes());
+        new_email.extend_from_slice(b"\r\n\r\n");
+
+        // Append the remainder of the email body.
+        new_email.extend_from_slice(&raw_email[boundary + separator.len()..]);
+        Ok(new_email)
     }
 }
 
@@ -420,5 +407,84 @@ impl Job {
             job_id: msg_id,
             attempts,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_insert_dkim_signature_basic() {
+        // A simple email with headers and a body.
+        let raw_email = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Email\r\n\r\nThis is the email body.";
+        let dkim_signature = "DKIM-Signature: test-signature";
+
+        // Call the function.
+        let result = Worker::insert_dkim_signature(raw_email, dkim_signature);
+        assert!(
+            result.is_ok(),
+            "Expected to successfully insert DKIM signature"
+        );
+
+        let new_email = result.unwrap();
+        // Use the returned Vec<u8> immediately and convert to &str.
+        let new_email_str = std::str::from_utf8(&new_email).expect("valid utf8");
+
+        // The expected output should have the DKIM signature header inserted
+        // after existing headers and before the empty line that starts the body.
+        let expected = "From: sender@example.com\r\n\
+                        To: recipient@example.com\r\n\
+                        Subject: Test Email\r\n\
+                        DKIM-Signature: test-signature\r\n\r\n\
+                        This is the email body.";
+
+        // For easier comparison, remove extra whitespace.
+        assert_eq!(
+            new_email_str.replace(" ", ""),
+            expected.replace(" ", ""),
+            "The DKIM signature should be inserted in the header block"
+        );
+    }
+
+    #[test]
+    fn test_insert_dkim_signature_removes_existing_dkim() {
+        // Email containing an existing DKIM header.
+        let raw_email = b"From: sender@example.com\r\nDKIM-Signature: old-signature\r\nSubject: Another Test\r\n\r\nThe email body.";
+        let dkim_signature = "DKIM-Signature: new-signature";
+
+        let result = Worker::insert_dkim_signature(raw_email, dkim_signature);
+        assert!(
+            result.is_ok(),
+            "Expected to successfully insert DKIM signature even with existing one"
+        );
+
+        let new_email = result.unwrap();
+        let new_email_str = std::str::from_utf8(&new_email).expect("valid utf8");
+
+        // The expected headers should not include the obsolete DKIM header.
+        let expected = "From: sender@example.com\r\n\
+                        Subject: Another Test\r\n\
+                        DKIM-Signature: new-signature\r\n\r\n\
+                        The email body.";
+        assert_eq!(
+            new_email_str.replace(" ", ""),
+            expected.replace(" ", ""),
+            "Should remove any existing DKIM-Signature header and insert the new one"
+        );
+    }
+
+    #[test]
+    fn test_insert_dkim_signature_missing_boundary() {
+        // Email without the required \r\n\r\n boundary.
+        let raw_email = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Missing Boundary\r\nThis is all header (missing boundary)";
+        let dkim_signature = "DKIM-Signature: test-signature";
+
+        let result = Worker::insert_dkim_signature(raw_email, dkim_signature);
+        // We expect an error because the header to body boundary is missing.
+        assert!(
+            result.is_err(),
+            "Expected an error when there is no header-body separator"
+        );
     }
 }
