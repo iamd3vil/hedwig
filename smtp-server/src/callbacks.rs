@@ -45,6 +45,7 @@ impl Callbacks {
                     cfg.server.outbound_local.unwrap_or(false),
                     cfg.server.pool_size.unwrap_or(100),
                 )
+                .await
                 .expect("Failed to create worker");
                 worker.run().await;
             });

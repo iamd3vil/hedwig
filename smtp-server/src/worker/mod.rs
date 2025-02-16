@@ -6,11 +6,11 @@ use hickory_resolver::{
     AsyncResolver, TokioAsyncResolver,
 };
 use lettre::{address::Envelope, Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
-use mail_auth::common::headers::HeaderWriter;
 use mail_auth::{
-    common::crypto::{RsaKey, Sha256},
+    common::crypto::{Ed25519Key, RsaKey, Sha256},
     dkim::DkimSigner,
 };
+use mail_auth::{common::headers::HeaderWriter, dkim::Done};
 use mail_parser::{Message, MessageParser};
 use mail_send::Error;
 use miette::{bail, Context, IntoDiagnostic, Result};
@@ -41,13 +41,18 @@ pub struct EmailMetadata {
     pub msg_id: String,
 }
 
-pub struct Worker<'a> {
+pub enum DkimSignerType {
+    Rsa(DkimSigner<RsaKey<Sha256>, Done>),
+    Ed25519(DkimSigner<Ed25519Key, Done>),
+}
+
+pub struct Worker {
     channel: Receiver<Job>,
     storage: Arc<dyn Storage>,
     resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
 
     pool: PoolManager,
-    dkim: &'a Option<CfgDKIM>,
+    dkim_signer: Option<DkimSignerType>,
 
     /// disable_outbound when set true, all outbound emails will be discarded.
     disable_outbound: bool,
@@ -59,11 +64,11 @@ pub struct Worker<'a> {
     max_delay: Duration,
 }
 
-impl<'a> Worker<'a> {
-    pub fn new(
+impl Worker {
+    pub async fn new(
         channel: Receiver<Job>,
         storage: Arc<dyn Storage>,
-        dkim: &'a Option<CfgDKIM>,
+        dkim: &Option<CfgDKIM>,
         disable_outbound: bool,
         outbound_local: bool,
         pool_size: u64,
@@ -73,15 +78,67 @@ impl<'a> Worker<'a> {
             .into_diagnostic()
             .wrap_err("creating dns resolver")?;
         let pool = PoolManager::new(pool_size, outbound_local);
+
+        // Create DKIM signer if dkim is enabled.
+        let dkim_signer = match dkim {
+            None => None,
+            Some(dkim) => {
+                let priv_key = fs::read_to_string(&dkim.private_key)
+                    .await
+                    .into_diagnostic()
+                    .wrap_err("reading private key")?;
+
+                let signer: DkimSignerType = match dkim.key_type {
+                    DkimKeyType::Rsa => {
+                        let pk_rsa = RsaKey::<Sha256>::from_rsa_pem(&priv_key)
+                            .expect("error reading RSA priv key");
+                        DkimSignerType::Rsa(
+                            DkimSigner::from_key(pk_rsa)
+                                .domain(&dkim.domain)
+                                .selector(&dkim.selector)
+                                .headers(DKIM_HEADERS)
+                                .expiration(60 * 60 * 7)
+                                .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                                .header_canonicalization(
+                                    mail_auth::dkim::Canonicalization::Relaxed,
+                                ),
+                        )
+                    }
+                    DkimKeyType::Ed25519 => {
+                        // Parse PEM to get DER bytes
+                        let pem = pem::parse(&priv_key)
+                            .into_diagnostic()
+                            .wrap_err("parsing Ed25519 PEM")?;
+
+                        let pk_ed25519 =
+                            mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(pem.contents())
+                                .expect("error reading Ed25519 priv key");
+                        DkimSignerType::Ed25519(
+                            DkimSigner::from_key(pk_ed25519)
+                                .domain(&dkim.domain)
+                                .selector(&dkim.selector)
+                                .headers(DKIM_HEADERS)
+                                .expiration(60 * 60 * 7)
+                                .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                                .header_canonicalization(
+                                    mail_auth::dkim::Canonicalization::Relaxed,
+                                ),
+                        )
+                    }
+                };
+                Some(signer)
+            }
+        };
+
         Ok(Worker {
             channel,
             storage,
             resolver,
             pool,
-            dkim,
             disable_outbound,
             initial_delay: Duration::from_secs(60),
             max_delay: Duration::from_secs(60 * 60 * 24),
+            dkim_signer,
         })
     }
 
@@ -202,15 +259,15 @@ impl<'a> Worker<'a> {
     async fn send_email<'b>(&self, email: &'b Message<'b>, body: &str) -> Result<()> {
         // Parse to address for each.
         for to in email.to().iter() {
-            let to = to.first().unwrap().address.as_ref().unwrap();
+            let to = to
+                .first()
+                .and_then(|t| t.address.as_ref())
+                .ok_or_else(|| miette::miette!("Invalid to address"))?;
             let from = email
                 .from()
-                .unwrap()
-                .first()
-                .unwrap()
-                .address
-                .as_ref()
-                .unwrap();
+                .and_then(|f| f.first())
+                .and_then(|f| f.address())
+                .ok_or_else(|| miette::miette!("Invalid from address"))?;
             info!(?to, ?from, "Attempting to send email");
             // Strip `<` and `>` from email address.
             let to = to.trim_matches(|c| c == '<' || c == '>');
@@ -252,62 +309,26 @@ impl<'a> Worker<'a> {
 
             // Try each MX record in order of preference
             let mut success = false;
-            for mx_record in mx.iter().collect::<Vec<_>>() {
+            for mx_record in mx.iter() {
                 debug!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
 
                 let transport: AsyncSmtpTransport<Tokio1Executor> =
                     self.pool.get(&mx_record.exchange().to_string()).await?;
 
-                if let Some(dkim) = &self.dkim {
+                if let Some(signer) = &self.dkim_signer {
                     debug!("Signing email with DKIM");
-                    let priv_key = fs::read(&dkim.private_key)
-                        .await
-                        .into_diagnostic()
-                        .wrap_err("reading private key")?;
-
-                    let priv_key_str = String::from_utf8(priv_key)
-                        .into_diagnostic()
-                        .wrap_err("converting private key to string")?;
-
                     let raw_email = body.as_bytes();
-                    let signature = match dkim.key_type {
-                        DkimKeyType::Rsa => {
-                            let pk_rsa = RsaKey::<Sha256>::from_rsa_pem(&priv_key_str)
-                                .expect("error reading RSA priv key");
-                            DkimSigner::from_key(pk_rsa)
-                                .domain(&dkim.domain)
-                                .selector(&dkim.selector)
-                                .headers(DKIM_HEADERS)
-                                .expiration(60 * 60 * 7)
-                                .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
-                                .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
-                                .sign(raw_email)
-                                .into_diagnostic()
-                                .wrap_err("signing message with RSA")?
-                                .to_header()
-                        }
-                        DkimKeyType::Ed25519 => {
-                            // Parse PEM to get DER bytes
-                            let pem = pem::parse(&priv_key_str)
-                                .into_diagnostic()
-                                .wrap_err("parsing Ed25519 PEM")?;
-
-                            let pk_ed25519 = mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(
-                                pem.contents(),
-                            )
-                            .expect("error reading Ed25519 priv key");
-                            DkimSigner::from_key(pk_ed25519)
-                                .domain(&dkim.domain)
-                                .selector(&dkim.selector)
-                                .headers(DKIM_HEADERS)
-                                .expiration(60 * 60 * 7)
-                                .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
-                                .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
-                                .sign(raw_email)
-                                .into_diagnostic()
-                                .wrap_err("signing message with Ed25519")?
-                                .to_header()
-                        }
+                    let signature = match &signer {
+                        DkimSignerType::Rsa(signer) => signer
+                            .sign(&raw_email)
+                            .into_diagnostic()
+                            .wrap_err("signing email with dkim")?
+                            .to_header(),
+                        DkimSignerType::Ed25519(signer) => signer
+                            .sign(&raw_email)
+                            .into_diagnostic()
+                            .wrap_err("signing email with dkim")?
+                            .to_header(),
                     };
 
                     // Insert DKIM signature.
