@@ -3,9 +3,10 @@ use clap::Parser;
 use config::{CfgDKIM, CfgStorage, DkimKeyType};
 use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
+use pkcs8::EncodePrivateKey;
 use rand::rngs::OsRng;
 use rsa::{
-    pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
+    pkcs8::{EncodePublicKey, LineEnding},
     RsaPrivateKey,
 };
 use rustls::pki_types::CertificateDer;
@@ -246,6 +247,7 @@ async fn generate_rsa_keys(dkim_config: &CfgDKIM) -> Result<()> {
 
 async fn generate_ed25519_keys(dkim_config: &CfgDKIM) -> Result<()> {
     use ed25519_dalek::SigningKey;
+    use pkcs8::{EncodePrivateKey, LineEnding};
     use rand::RngCore;
 
     let mut rng = OsRng;
@@ -258,10 +260,11 @@ async fn generate_ed25519_keys(dkim_config: &CfgDKIM) -> Result<()> {
     let signing_key = SigningKey::from_bytes(&secret_bytes);
     let verifying_key = signing_key.verifying_key();
 
-    // Convert to PKCS8 PEM
-    let private_key_bytes = signing_key.to_bytes().to_vec();
-    let pem = pem::Pem::new("PRIVATE KEY", private_key_bytes);
-    let private_key_pem = pem::encode(&pem);
+    // Convert directly to PKCS8 PEM using the EncodePrivateKey trait
+    let private_key_pem = signing_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .into_diagnostic()
+        .wrap_err("Failed to encode private key to PEM")?;
 
     tokio::fs::write(&dkim_config.private_key, private_key_pem.as_bytes())
         .await

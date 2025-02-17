@@ -52,6 +52,6 @@ clap = { version = "4", features = ["derive"] }
 base64 = "0.21"
 rsa = "0.9"
 rand = "0.8"
-ed25519-dalek = "2"
+ed25519-dalek = { version = "2", features = ["pkcs8"]}
 pem = "3"
 memchr = "2.7.4"

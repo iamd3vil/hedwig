@@ -90,8 +90,13 @@ impl Worker {
 
                 let signer: DkimSignerType = match dkim.key_type {
                     DkimKeyType::Rsa => {
-                        let pk_rsa = RsaKey::<Sha256>::from_rsa_pem(&priv_key)
-                            .expect("error reading RSA priv key");
+                        let pem = pem::parse(&priv_key)
+                            .into_diagnostic()
+                            .wrap_err("parsing RSA PEM")?;
+                        let pk_rsa = RsaKey::<Sha256>::from_pkcs8_der(pem.contents())
+                            .into_diagnostic()
+                            .wrap_err("error reading RSA priv key")?;
+
                         DkimSignerType::Rsa(
                             DkimSigner::from_key(pk_rsa)
                                 .domain(&dkim.domain)
@@ -112,7 +117,8 @@ impl Worker {
 
                         let pk_ed25519 =
                             mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(pem.contents())
-                                .expect("error reading Ed25519 priv key");
+                                .into_diagnostic()
+                                .wrap_err("error reading Ed25519 priv key")?;
                         DkimSignerType::Ed25519(
                             DkimSigner::from_key(pk_ed25519)
                                 .domain(&dkim.domain)
