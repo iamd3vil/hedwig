@@ -15,7 +15,7 @@ pub struct Cfg {
 pub struct CfgServer {
     pub addr: String,
     pub workers: Option<usize>,
-    pub auth: Option<CfgAuth>,
+    pub auth: Option<Vec<CfgAuth>>,
     pub dkim: Option<CfgDKIM>,
     pub disable_outbound: Option<bool>,
     pub outbound_local: Option<bool>,

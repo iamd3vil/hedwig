@@ -2,10 +2,11 @@
 ///
 /// This module implements the `SmtpCallbacks` trait, providing the logic for
 /// handling SMTP commands such as `EHLO`, `AUTH`, `MAIL FROM`, `RCPT TO`, and `DATA`.
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use smtp::{Email, SmtpCallbacks, SmtpError};
+use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use crate::{
@@ -18,6 +19,7 @@ use crate::{
 /// The Callbacks struct holds the configuration, storage, and sender channel.
 pub struct Callbacks {
     cfg: Cfg,
+    auth_mapping: Mutex<HashMap<String, String>>,
     storage: Arc<dyn Storage>,
     sender_channel: async_channel::Sender<worker::Job>,
 }
@@ -51,10 +53,20 @@ impl Callbacks {
             });
         }
 
+        // Create the auth mapping.
+        let mut auth_mapping = HashMap::new();
+
+        if let Some(auth) = &cfg.server.auth {
+            for auth in auth.iter() {
+                auth_mapping.insert(auth.username.clone(), auth.password.clone());
+            }
+        }
+
         Callbacks {
             storage,
             sender_channel,
             cfg,
+            auth_mapping: Mutex::new(auth_mapping),
         }
     }
 
@@ -102,17 +114,16 @@ impl SmtpCallbacks for Callbacks {
 
     // Handles the AUTH command.
     async fn on_auth(&self, username: &str, password: &str) -> Result<bool, SmtpError> {
-        match &self.cfg.server.auth {
-            Some(auth) => {
-                // Use constant-time comparison to prevent timing attacks
-                let username_match =
-                    constant_time_eq(username.as_bytes(), auth.username.as_bytes());
-                let password_match =
-                    constant_time_eq(password.as_bytes(), auth.password.as_bytes());
-                Ok(username_match && password_match)
-            }
-            None => Ok(false), // Authentication is disabled
+        if self.cfg.server.auth.is_none() {
+            return Ok(false);
         }
+
+        let auth_mapping = self.auth_mapping.lock().await;
+        if let Some(expected_password) = auth_mapping.get(username) {
+            let is_valid = constant_time_eq(password.as_bytes(), expected_password.as_bytes());
+            return Ok(is_valid);
+        }
+        Ok(false)
     }
 
     // Handles the MAIL FROM command.

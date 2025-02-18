@@ -57,7 +57,7 @@ This SMTP server is designed with a focus on speed and simplicity. It provides a
    key_path = "/path/to/key.pem"
 
    # Optional SMTP authentication
-   [server.auth]
+   [[server.auth]]
    username = "your_username"
    password = "your_password"
 
@@ -97,8 +97,10 @@ key_path = "/path/to/key.pem"
 
 ### Authentication (Optional)
 
+Multiple users can be configured for SMTP authentication. Just add multiple `[[server.auth]]` sections to the configuration file.
+
 ```toml
-[server.auth]
+[[server.auth]]
 username = "your_username"
 password = "your_password"
 ```
