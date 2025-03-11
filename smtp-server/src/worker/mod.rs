@@ -88,50 +88,7 @@ impl Worker {
                     .into_diagnostic()
                     .wrap_err("reading private key")?;
 
-                let signer: DkimSignerType = match dkim.key_type {
-                    DkimKeyType::Rsa => {
-                        let pem = pem::parse(&priv_key)
-                            .into_diagnostic()
-                            .wrap_err("parsing RSA PEM")?;
-                        let pk_rsa = RsaKey::<Sha256>::from_pkcs8_der(pem.contents())
-                            .into_diagnostic()
-                            .wrap_err("error reading RSA priv key")?;
-
-                        DkimSignerType::Rsa(
-                            DkimSigner::from_key(pk_rsa)
-                                .domain(&dkim.domain)
-                                .selector(&dkim.selector)
-                                .headers(DKIM_HEADERS)
-                                .expiration(60 * 60 * 7)
-                                .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
-                                .header_canonicalization(
-                                    mail_auth::dkim::Canonicalization::Relaxed,
-                                ),
-                        )
-                    }
-                    DkimKeyType::Ed25519 => {
-                        // Parse PEM to get DER bytes
-                        let pem = pem::parse(&priv_key)
-                            .into_diagnostic()
-                            .wrap_err("parsing Ed25519 PEM")?;
-
-                        let pk_ed25519 =
-                            mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(pem.contents())
-                                .into_diagnostic()
-                                .wrap_err("error reading Ed25519 priv key")?;
-                        DkimSignerType::Ed25519(
-                            DkimSigner::from_key(pk_ed25519)
-                                .domain(&dkim.domain)
-                                .selector(&dkim.selector)
-                                .headers(DKIM_HEADERS)
-                                .expiration(60 * 60 * 7)
-                                .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
-                                .header_canonicalization(
-                                    mail_auth::dkim::Canonicalization::Relaxed,
-                                ),
-                        )
-                    }
-                };
+                let signer = Self::create_dkim_signer(dkim, &priv_key)?;
                 Some(signer)
             }
         };
@@ -146,6 +103,50 @@ impl Worker {
             max_delay: Duration::from_secs(60 * 60 * 24),
             dkim_signer,
         })
+    }
+
+    fn create_dkim_signer(dkim: &CfgDKIM, priv_key: &str) -> Result<DkimSignerType> {
+        match dkim.key_type {
+            DkimKeyType::Rsa => {
+                let pem = pem::parse(priv_key)
+                    .into_diagnostic()
+                    .wrap_err("parsing RSA PEM")?;
+                let pk_rsa = RsaKey::<Sha256>::from_pkcs8_der(pem.contents())
+                    .into_diagnostic()
+                    .wrap_err("error reading RSA priv key")?;
+
+                Ok(DkimSignerType::Rsa(
+                    DkimSigner::from_key(pk_rsa)
+                        .domain(&dkim.domain)
+                        .selector(&dkim.selector)
+                        .headers(DKIM_HEADERS)
+                        .expiration(60 * 60 * 7)
+                        .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                        .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed),
+                ))
+            }
+            DkimKeyType::Ed25519 => {
+                // Parse PEM to get DER bytes
+                let pem = pem::parse(priv_key)
+                    .into_diagnostic()
+                    .wrap_err("parsing Ed25519 PEM")?;
+
+                let pk_ed25519 =
+                    mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(pem.contents())
+                        .into_diagnostic()
+                        .wrap_err("error reading Ed25519 priv key")?;
+
+                Ok(DkimSignerType::Ed25519(
+                    DkimSigner::from_key(pk_ed25519)
+                        .domain(&dkim.domain)
+                        .selector(&dkim.selector)
+                        .headers(DKIM_HEADERS)
+                        .expiration(60 * 60 * 7)
+                        .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                        .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed),
+                ))
+            }
+        }
     }
 
     pub async fn run(&mut self) {
