@@ -22,7 +22,7 @@ build-macos $RUSTFLAGS="-C target-feature=+crt-static":
         docker run --rm \
         --volume ${PWD}:/root/src \
         --workdir /root/src \
-        joseluisq/rust-linux-darwin-builder:1.81.0 \
+        joseluisq/rust-linux-darwin-builder:1.86.0 \
         sh -c 'CC=aarch64-apple-darwin22.4-clang CXX=aarch64-apple-darwin22.4-clang++ TARGET_CC=aarch64-apple-darwin22.4-clang TARGET_AR=aarch64-apple-darwin22.4-ar cargo build --release --target aarch64-apple-darwin'
     fi
 

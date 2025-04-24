@@ -1,0 +1,25 @@
+releases:
+  - name: "Release to GitHub"
+    dist_folder: "./dist"
+    targets:
+      github:
+        owner: "iamd3vil"
+        repo: "hedwig"
+    checksum:
+      algorithm: "sha256"
+    additional_files:
+      - "README.md"
+      - "LICENSE"
+    builds:
+      - command: "just build-linux"
+        artifact: "target/x86_64-unknown-linux-musl/release/hedwig"
+        archive_name: "hedwig-{{ meta.tag }}-linux-x86_64"
+        name: "Linux build"
+changelog:
+  format: "github"
+  exclude:
+    - "^chore"
+    - "^ci"
+    - "^docs"
+    - "^test"
+  template: "changelog.tpl"
