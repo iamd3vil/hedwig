@@ -46,7 +46,7 @@ lettre = { version = "0.11.11", features = [
 mail-auth = "0.6.0"
 moka = { version = "0.12.10", features = ["future"] }
 tokio-util = { version = "0.7.13", features = ["io"] }
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", features = ["ring"], default-features = false}
 rustls-pemfile = "2.2.0"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.21"

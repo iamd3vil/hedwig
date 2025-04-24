@@ -51,6 +51,9 @@ async fn main() -> Result<()> {
     // Parse command line arguments
     let args = Args::parse();
 
+    // Set up the default provider for rustls.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     match args.command.unwrap_or(Commands::Server) {
         Commands::Server => run_server(&args.config).await,
         Commands::DkimGenerate => generate_dkim_keys(&args.config).await,
