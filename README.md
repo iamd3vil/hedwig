@@ -1,3 +1,5 @@
+<a href="https://zerodha.tech"><img src="https://zerodha.tech/static/images/github-badge.svg" align="right" /></a>
+
 <p align="center">
   <img src="logo.png" alt="Hedwig" width="75"/>
   <h1 align="center">Hedwig</h1>
