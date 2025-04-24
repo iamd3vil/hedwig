@@ -1,9 +1,13 @@
-<a href="https://zerodha.tech"><img src="https://zerodha.tech/static/images/github-badge.svg" align="right" /></a>
+<div align="right">
+  <a href="https://zerodha.tech">
+    <img src="https://zerodha.tech/static/images/github-badge.svg" width=80 />
+  </a>
+</div>
 
-<p align="center">
+<div align="center">
   <img src="logo.png" alt="Hedwig" width="75"/>
-  <h1 align="center">Hedwig</h1>
-</p>
+  <h1>Hedwig</h1>
+</div>
 
 <p align="center">
    Hedwig - A high-performance, minimalist SMTP server implemented in Rust.
