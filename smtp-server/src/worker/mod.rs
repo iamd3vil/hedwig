@@ -389,7 +389,7 @@ impl Worker {
         // Find the boundary of headers and body.
         let separator = b"\r\n\r\n";
         let boundary = memmem::find(raw_email, separator).ok_or_else(|| {
-            miette::miette!("Invalid email format: header–body boundary not found")
+            miette::miette!("Invalid email format: header body boundary not found")
         })?;
 
         // Copy the header part while filtering out any existing "DKIM-Signature:" lines.
@@ -412,7 +412,11 @@ impl Worker {
 
         // Insert DKIM signature.
         new_email.extend_from_slice(dkim_signature.as_bytes());
-        new_email.extend_from_slice(b"\r\n\r\n");
+        if !dkim_signature.ends_with("\r\n") {
+            new_email.extend_from_slice(b"\r\n");
+        }
+        // Add the single blank line (\r\n) that separates headers from the body.
+        new_email.extend_from_slice(b"\r\n");
 
         // Append the remainder of the email body.
         new_email.extend_from_slice(&raw_email[boundary + separator.len()..]);
