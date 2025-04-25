@@ -1,6 +1,6 @@
 <div align="right">
   <a href="https://zerodha.tech">
-    <img src="https://zerodha.tech/static/images/github-badge.svg" width=80 />
+    <img src="https://zerodha.tech/static/images/github-badge.svg" width=140 />
   </a>
 </div>
 
