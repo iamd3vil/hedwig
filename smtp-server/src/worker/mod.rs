@@ -187,6 +187,8 @@ impl Worker {
         if self.disable_outbound {
             info!(
                 msg_id = job.job_id,
+                from_email = email.from,
+                to_email = email.to.join(","),
                 "Outbound mail disabled, dropping message"
             );
             return self.storage.delete(&job.job_id, Status::Queued).await;
@@ -194,7 +196,12 @@ impl Worker {
 
         match self.send_email(&msg, &email.body).await {
             Ok(_) => {
-                info!(msg_id = job.job_id, "Successfully sent email");
+                info!(
+                    msg_id = job.job_id,
+                    from_email = email.from,
+                    to_email = email.to.join(","),
+                    "Successfully sent email"
+                );
                 self.storage.delete(&job.job_id, Status::Queued).await?;
                 // Delete any meta file in deferred.
                 self.storage
@@ -210,6 +217,8 @@ impl Worker {
                             warn!(
                                 msg_id = ?job.job_id,
                                 code = resp.code(),
+                                from_email = email.from,
+                                to_email = email.to.join(","),
                                 "Retryable error encountered, deferring email"
                             );
                             // Defer the email.
@@ -219,7 +228,12 @@ impl Worker {
                         Ok(())
                     }
                     _ => {
-                        error!(msg_id = ?job.job_id, ?e, "Non-retryable error, bouncing email");
+                        error!(
+                            msg_id = ?job.job_id,
+                            from_email = email.from,
+                            to_email = email.to.join(","),
+                            ?e, "Non-retryable error, bouncing email"
+                        );
                         // Bounce the email.
                         println!("Error sending email: {:?}", e);
                         self.storage
@@ -370,17 +384,15 @@ impl Worker {
     /// Determines if a status code indicates the operation can be retried.
     ///
     /// Retryable codes include:
-    /// - 421: Service not available, closing transmission channel
-    /// - 450-452, 454, 458: Various temporary failures
+    /// - 4XX: Transient errors.
     /// - 500-504: Server errors
     /// - 521: Server is down
     /// - 530, 550-554: Authentication/policy failures
     fn is_retryable(code: u16) -> bool {
-        const RETRYABLE_CODES: &[u16] = &[
-            421, 450, 451, 452, 454, 458, 500, 501, 502, 503, 504, 521, 530, 550, 551, 552, 553,
-            554,
-        ];
-        RETRYABLE_CODES.contains(&code)
+        const ADDITIONAL_RETRYABLE_CODES: &[u16] =
+            &[500, 501, 502, 503, 504, 521, 530, 550, 551, 552, 553, 554];
+
+        (code >= 400 && code < 500) || ADDITIONAL_RETRYABLE_CODES.contains(&code)
     }
 
     /// Inserts a DKIM signature into a raw email body.
