@@ -164,7 +164,11 @@ async fn run_server(config_path: &str) -> Result<()> {
 
     // Start the deferred worker.
     tokio::spawn(async move {
-        let worker = DeferredWorker::new(Arc::clone(&storage), sender_channel.clone());
+        let worker = DeferredWorker::new(
+            Arc::clone(&storage),
+            sender_channel.clone(),
+            cfg.server.max_retries,
+        );
         let res = worker.process_deferred_jobs().await;
         if let Err(e) = res {
             error!("Error running deferred worker: {:#}", e);

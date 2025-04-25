@@ -8,6 +8,8 @@ use crate::storage::{Status, Storage};
 
 use super::{EmailMetadata, Job};
 
+const DEFAULT_MAX_RETRIES: u32 = 5;
+
 pub struct DeferredWorker {
     storage: Arc<dyn Storage>,
 
@@ -18,11 +20,11 @@ pub struct DeferredWorker {
 }
 
 impl DeferredWorker {
-    pub fn new(storage: Arc<dyn Storage>, channel: Sender<Job>) -> Self {
+    pub fn new(storage: Arc<dyn Storage>, channel: Sender<Job>, max_retries: Option<u32>) -> Self {
         Self {
             storage,
             channel,
-            max_attempts: 5,
+            max_attempts: max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
         }
     }
 
@@ -103,7 +105,7 @@ mod tests {
         .unwrap();
         let storage = Arc::new(storage);
         let (sender, receiver) = bounded(100);
-        let worker = DeferredWorker::new(storage, sender);
+        let worker = DeferredWorker::new(storage, sender, None);
         (worker, receiver, temp_dir)
     }
 

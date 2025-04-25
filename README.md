@@ -55,7 +55,9 @@ This SMTP server is designed with a focus on speed and simplicity. It provides a
    [server]
    addr = "0.0.0.0:25"  # SMTP server address
    workers = 4          # Number of worker threads
-   pool_size = 100      # Connection pool size
+   pool_size = 100      # Outbund Connection pool size
+   max_retries = 5      # Maximum number of retries for deferred emails (Default is 5)
+
 
    # Optional TLS configuration
    [server.tls]
