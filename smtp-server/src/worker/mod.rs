@@ -194,7 +194,7 @@ impl Worker {
             return self.storage.delete(&job.job_id, Status::Queued).await;
         }
 
-        match self.send_email(&msg, &email.body).await {
+        match self.send_email(&email.to, &msg, &email.body).await {
             Ok(_) => {
                 info!(
                     msg_id = job.job_id,
@@ -277,7 +277,12 @@ impl Worker {
         Ok(())
     }
 
-    async fn send_email<'b>(&self, email: &'b Message<'b>, body: &str) -> Result<()> {
+    async fn send_email<'b>(
+        &self,
+        to: &Vec<String>,
+        email: &'b Message<'b>,
+        body: &str,
+    ) -> Result<()> {
         let from = email
             .from()
             .and_then(|f| f.first())
@@ -308,12 +313,21 @@ impl Worker {
             None => body,
         };
 
+        let mut all_recipients = Vec::with_capacity(to.len() + 1);
+        all_recipients.extend(to.iter().map(|s| s.to_owned()));
+
+        if let Some(cc_list) = email.cc() {
+            let cc_list = cc_list.clone().into_list();
+            for cc in cc_list.iter() {
+                if let Some(cc) = cc.address() {
+                    let cc = cc.to_owned();
+                    all_recipients.push(cc);
+                }
+            }
+        }
+
         // Parse to address for each.
-        for to in email.to().iter() {
-            let to = to
-                .first()
-                .and_then(|t| t.address.as_ref())
-                .ok_or_else(|| miette::miette!("Invalid to address"))?;
+        for to in all_recipients.iter() {
             info!(?to, ?from, "Attempting to send email");
             // Strip `<` and `>` from email address.
             let to = to.trim_matches(|c| c == '<' || c == '>');
