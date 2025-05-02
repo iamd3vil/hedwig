@@ -2,7 +2,9 @@ use crate::config::DkimKeyType;
 use async_channel::Receiver;
 use email_address_parser::EmailAddress;
 use hickory_resolver::{
+    lookup::MxLookup,
     name_server::{GenericConnector, TokioRuntimeProvider},
+    proto::rr::rdata::MX,
     AsyncResolver, TokioAsyncResolver,
 };
 use lettre::{address::Envelope, Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
@@ -16,6 +18,7 @@ use mail_send::Error;
 use miette::{bail, Context, IntoDiagnostic, Result};
 // use pool::SmtpClientPool;
 use memchr::memmem;
+use moka::future::Cache;
 use pool::PoolManager;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
@@ -56,6 +59,9 @@ pub struct Worker {
     pool: PoolManager,
     dkim_signer: Option<DkimSignerType>,
 
+    // MX Cache
+    mx_cache: Cache<String, MxLookup>,
+
     /// disable_outbound when set true, all outbound emails will be discarded.
     disable_outbound: bool,
 
@@ -73,6 +79,7 @@ impl Worker {
         dkim: &Option<CfgDKIM>,
         disable_outbound: bool,
         outbound_local: bool,
+        mx_cache: Cache<String, MxLookup>,
         pool_size: u64,
     ) -> Result<Self> {
         info!("Initializing SMTP worker");
@@ -100,6 +107,7 @@ impl Worker {
             storage,
             resolver,
             pool,
+            mx_cache,
             disable_outbound,
             initial_delay: Duration::from_secs(60),
             max_delay: Duration::from_secs(60 * 60 * 24),
@@ -292,7 +300,7 @@ impl Worker {
 
         for line in header_part.split(|&b| b == b'\n') {
             // Trim potential trailing '\r' before checking prefix
-            let trimmed_line = if line.ends_with(&[b'\r']) {
+            let trimmed_line = if line.ends_with(b"\r") {
                 &line[..line.len() - 1]
             } else {
                 line
@@ -302,9 +310,7 @@ impl Worker {
             // Use eq_ignore_ascii_case for case-insensitive if needed:
             if !trimmed_line
                 .get(..BCC_HEADER_PREFIX.len())
-                .map_or(false, |prefix| {
-                    prefix.eq_ignore_ascii_case(BCC_HEADER_PREFIX)
-                })
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(BCC_HEADER_PREFIX))
             {
                 // Keep the line if it's not a Bcc header
                 new_email.extend_from_slice(line);
@@ -326,7 +332,7 @@ impl Worker {
 
     async fn send_email<'b>(
         &self,
-        to: &Vec<String>,
+        to: &[String],
         email: &'b Message<'b>,
         body: &str,
     ) -> Result<()> {
@@ -402,16 +408,20 @@ impl Worker {
             debug!(?parsed_email_id, "Looking up MX records");
 
             // Resolve MX record for domain.
-            let mx = self
-                .resolver
-                .mx_lookup(parsed_email_id.get_domain())
+            let mx_lookup = self
+                .lookup_mx(parsed_email_id.get_domain())
                 .await
-                .into_diagnostic()
-                .wrap_err("getting mx record")?;
-            if mx.iter().count() == 0 {
+                .wrap_err("looking up mx record")?;
+            if mx_lookup.iter().count() == 0 {
                 warn!(domain = ?parsed_email_id.get_domain(), "No MX records found");
                 continue;
             }
+
+            // Sort mx according to preference in ascending order.
+            let mut mx = mx_lookup.iter().collect::<Vec<&MX>>();
+
+            // Sort in place using Rust's standard sort
+            mx.sort_by_key(|a| a.preference());
 
             let from: String = email
                 .from()
@@ -456,6 +466,24 @@ impl Worker {
         Ok(())
     }
 
+    async fn lookup_mx(&self, domain: &str) -> Result<MxLookup> {
+        if let Some(mx) = self.mx_cache.get(domain).await {
+            return Ok(mx);
+        }
+
+        let mx = self
+            .resolver
+            .mx_lookup(domain)
+            .await
+            .into_diagnostic()
+            .wrap_err("getting mx record")?;
+
+        // Cache the result.
+        self.mx_cache.insert(domain.to_string(), mx.clone()).await;
+
+        Ok(mx)
+    }
+
     /// Determines if a status code indicates the operation can be retried.
     ///
     /// Retryable codes include:
@@ -467,7 +495,7 @@ impl Worker {
         const ADDITIONAL_RETRYABLE_CODES: &[u16] =
             &[500, 501, 502, 503, 504, 521, 530, 550, 551, 552, 553, 554];
 
-        (code >= 400 && code < 500) || ADDITIONAL_RETRYABLE_CODES.contains(&code)
+        ((400..500).contains(&code)) || ADDITIONAL_RETRYABLE_CODES.contains(&code)
     }
 
     /// Inserts a DKIM signature into a raw email body.
@@ -485,7 +513,7 @@ impl Worker {
             // Process headers line by line.
             for line in raw_email[..boundary].split(|&b| b == b'\n') {
                 // Trim trailing carriage returns, if any.
-                if let Some(line) = line.strip_suffix(&[b'\r']) {
+                if let Some(line) = line.strip_suffix(b"\r") {
                     if !line.starts_with(b"DKIM-Signature:") {
                         new_email.extend_from_slice(line);
                         new_email.extend_from_slice(b"\r\n");

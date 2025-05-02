@@ -30,17 +30,12 @@ pub struct CfgStorage {
     pub base_path: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DkimKeyType {
+    #[default]
     Rsa,
     Ed25519,
-}
-
-impl Default for DkimKeyType {
-    fn default() -> Self {
-        DkimKeyType::Rsa
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

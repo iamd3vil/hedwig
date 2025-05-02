@@ -5,6 +5,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use hickory_resolver::lookup::MxLookup;
+use moka::{future::Cache, Expiry};
 use smtp::{Email, SmtpCallbacks, SmtpError};
 use tokio::sync::Mutex;
 use ulid::Ulid;
@@ -24,6 +26,27 @@ pub struct Callbacks {
     sender_channel: async_channel::Sender<worker::Job>,
 }
 
+pub struct MXExpiry;
+
+impl Expiry<String, MxLookup> for MXExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &MxLookup,
+        _created_at: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let valid_until = value.valid_until();
+        // Return time from now until the valid_until time.
+        let now = std::time::Instant::now();
+        if valid_until > now {
+            Some(valid_until - now)
+        } else {
+            None
+        }
+    }
+}
+
+/// The Callbacks struct implements the SmtpCallbacks trait.
 impl Callbacks {
     /// Creates a new Callbacks instance.
     pub fn new(
@@ -32,12 +55,19 @@ impl Callbacks {
         receiver_channel: async_channel::Receiver<Job>,
         cfg: Cfg,
     ) -> Self {
+        let expiry = MXExpiry;
+        let mx_cache: Cache<_, _> = Cache::builder()
+            .max_capacity(10000)
+            .expire_after(expiry)
+            .build();
+
         // Start workers.
         let worker_count = cfg.server.workers.unwrap_or(1).max(1);
         for _ in 0..worker_count {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
             let dkim = cfg.server.dkim.clone();
+            let mx_cache = mx_cache.clone();
             tokio::spawn(async move {
                 let mut worker = Worker::new(
                     receiver_channel,
@@ -45,6 +75,7 @@ impl Callbacks {
                     &dkim,
                     cfg.server.disable_outbound.unwrap_or(false),
                     cfg.server.outbound_local.unwrap_or(false),
+                    mx_cache,
                     cfg.server.pool_size.unwrap_or(100),
                 )
                 .await
