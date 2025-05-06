@@ -23,6 +23,7 @@ def send_email(
         # Create the email message
         msg = EmailMessage()
         msg["From"] = sender_email
+        print("recipients", recipient_emails)
         msg["To"] = recipient_emails  # Can be a list or comma-separated string
         msg["Subject"] = subject
         msg.set_content(body)
@@ -81,7 +82,7 @@ if __name__ == "__main__":
         "--port", type=int, default=587, help="SMTP server port (default: 587)"
     )
     parser.add_argument(
-        "--use-tls", type=bool, default=True, help="Use STARTTLS (default: True)"
+        "--use-tls", type=bool, default=False, help="Use STARTTLS (default: True)"
     )
     parser.add_argument(
         "--use-ssl", type=bool, default=False, help="Use SSL (default: False)"
