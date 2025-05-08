@@ -236,7 +236,71 @@ impl SmtpCallbacks for Callbacks {
     }
 
     // Handles the RCPT TO command.
-    async fn on_rcpt_to(&self, _to: &str) -> Result<(), SmtpError> {
+    async fn on_rcpt_to(&self, rcpt_path: &str) -> Result<(), SmtpError> {
+        let recipient_domain_opt: Option<String> = extract_domain_from_path(rcpt_path);
+
+        if let Some(filters) = &self.cfg.filters {
+            let to_domain_filters: Vec<_> = filters
+                .iter()
+                .filter(|f| matches!(f.typ, FilterType::ToDomain))
+                .collect();
+
+            if to_domain_filters.is_empty() {
+                // No ToDomain filters specifically, so this check passes.
+                return Ok(());
+            }
+
+            // 1. Check DENY rules
+            if let Some(ref recipient_domain) = recipient_domain_opt {
+                for filter in &to_domain_filters {
+                    if matches!(filter.action, FilterAction::Deny) {
+                        if filter.domain.iter().any(|d| d.eq_ignore_ascii_case(recipient_domain)) {
+                            let message = format!("Recipient domain {} is denied.", recipient_domain);
+                            tracing::warn!("Denying email to [{}]: {}", rcpt_path, message);
+                            return Err(SmtpError::RcptToDenied { message });
+                        }
+                    }
+                }
+            }
+            // If recipient_domain_opt is None, it cannot be denied by a specific domain DENY rule.
+
+            // 2. Check ALLOW rules, if any ToDomain Allow rules exist
+            let has_to_domain_allow_rules = to_domain_filters
+                .iter()
+                .any(|f| matches!(f.action, FilterAction::Allow));
+
+            if has_to_domain_allow_rules {
+                let mut explicitly_allowed = false;
+                if let Some(ref recipient_domain) = recipient_domain_opt {
+                    for filter in &to_domain_filters {
+                        if matches!(filter.action, FilterAction::Allow) {
+                            if filter.domain.iter().any(|d| d.eq_ignore_ascii_case(recipient_domain)) {
+                                explicitly_allowed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // If no domain could be parsed, or if a domain was parsed but didn't match any allow rule,
+                // then it's not explicitly allowed.
+                if !explicitly_allowed {
+                    let message = if let Some(ref rd) = recipient_domain_opt {
+                        format!("Recipient domain {} is not in the allowed list.", rd)
+                    } else {
+                        format!("Recipient address '{}' (no domain/unparsable) is not in the allowed list.", rcpt_path)
+                    };
+                    tracing::warn!("Denying email to [{}]: {}", rcpt_path, message);
+                    return Err(SmtpError::RcptToDenied { message });
+                }
+            }
+            // If we reached here:
+            // - No DENY rule matched (or recipient had no domain to match against specific DENY rules).
+            // - AND ( (there are no ToDomain ALLOW rules) OR (an ALLOW rule matched) ).
+            // So, allow.
+        }
+
+        // If self.cfg.filters is None, or if it's Some but contains no ToDomain filters,
+        // or if it passed all applicable ToDomain filters.
         Ok(())
     }
 

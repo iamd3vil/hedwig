@@ -67,6 +67,9 @@ pub enum SmtpError {
     #[error("Mail rejected: {message}")]
     MailFromDenied { message: String },
 
+    #[error("Mail rejected: {message}")]
+    RcptToDenied { message: String },
+
     #[error("Authentication error")]
     #[diagnostic(code(smtp::auth_error))]
     AuthError,
@@ -220,6 +223,11 @@ impl SmtpServer {
             match e.downcast::<SmtpError>() {
                 Ok(e) => match e {
                     SmtpError::MailFromDenied { message } => {
+                        socket
+                            .write_line(format!("550 {}", message).as_bytes())
+                            .await
+                    }
+                    SmtpError::RcptToDenied { message } => {
                         socket
                             .write_line(format!("550 {}", message).as_bytes())
                             .await
