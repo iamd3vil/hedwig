@@ -3,12 +3,30 @@ use miette::{IntoDiagnostic, Result};
 use serde::Deserialize;
 use tracing::Level;
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub enum FilterType {
+    #[serde(rename = "from_domain_filter")]
+    #[default]
+    FromDomain,
+    #[serde(rename = "to_domain_filter")]
+    ToDomain,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FilterAction {
+    #[default]
+    Allow,
+    Deny,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Cfg {
     #[serde(default)]
     pub log: CfgLog,
     pub server: CfgServer,
     pub storage: CfgStorage,
+    pub filters: Option<Vec<CfgFilter>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -22,6 +40,15 @@ pub struct CfgServer {
     pub outbound_local: Option<bool>,
     pub pool_size: Option<u64>,
     pub tls: Option<CfgTls>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CfgFilter {
+    #[serde(rename = "type", default)]
+    pub typ: FilterType,
+    pub domain: Vec<String>,
+    #[serde(default)]
+    pub action: FilterAction,
 }
 
 #[derive(Debug, Deserialize, Clone)]

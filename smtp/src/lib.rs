@@ -64,6 +64,9 @@ pub enum SmtpError {
         span: SourceSpan,
     },
 
+    #[error("Mail rejected: {message}")]
+    MailFromDenied { message: String },
+
     #[error("Authentication error")]
     #[diagnostic(code(smtp::auth_error))]
     AuthError,
@@ -212,7 +215,23 @@ impl SmtpServer {
             .write_line(b"220 localhost ESMTP server ready\r\n")
             .await?;
 
-        self.handle_connection(&mut session, socket).await
+        let res = self.handle_connection(&mut session, socket).await;
+        if let Err(e) = res {
+            match e.downcast::<SmtpError>() {
+                Ok(e) => match e {
+                    SmtpError::MailFromDenied { message } => {
+                        socket
+                            .write_line(format!("550 {}", message).as_bytes())
+                            .await
+                    }
+                    _ => socket.write_line(b"500 Internal server error\r\n").await,
+                },
+                _ => return Ok(()),
+            }
+        } else {
+            // Handle successful connection termination
+            socket.write_line(b"221 Bye\r\n").await
+        }
     }
 
     async fn handle_connection(
