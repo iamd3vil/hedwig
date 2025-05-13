@@ -55,3 +55,4 @@ rand = "0.8"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 pem = "3"
 memchr = "2.7.4"
+mailparse = "0.16.1"

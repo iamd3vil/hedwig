@@ -1,3 +1,5 @@
+use email_address_parser::EmailAddress;
+use mailparse::MailAddr;
 /// This file defines the callbacks for the SMTP server.
 ///
 /// This module implements the `SmtpCallbacks` trait, providing the logic for
@@ -28,13 +30,18 @@ pub struct Callbacks {
 }
 
 fn extract_domain_from_path(path: &str) -> Option<String> {
-    let mut email_part = path.trim();
-    if email_part.starts_with('<') && email_part.ends_with('>') {
-        email_part = &email_part[1..email_part.len() - 1];
-    }
-    email_part
-        .rsplit_once('@')
-        .map(|(_, domain)| domain.to_lowercase())
+    mailparse::addrparse(path).ok().and_then(|addr| {
+        if let Some(email) = addr.get(0) {
+            match email {
+                MailAddr::Single(info) => {
+                    return EmailAddress::parse(info.addr.as_ref(), None)
+                        .map(|e| e.domain().to_lowercase())
+                }
+                _ => return None,
+            }
+        }
+        None
+    })
 }
 
 pub struct MXExpiry;
@@ -746,6 +753,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_extract_domain_from_full_email_addr() {
+        assert_eq!(
+            extract_domain_from_path("Testing <testing@hedwig.example.com>"),
+            Some("hedwig.example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn test_extract_domain_from_path_with_angle_brackets() {
         assert_eq!(
             extract_domain_from_path("<test@example.com>"),
@@ -765,15 +780,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_extract_domain_from_path_just_at() {
-        assert_eq!(extract_domain_from_path("@"), Some("".to_string()));
+        assert_eq!(extract_domain_from_path("@"), None);
     }
 
     #[tokio::test]
     async fn test_extract_domain_from_path_malformed() {
-        assert_eq!(extract_domain_from_path("test@"), Some("".to_string())); // Or None, depending on desired strictness
-        assert_eq!(
-            extract_domain_from_path("@domain.com"),
-            Some("domain.com".to_string())
-        );
+        assert_eq!(extract_domain_from_path("test@"), None); // Or None, depending on desired strictness
+        assert_eq!(extract_domain_from_path("@domain.com"), None);
     }
 }
