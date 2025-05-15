@@ -22,6 +22,7 @@ use worker::{deferred_worker::DeferredWorker, Job};
 
 mod callbacks;
 mod config;
+mod filters;
 mod storage;
 mod worker;
 

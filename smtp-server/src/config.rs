@@ -3,7 +3,7 @@ use miette::{IntoDiagnostic, Result};
 use serde::Deserialize;
 use tracing::Level;
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
 pub enum FilterType {
     #[serde(rename = "from_domain_filter")]
     #[default]
