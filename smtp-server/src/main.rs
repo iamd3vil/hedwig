@@ -198,7 +198,14 @@ async fn run_server(config_path: &str) -> Result<()> {
                 match acceptor.accept(socket).await {
                     Ok(tls_stream) => Box::new(tls_stream),
                     Err(e) => {
-                        error!("TLS handshake failed: {}", e);
+                        // Ignore if it's EOF.
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                            debug!("TLS handshake failed: {}", e);
+                        } else {
+                            // Log the error.
+                            error!("TLS handshake failed: {}", e);
+                        }
+
                         return;
                     }
                 }
