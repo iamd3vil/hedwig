@@ -157,18 +157,18 @@ graph TD
     F -- DATA --> G[Callbacks: Start Email Data Reception];
     G --> H[Callbacks: Receives Email Content];
     H -- End of Data --> I[Callbacks: Save Email to Storage];
-    I --> J[Storage: Email Saved (e.g., Queued status)];
-    J --> K[Callbacks: Create Job (Message ID)];
+    I --> J["Storage: Email Saved (e.g., Queued status)"];
+    J --> K["Callbacks: Create Job (Message ID)"];
     K --> L[Callbacks: Send Job to Async Channel];
 
     M[DeferredWorker] -- Listens --> L;
     M --> N[DeferredWorker: Receives Job];
     N --> O[DeferredWorker: Retrieve Email from Storage];
-    O --> P[DeferredWorker: Process Email (e.g., delivery attempt)];
-    P -- Success --> Q[Storage: Update Email Status (e.g., Sent)];
-    P -- Retryable Failure --> R[Storage: Update Email Status (e.g., Queued, increment retry count)];
+    O --> P["DeferredWorker: Process Email (e.g., delivery attempt)"];
+    P -- Success --> Q["Storage: Update Email Status (e.g., Sent)"];
+    P -- Retryable Failure --> R["Storage: Update Email Status (e.g., Queued, increment retry count)"];
     R --> L;
-    P -- Non-Retryable Failure --> S[Storage: Update Email Status (e.g., Failed)];
+    P -- Non-Retryable Failure --> S["Storage: Update Email Status (e.g., Failed)"];
 
     T[Initial Server Startup] --> U[Load Queued Emails from Storage];
     U --> L;
