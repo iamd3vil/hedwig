@@ -145,6 +145,7 @@ async fn run_server(config_path: &str) -> Result<()> {
             cfg.clone(),
         ),
         auth_enabled,
+        tls_acceptor.clone(),
     );
 
     // Check if there are any emails to process.
@@ -191,29 +192,30 @@ async fn run_server(config_path: &str) -> Result<()> {
             .wrap_err("error accepting tcp connection")?;
         debug!("Accepted connection");
         let server_clone = smtp_server.clone();
-        let tls_acceptor = tls_acceptor.clone();
+        let tls_acceptor_for_initial_connection = tls_acceptor.clone();
 
         tokio::spawn(async move {
-            let mut boxed_socket: Box<dyn SmtpStream> = if let Some(acceptor) = tls_acceptor {
-                match acceptor.accept(socket).await {
-                    Ok(tls_stream) => Box::new(tls_stream),
-                    Err(e) => {
-                        // Ignore if it's EOF.
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                            debug!("TLS handshake failed: {}", e);
-                        } else {
-                            // Log the error.
-                            error!("TLS handshake failed: {}", e);
+            let boxed_socket: Box<dyn SmtpStream> =
+                if let Some(acceptor) = tls_acceptor_for_initial_connection {
+                    match acceptor.accept(socket).await {
+                        Ok(tls_stream) => Box::new(tls_stream),
+                        Err(e) => {
+                            // Ignore if it's EOF.
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                debug!("TLS handshake failed: {}", e);
+                            } else {
+                                // Log the error.
+                                error!("TLS handshake failed: {}", e);
+                            }
+
+                            return;
                         }
-
-                        return;
                     }
-                }
-            } else {
-                Box::new(socket)
-            };
+                } else {
+                    Box::new(socket)
+                };
 
-            if let Err(e) = server_clone.handle_client(&mut boxed_socket).await {
+            if let Err(e) = server_clone.handle_client(boxed_socket).await {
                 error!("Error handling client: {:#}", e);
             }
         });
