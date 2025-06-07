@@ -73,8 +73,6 @@ fn parse_normal_command(input: &str) -> IResult<&str, SmtpCommand> {
         parse_mail_from,
         parse_rcpt_to,
         parse_simple_command,
-        // Changed this line to be exact
-        map(tag_no_case("STARTTLS\r\n"), |_| SmtpCommand::StartTls),
     ))
     .parse(input)
 }
@@ -127,6 +125,7 @@ fn parse_simple_command(input: &str) -> IResult<&str, SmtpCommand> {
         map(tag_no_case("QUIT"), |_| SmtpCommand::Quit),
         map(tag_no_case("RSET"), |_| SmtpCommand::Rset),
         map(tag_no_case("NOOP"), |_| SmtpCommand::Noop),
+        map(tag_no_case("STARTTLS"), |_| SmtpCommand::StartTls),
     ))
     .parse(input)
 }

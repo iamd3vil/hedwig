@@ -39,6 +39,7 @@ pub struct CfgServer {
     pub disable_outbound: Option<bool>,
     pub outbound_local: Option<bool>,
     pub pool_size: Option<u64>,
+    pub enable_starttls: Option<bool>,
     pub tls: Option<CfgTls>,
 }
 

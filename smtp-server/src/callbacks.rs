@@ -415,6 +415,7 @@ mod tests {
                 outbound_local: Some(false),
                 pool_size: Some(10),
                 tls: None,
+                enable_starttls: Some(false),
             },
             storage: CfgStorage {
                 storage_type: "mock".to_string(),

@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use base64::prelude::*;
 use bytes::{Buf, BytesMut};
-use memchr::memchr;
 use miette::{bail, Diagnostic, IntoDiagnostic, Result, SourceSpan};
 use std::sync::Arc;
 use thiserror::Error;
@@ -152,6 +151,8 @@ pub struct SmtpServer {
     auth_enabled: bool,
     // TLS acceptor for handling STARTTLS.
     tls_acceptor: Option<TlsAcceptor>,
+    // Indicates whether STARTTLS is enabled for this server.
+    enable_starttls: bool,
 }
 
 // Added DispatchResult enum definition here
@@ -178,11 +179,13 @@ impl SmtpServer {
         callbacks: T,
         auth_enabled: bool,
         tls_acceptor_for_starttls: Option<TlsAcceptor>,
+        enable_starttls: bool,
     ) -> Self {
         SmtpServer {
             callbacks: Arc::new(callbacks),
             auth_enabled,
             tls_acceptor: tls_acceptor_for_starttls,
+            enable_starttls: enable_starttls,
         }
     }
 
@@ -206,8 +209,8 @@ impl SmtpServer {
             .write_line(b"220 localhost ESMTP server ready")
             .await?;
 
-        let mut buf = BytesMut::with_capacity(4096); // Buffer for command lines
-        let mut data_buffer = BytesMut::new(); // Buffer for DATA content
+        let mut buf = BytesMut::with_capacity(4096);
+        let mut data_buffer = BytesMut::new();
 
         loop {
             if session.state == SessionState::ReceivingData {
@@ -219,10 +222,9 @@ impl SmtpServer {
                     return Ok(());
                 }
 
-                let mut termination_found = false;
                 if let Some(pos) = memchr::memmem::find(&data_buffer, b"\r\n.\r\n") {
                     let raw_message_bytes = data_buffer.split_to(pos).freeze();
-                    data_buffer.advance(5); // Consume \r\n.\r\n
+                    data_buffer.advance(5);
 
                     let unstuffed_bytes = unstuff_dot_lines(&raw_message_bytes);
                     session.email.body =
@@ -232,171 +234,55 @@ impl SmtpServer {
                         })?;
 
                     if let Err(_) = self.callbacks.on_data(&session.email).await {
-                        // Handle specific SmtpError cases for on_data rejection
                         current_socket.write_line(b"554 Transaction failed").await?;
-                        session.reset(); // Reset session for new transaction
-                        session.state = if session.auth_required_for_state() || !self.auth_enabled {
-                            SessionState::Authenticated
-                        } else {
-                            SessionState::Greeted
-                        };
                     } else {
                         current_socket.write_line(b"250 OK: mail queued").await?;
                     }
-
+                    session.reset();
                     session.state = if session.auth_required_for_state() || !self.auth_enabled {
                         SessionState::Authenticated
                     } else {
                         SessionState::Greeted
                     };
-                    session.email.body.clear();
-                    session.email.to.clear(); // From is kept as per some server behaviors for multiple emails in one session
-
-                    termination_found = true;
-                }
-
-                if termination_found {
-                    if !data_buffer.is_empty() {
-                        buf.extend_from_slice(&data_buffer);
-                        data_buffer.clear();
-                    }
-                    continue;
-                }
-                if data_buffer.len() > 10 * 1024 * 1024 {
-                    // 10MB limit
-                    current_socket
-                        .write_line(
-                            b"552 Requested mail action aborted: exceeded storage allocation",
-                        )
-                        .await?;
-                    session.state = SessionState::Authenticated; // Or Greeted
-                    data_buffer.clear();
-                    // Potentially close connection or wait for RSET/QUIT
                 }
             } else {
-                if buf.capacity() == 0 {
-                    buf.reserve(1024);
-                }
                 let n = current_socket.read_buf(&mut buf).await.into_diagnostic()?;
                 if n == 0 {
                     return Ok(());
                 }
 
-                while let Some(cr_pos) = memchr(b'\r', &buf) {
-                    if cr_pos + 1 < buf.len() && buf[cr_pos + 1] == b'\n' {
-                        let line_bytes = buf.split_to(cr_pos + 2).freeze();
-                        let command_str = std::str::from_utf8(&line_bytes[..line_bytes.len() - 2])
-                            .map_err(|err| SmtpError::ParseError {
-                                message: format!("Invalid UTF-8 sequence: {}", err),
-                                span: (0, line_bytes.len() - 2).into(),
-                            })?
-                            .trim();
+                while let Some(pos) = memchr::memmem::find(&buf, b"\r\n") {
+                    let line = buf.split_to(pos + 2).freeze();
+                    let line_str = String::from_utf8_lossy(&line).trim().to_string();
 
-                        if command_str.is_empty() {
-                            continue;
-                        }
+                    if line_str.is_empty() {
+                        continue;
+                    }
 
-                        match parse_command(command_str, &session.state) {
-                            Ok(cmd) => {
-                                match self
-                                    .dispatch_command(&mut session, cmd, &mut current_socket)
-                                    .await
-                                {
-                                    Ok(DispatchResult::Ok) => { /* Continue to next command in buffer or read more */
-                                    }
-                                    Ok(DispatchResult::Quit) => {
-                                        return Ok(());
-                                    }
-                                    Ok(DispatchResult::NeedsTlsUpgrade) => {
-                                        if let Some(ref acceptor) = self.tls_acceptor {
-                                            current_socket
-                                                .write_line(b"220 Ready to start TLS")
-                                                .await?;
-                                            // current_socket is consumed by upgrade and a new socket is returned or an error.
-                                            match current_socket.upgrade(acceptor.clone()).await {
-                                                Ok(upgraded_socket) => {
-                                                    current_socket = upgraded_socket; // Assign the new upgraded socket
-                                                    session.reset_for_tls();
-                                                    buf.clear();
-                                                    data_buffer.clear();
-                                                    // Continue loop for client to send EHLO on the new TLS stream
-                                                }
-                                                Err(upgrade_err) => {
-                                                    // upgrade_err is miette::Report
-                                                    eprintln!("TLS handshake failure: {}. Closing connection.", upgrade_err);
-                                                    // Propagate the error; handle_client's caller in main.rs will log it.
-                                                    return Err(upgrade_err);
-                                                }
-                                            }
-                                        } else {
-                                            // This case should ideally not be reached if dispatch_command ensures
-                                            // tls_acceptor.is_some() before returning NeedsTlsUpgrade.
-                                            // If it's reached, it implies a logic error in dispatch_command.
-                                            eprintln!("Internal Server Error: STARTTLS requested but no acceptor configured, despite dispatch_command signaling upgrade.");
-                                            current_socket
-                                                .write_line(
-                                                    b"454 TLS not available due to server error",
-                                                )
-                                                .await?;
-                                            bail!("Internal server error: Inconsistent STARTTLS state");
-                                        }
-                                    }
-                                    Err(smtp_err) => {
-                                        // dispatch_command should ideally send SMTP error replies.
-                                        // This block handles errors that weren't translated to replies OR
-                                        // cases where we need to send a generic reply based on SmtpError type.
-                                        match smtp_err {
-                                            SmtpError::MailFromDenied { message } => {
-                                                current_socket
-                                                    .write_line(
-                                                        format!("550 {}", message).as_bytes(),
-                                                    )
-                                                    .await?;
-                                            }
-                                            SmtpError::RcptToDenied { message } => {
-                                                current_socket
-                                                    .write_line(
-                                                        format!("550 {}", message).as_bytes(),
-                                                    )
-                                                    .await?;
-                                            }
-                                            SmtpError::AuthError => {
-                                                current_socket
-                                                    .write_line(
-                                                        b"535 Authentication credentials invalid",
-                                                    )
-                                                    .await?;
-                                            }
-                                            SmtpError::ProtocolError(msg) => {
-                                                current_socket
-                                                    .write_line(format!("503 {}", msg).as_bytes())
-                                                    .await?;
-                                            }
-                                            SmtpError::ParseError { .. } => {
-                                                // Already handled by parse_command presumably with 500
-                                                // but if it gets here, means parse_command failed and didn't result in early exit
-                                                current_socket
-                                                    .write_line(b"500 Syntax error")
-                                                    .await?;
-                                            }
-                                            SmtpError::IoError(_) => {
-                                                // IO errors usually mean connection is dead or unusable.
-                                                return Err(smtp_err.into()); // Propagate to close handler
-                                            }
-                                        }
-                                        // After sending error, continue processing other commands unless it was fatal IO
+                    match parse_command(&line_str, &session.state) {
+                        Ok(command) => {
+                            let dispatch_result = self
+                                .dispatch_command(&mut session, command, &mut current_socket)
+                                .await?;
+
+                            match dispatch_result {
+                                DispatchResult::Ok => {}
+                                DispatchResult::Quit => return Ok(()),
+                                DispatchResult::NeedsTlsUpgrade => {
+                                    if let Some(acceptor) = &self.tls_acceptor {
+                                        current_socket =
+                                            current_socket.upgrade(acceptor.clone()).await?;
+                                        session.reset_for_tls();
+                                    } else {
+                                        bail!("TLS upgrade requested but no acceptor configured");
                                     }
                                 }
                             }
-                            Err(parse_err) => {
-                                eprintln!("Parse error: {}", parse_err);
-                                current_socket
-                                    .write_line(b"500 Syntax error, command unrecognized")
-                                    .await?;
-                            }
                         }
-                    } else {
-                        break; // Incomplete command in buffer, read more.
+                        Err(e) => {
+                            current_socket.write_line(b"500 Syntax error").await?;
+                            return Err(e.into());
+                        }
                     }
                 }
             }
@@ -409,221 +295,150 @@ impl SmtpServer {
         command: SmtpCommand,
         stream: &mut Box<dyn SmtpStream>,
     ) -> Result<DispatchResult, SmtpError> {
-        match (&session.state, command) {
-            (SessionState::Connected, SmtpCommand::Ehlo(domain)) => {
-                self.callbacks.on_ehlo(&domain).await?;
+        if command_requires_ehlo(&command) && session.state == SessionState::Connected {
+            stream
+                .write_line(b"503 Bad sequence of commands (EHLO required)")
+                .await
+                .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
+            return Ok(DispatchResult::Ok);
+        }
+
+        if command_requires_auth(&command, self.auth_enabled) && !session.can_accept_mail_commands()
+        {
+            stream
+                .write_line(b"530 Authentication required")
+                .await
+                .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
+            return Ok(DispatchResult::Ok);
+        }
+
+        match command {
+            SmtpCommand::Ehlo(domain) => {
+                session.state = SessionState::Greeted;
                 session.ehlo_domain = Some(domain.clone());
-                let mut caps = vec![format!("250-localhost Hello {}", domain)];
-                if self.tls_acceptor.is_some() && !session.is_tls {
-                    caps.push("250-STARTTLS".to_string());
+                self.callbacks.on_ehlo(&domain).await?;
+
+                let mut extensions = vec![
+                    "250-localhost".to_string(),
+                    "250-PIPELINING".to_string(),
+                    "250-SIZE 20480000".to_string(),
+                ];
+
+                if self.enable_starttls {
+                    extensions.push("250-STARTTLS".to_string());
                 }
                 if self.auth_enabled {
-                    caps.push("250-AUTH PLAIN LOGIN".to_string());
+                    extensions.push("250-AUTH PLAIN LOGIN".to_string());
                 }
-                caps.push("250 OK".to_string());
-                stream
-                    .write_line(caps.join("\r\n").as_bytes())
-                    .await
-                    .map_err(|e| {
-                        SmtpError::IoError(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Stream write error: {}", e),
-                        ))
-                    })?;
 
-                session.state = if self.auth_enabled {
-                    SessionState::Greeted
-                } else {
-                    SessionState::Authenticated
-                };
-            }
-            (_, SmtpCommand::StartTls) => {
-                if session.is_tls {
-                    stream
-                        .write_line(b"503 Bad sequence of commands (already TLS)")
-                        .await
-                        .map_err(|e| {
-                            SmtpError::IoError(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Stream write error: {}", e),
-                            ))
-                        })?;
-                    return Ok(DispatchResult::Ok);
-                }
-                if self.tls_acceptor.is_some() {
-                    return Ok(DispatchResult::NeedsTlsUpgrade);
-                } else {
-                    stream
-                        .write_line(b"502 STARTTLS not supported")
-                        .await
-                        .map_err(|e| {
-                            SmtpError::IoError(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Stream write error: {}", e),
-                            ))
-                        })?;
+                extensions.push("250 HELP".to_string());
+
+                for (i, line) in extensions.iter().enumerate() {
+                    if i < extensions.len() - 1 {
+                        stream
+                            .write_all(line.as_bytes())
+                            .await
+                            .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
+                        stream
+                            .write_all(b"\r\n")
+                            .await
+                            .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
+                    } else {
+                        stream
+                            .write_line(line.as_bytes())
+                            .await
+                            .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
+                    }
                 }
             }
-            (SessionState::Greeted, SmtpCommand::AuthPlain(auth_data)) => {
-                match self.handle_auth_plain(session, auth_data, stream).await {
-                    Ok(_) => session.state = SessionState::Authenticated,
-                    Err(e) => return Err(e),
-                }
+            SmtpCommand::AuthPlain(auth_data) => {
+                self.handle_auth_plain(session, auth_data, stream).await?;
             }
-            (SessionState::Greeted, SmtpCommand::AuthLogin) => {
+            SmtpCommand::AuthLogin => {
                 session.state = SessionState::AuthenticatingUsername;
-                stream.write_line(b"334 VXNlcm5hbWU6").await.map_err(|e| {
-                    SmtpError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Stream write error: {}", e),
-                    ))
-                })?;
-            }
-            (SessionState::AuthenticatingUsername, SmtpCommand::AuthUsername(username)) => {
-                let decoded_username = decode_base64(&username)?;
-                session.state = SessionState::AuthenticatingPassword(decoded_username);
-                stream.write_line(b"334 UGFzc3dvcmQ6").await.map_err(|e| {
-                    SmtpError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Stream write error: {}", e),
-                    ))
-                })?;
-            }
-            (
-                SessionState::AuthenticatingPassword(username),
-                SmtpCommand::AuthPassword(password),
-            ) => {
-                match self
-                    .handle_auth_login(session, username.to_string(), password, stream)
+                stream
+                    .write_line(b"334 VXNlcm5hbWU6")
                     .await
-                {
-                    Ok(_) => session.state = SessionState::Authenticated,
-                    Err(e) => return Err(e),
+                    .map_err(|e| SmtpError::ProtocolError(e.to_string()))?; // "Username:" in base64
+            }
+            SmtpCommand::AuthUsername(username) => {
+                session.state = SessionState::AuthenticatingPassword(username);
+                stream
+                    .write_line(b"334 UGFzc3dvcmQ6")
+                    .await
+                    .map_err(|e| SmtpError::ProtocolError(e.to_string()))?; // "Password:" in base64
+            }
+            SmtpCommand::AuthPassword(password) => {
+                if let SessionState::AuthenticatingPassword(username_b64) = &session.state {
+                    self.handle_auth_login(session, username_b64.clone(), password, stream)
+                        .await?;
                 }
             }
-            (SessionState::Authenticated, SmtpCommand::MailFrom(from))
-            | (SessionState::Greeted, SmtpCommand::MailFrom(from))
-                if !self.auth_enabled || session.state == SessionState::Authenticated =>
-            {
-                self.callbacks.on_mail_from(&from).await?;
-                session.email.from = from;
-                stream.write_line(b"250 OK").await.map_err(|e| {
-                    SmtpError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Stream write error: {}", e),
-                    ))
-                })?;
+            SmtpCommand::MailFrom(from) => {
                 session.state = SessionState::ReceivingMailFrom;
+                session.email.from = from.clone();
+                self.callbacks.on_mail_from(&from).await?;
+                stream
+                    .write_line(b"250 OK")
+                    .await
+                    .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
             }
-            (SessionState::ReceivingMailFrom, SmtpCommand::RcptTo(to))
-            | (SessionState::ReceivingRcptTo, SmtpCommand::RcptTo(to)) => {
-                self.callbacks.on_rcpt_to(&to).await?;
-                session.email.to.push(to);
-                stream.write_line(b"250 OK").await.map_err(|e| {
-                    SmtpError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Stream write error: {}", e),
-                    ))
-                })?;
+            SmtpCommand::RcptTo(to) => {
                 session.state = SessionState::ReceivingRcptTo;
+                session.email.to.push(to.clone());
+                self.callbacks.on_rcpt_to(&to).await?;
+                stream
+                    .write_line(b"250 OK")
+                    .await
+                    .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
             }
-            (SessionState::ReceivingRcptTo, SmtpCommand::MailFrom(from)) => {
-                session.reset();
-                self.callbacks.on_mail_from(&from).await?;
-                session.email.from = from;
-                stream.write_line(b"250 OK").await.map_err(|e| {
-                    SmtpError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Stream write error: {}", e),
-                    ))
-                })?;
-                session.state = SessionState::ReceivingMailFrom;
+            SmtpCommand::Data => {
+                session.state = SessionState::ReceivingData;
+                stream
+                    .write_line(b"354 End data with <CR><LF>.<CR><LF>")
+                    .await
+                    .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
             }
-            (SessionState::ReceivingRcptTo, SmtpCommand::Data) => {
-                if session.email.to.is_empty() {
-                    stream
-                        .write_line(b"503 Bad sequence of commands (RCPT TO required first)")
-                        .await
-                        .map_err(|e| {
-                            SmtpError::IoError(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Stream write error: {}", e),
-                            ))
-                        })?;
-                } else {
-                    stream
-                        .write_line(b"354 Start mail input; end with <CRLF>.<CRLF>")
-                        .await
-                        .map_err(|e| {
-                            SmtpError::IoError(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Stream write error: {}", e),
-                            ))
-                        })?;
-                    session.state = SessionState::ReceivingData;
-                }
-            }
-            (_, SmtpCommand::Quit) => {
-                stream.write_line(b"221 Bye").await.map_err(|e| {
-                    SmtpError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Stream write error: {}", e),
-                    ))
-                })?;
+            SmtpCommand::Quit => {
+                stream
+                    .write_line(b"221 Bye")
+                    .await
+                    .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
                 return Ok(DispatchResult::Quit);
             }
-            (_, SmtpCommand::Rset) => {
+            SmtpCommand::Rset => {
                 session.reset();
-                stream.write_line(b"250 OK").await.map_err(|e| {
-                    SmtpError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Stream write error: {}", e),
-                    ))
-                })?;
+                stream
+                    .write_line(b"250 OK")
+                    .await
+                    .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
             }
-            (_, SmtpCommand::Noop) => {
-                stream.write_line(b"250 OK").await.map_err(|e| {
-                    SmtpError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Stream write error: {}", e),
-                    ))
-                })?;
+            SmtpCommand::Noop => {
+                stream
+                    .write_line(b"250 OK")
+                    .await
+                    .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
             }
-            (state, cmd) => {
-                if session.ehlo_domain.is_none() && command_requires_ehlo(&cmd) {
+            SmtpCommand::StartTls => {
+                if !self.enable_starttls {
                     stream
-                        .write_line(b"503 Bad sequence of commands (EHLO first)")
+                        .write_line(b"454 TLS not available due to server policy")
                         .await
-                        .map_err(|e| {
-                            SmtpError::IoError(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Stream write error: {}", e),
-                            ))
-                        })?;
-                } else if !session.can_accept_mail_commands()
-                    && command_requires_auth(&cmd, self.auth_enabled)
-                {
-                    stream
-                        .write_line(b"530 Authentication required")
-                        .await
-                        .map_err(|e| {
-                            SmtpError::IoError(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Stream write error: {}", e),
-                            ))
-                        })?;
-                } else {
-                    eprintln!("Unhandled command {:?} in state {:?}", cmd, state);
-                    stream
-                        .write_line(b"500 Unknown command or bad sequence")
-                        .await
-                        .map_err(|e| {
-                            SmtpError::IoError(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Stream write error: {}", e),
-                            ))
-                        })?;
+                        .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
+                    return Ok(DispatchResult::Ok);
                 }
+                if stream.is_encrypted() {
+                    stream
+                        .write_line(b"554 5.5.1 Error: TLS already active")
+                        .await
+                        .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
+                    return Ok(DispatchResult::Ok);
+                }
+                stream
+                    .write_line(b"220 Ready to start TLS")
+                    .await
+                    .map_err(|e| SmtpError::ProtocolError(e.to_string()))?;
+                return Ok(DispatchResult::NeedsTlsUpgrade);
             }
         }
         Ok(DispatchResult::Ok)

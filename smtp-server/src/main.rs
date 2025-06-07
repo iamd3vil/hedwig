@@ -137,6 +137,8 @@ async fn run_server(config_path: &str) -> Result<()> {
 
     info!("Auth enabled: {}", auth_enabled);
 
+    let starttls_enabled = cfg.server.enable_starttls.unwrap_or(false);
+
     let smtp_server = SmtpServer::new(
         callbacks::Callbacks::new(
             Arc::clone(&storage),
@@ -146,6 +148,7 @@ async fn run_server(config_path: &str) -> Result<()> {
         ),
         auth_enabled,
         tls_acceptor.clone(),
+        starttls_enabled,
     );
 
     // Check if there are any emails to process.
@@ -197,18 +200,22 @@ async fn run_server(config_path: &str) -> Result<()> {
         tokio::spawn(async move {
             let boxed_socket: Box<dyn SmtpStream> =
                 if let Some(acceptor) = tls_acceptor_for_initial_connection {
-                    match acceptor.accept(socket).await {
-                        Ok(tls_stream) => Box::new(tls_stream),
-                        Err(e) => {
-                            // Ignore if it's EOF.
-                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                                debug!("TLS handshake failed: {}", e);
-                            } else {
-                                // Log the error.
-                                error!("TLS handshake failed: {}", e);
-                            }
+                    if starttls_enabled {
+                        Box::new(socket)
+                    } else {
+                        match acceptor.accept(socket).await {
+                            Ok(tls_stream) => Box::new(tls_stream),
+                            Err(e) => {
+                                // Ignore if it's EOF.
+                                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                    debug!("TLS handshake failed: {}", e);
+                                } else {
+                                    // Log the error.
+                                    error!("TLS handshake failed: {}", e);
+                                }
 
-                            return;
+                                return;
+                            }
                         }
                     }
                 } else {

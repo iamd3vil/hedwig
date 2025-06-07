@@ -8,8 +8,8 @@ import os
 def send_email(
     smtp_server,
     port,
-    use_tls,
-    use_ssl,
+    use_explicit_tls,
+    use_starttls,
     smtp_username,
     smtp_password,
     sender_email,
@@ -20,11 +20,14 @@ def send_email(
     timeout,
 ):
     try:
+        if use_starttls:
+            print("Starting TLS upgrade", use_explicit_tls)
+        # elif use_explicit_tls:
+        #     print("Starting TLS upgrade")
         # Create the email message
         msg = EmailMessage()
         msg["From"] = sender_email
-        print("recipients", recipient_emails)
-        msg["To"] = recipient_emails  # Can be a list or comma-separated string
+        msg["To"] = recipient_emails
         msg["Subject"] = subject
         msg.set_content(body)
 
@@ -51,16 +54,19 @@ def send_email(
                 print(f"Error attaching file {file_path}: {e}")
 
         # Configure SMTP server connection
-        if use_ssl:
+        if use_explicit_tls:
             server_class = smtplib.SMTP_SSL
         else:
             server_class = smtplib.SMTP
 
+        print(smtp_server, port, timeout)
         # Send the email with timeout
         with server_class(smtp_server, port, timeout=timeout) as server:
-            if not use_ssl and use_tls:
+            if use_starttls and not use_explicit_tls:
+                print("Starting TLS upgrade")
                 server.starttls()
-            server.login(smtp_username, smtp_password)
+            if smtp_username and smtp_password:
+                server.login(smtp_username, smtp_password)
             server.send_message(msg)
 
         print("Email sent successfully!")
@@ -75,20 +81,31 @@ def send_email(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Send an email with attachments, supporting SSL/TLS and STARTTLS."
+        description="Send an email with attachments, supporting explicit TLS, STARTTLS, or plain text SMTP."
     )
     parser.add_argument("--smtp-server", required=True, help="SMTP server address")
     parser.add_argument(
-        "--port", type=int, default=587, help="SMTP server port (default: 587)"
+        "--port",
+        type=int,
+        default=587,
+        help="SMTP server port (default: 587 for STARTTLS/plain, 465 for explicit TLS)",
     )
     parser.add_argument(
-        "--use-tls", type=bool, default=False, help="Use STARTTLS (default: True)"
+        "--use-explicit-tls",
+        action="store_true",
+        help="Use explicit TLS (connects on SSL/TLS port, e.g., 465)",
     )
     parser.add_argument(
-        "--use-ssl", type=bool, default=False, help="Use SSL (default: False)"
+        "--use-starttls",
+        action="store_true",
+        help="Use STARTTLS (connects on plain port then upgrades, e.g., 587)",
     )
-    parser.add_argument("--smtp-username", required=True, help="SMTP server username")
-    parser.add_argument("--smtp-password", required=True, help="SMTP server password")
+    parser.add_argument(
+        "--smtp-username", help="SMTP server username (optional for plain text)"
+    )
+    parser.add_argument(
+        "--smtp-password", help="SMTP server password (optional for plain text)"
+    )
     parser.add_argument("--sender", required=True, help="Sender's email address")
     parser.add_argument(
         "--recipient", required=True, help="Recipient email addresses (comma-separated)"
@@ -107,14 +124,28 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Ensure mutually exclusive TLS options
+    if args.use_explicit_tls and args.use_starttls:
+        raise ValueError(
+            "Cannot use both --use-explicit-tls and --use-starttls simultaneously."
+        )
+
+    # Adjust default port if explicit TLS is used and port is not explicitly set
+    if args.use_explicit_tls and args.port == 587:  # Default port for STARTTLS
+        print("Explicit TLS typically uses port 465. Adjusting port to 465.")
+        args.port = 465
+    elif args.use_starttls and args.port == 465:  # Default port for explicit TLS
+        print("STARTTLS typically uses port 587. Adjusting port to 587.")
+        args.port = 587
+
     # Split recipients into a list
     recipients = [email.strip() for email in args.recipient.split(",")]
 
     send_email(
         smtp_server=args.smtp_server,
         port=args.port,
-        use_tls=args.use_tls,
-        use_ssl=args.use_ssl,
+        use_explicit_tls=args.use_explicit_tls,
+        use_starttls=args.use_starttls,
         smtp_username=args.smtp_username,
         smtp_password=args.smtp_password,
         sender_email=args.sender,
