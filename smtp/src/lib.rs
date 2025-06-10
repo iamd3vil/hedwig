@@ -15,7 +15,7 @@ use std::path::Path;
 use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 
-mod parser;
+pub mod parser;
 use parser::{parse_command, SmtpCommand};
 
 #[async_trait]
@@ -87,7 +87,7 @@ pub struct Email {
 }
 
 #[derive(Debug, PartialEq)]
-enum SessionState {
+pub enum SessionState {
     Connected,
     Greeted,
     AuthenticatingUsername,
@@ -123,8 +123,8 @@ pub trait SmtpCallbacks: Send + Sync {
     /// Called when a client sends a MAIL FROM command.
     ///
     /// # Arguments
-    /// * `from` - The email address of the sender.
-    async fn on_mail_from(&self, from: &str) -> Result<(), SmtpError>;
+    /// * `from_command` - The MAIL FROM command containing address and ESMTP parameters.
+    async fn on_mail_from(&self, from_command: &parser::MailFromCommand) -> Result<(), SmtpError>;
 
     /// Called when a client sends an RCPT TO command.
     ///
@@ -369,9 +369,9 @@ impl SmtpServer {
                 self.handle_auth_login(session, username.to_string(), password, stream)
                     .await?;
             }
-            (SessionState::Authenticated, SmtpCommand::MailFrom(from)) => {
-                self.callbacks.on_mail_from(&from).await?;
-                session.email.from = from;
+            (SessionState::Authenticated, SmtpCommand::MailFrom(from_command)) => {
+                self.callbacks.on_mail_from(&from_command).await?;
+                session.email.from = from_command.address.clone();
                 stream.write_line(b"250 OK\r\n").await?;
                 session.state = SessionState::ReceivingMailFrom;
             }
@@ -382,11 +382,11 @@ impl SmtpServer {
                 stream.write_line(b"250 OK\r\n").await?;
                 session.state = SessionState::ReceivingRcptTo;
             }
-            (SessionState::ReceivingRcptTo, SmtpCommand::MailFrom(from)) => {
+            (SessionState::ReceivingRcptTo, SmtpCommand::MailFrom(from_command)) => {
                 // Start a new email transaction
-                self.callbacks.on_mail_from(&from).await?;
+                self.callbacks.on_mail_from(&from_command).await?;
                 session.email = Email {
-                    from,
+                    from: from_command.address.clone(),
                     to: Vec::with_capacity(1),
                     body: String::new(),
                 };

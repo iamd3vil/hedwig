@@ -1,11 +1,24 @@
 use super::*;
 use nom::{
     branch::alt,
-    bytes::complete::{tag_no_case, take_while1},
-    combinator::{map, rest, verify},
-    sequence::preceded,
+    bytes::complete::{tag, tag_no_case, take_while, take_while1},
+    character::complete::{space0, space1},
+    combinator::{map, opt, rest, verify},
+    multi::separated_list0,
+    sequence::{preceded, separated_pair},
     IResult, Parser,
 };
+
+/// Represents ESMTP parameters for MAIL FROM command
+#[derive(Debug, PartialEq, Clone)]
+pub struct MailFromCommand {
+    /// The sender email address (can be empty for null sender)
+    pub address: String,
+    /// SIZE parameter indicating message size
+    pub size: Option<u64>,
+    /// Other ESMTP parameters as key-value pairs
+    pub other_params: Vec<(String, Option<String>)>,
+}
 
 /// Represents valid SMTP commands that can be received from a client
 #[derive(Debug, PartialEq)]
@@ -20,8 +33,8 @@ pub(crate) enum SmtpCommand {
     AuthUsername(String),
     /// Password input during AUTH LOGIN
     AuthPassword(String),
-    /// MAIL FROM command with email address
-    MailFrom(String),
+    /// MAIL FROM command with email address and ESMTP parameters
+    MailFrom(MailFromCommand),
     /// RCPT TO command with email address
     RcptTo(String),
     /// DATA command
@@ -107,9 +120,84 @@ fn parse_auth_login(input: &str) -> IResult<&str, SmtpCommand> {
 
 fn parse_mail_from(input: &str) -> IResult<&str, SmtpCommand> {
     map(
-        preceded(tag_no_case("MAIL FROM:"), rest), // Use `rest` to capture everything after the prefix
-        |address_part: &str| SmtpCommand::MailFrom(address_part.trim().to_string()), // Trim whitespace from the captured address
+        preceded(
+            tag_no_case("MAIL FROM:"),
+            (
+                preceded(space0, parse_email_address),
+                opt(preceded(space1, parse_esmtp_parameters)),
+            ),
+        ),
+        |(address, params)| {
+            let (size, other_params) = params.unwrap_or_default();
+            SmtpCommand::MailFrom(MailFromCommand {
+                address,
+                size,
+                other_params,
+            })
+        },
     )
+    .parse(input)
+}
+
+/// Parses an email address which can be in angle brackets or without
+fn parse_email_address(input: &str) -> IResult<&str, String> {
+    alt((
+        // Address in angle brackets: <user@domain.com> or <> (null sender)
+        map(
+            (tag("<"), take_while(|c: char| c != '>'), tag(">")),
+            |(_, addr, _)| format!("<{}>", addr),
+        ),
+        // Address without angle brackets: user@domain.com
+        map(
+            take_while1(|c: char| !c.is_whitespace() && c != '\r' && c != '\n'),
+            |s: &str| s.to_string(),
+        ),
+    ))
+    .parse(input)
+}
+
+/// Parses ESMTP parameters and returns (size, other_params)
+fn parse_esmtp_parameters(
+    input: &str,
+) -> IResult<&str, (Option<u64>, Vec<(String, Option<String>)>)> {
+    let (input, params) = separated_list0(space1, parse_single_parameter).parse(input)?;
+
+    let mut size = None;
+    let mut other_params = Vec::new();
+
+    for (key, value) in params {
+        if key.to_uppercase() == "SIZE" {
+            if let Some(val) = value {
+                if let Ok(s) = val.parse::<u64>() {
+                    size = Some(s);
+                }
+            }
+        } else {
+            other_params.push((key, value));
+        }
+    }
+
+    Ok((input, (size, other_params)))
+}
+
+/// Parses a single parameter which can be key=value or just key
+fn parse_single_parameter(input: &str) -> IResult<&str, (String, Option<String>)> {
+    alt((
+        // Parameter with value: KEY=VALUE
+        map(
+            separated_pair(
+                take_while1(|c: char| c.is_alphanumeric() || c == '-' || c == '_'),
+                tag("="),
+                take_while1(|c: char| !c.is_whitespace() && c != '\r' && c != '\n'),
+            ),
+            |(key, value): (&str, &str)| (key.to_string(), Some(value.to_string())),
+        ),
+        // Parameter without value: KEY
+        map(
+            take_while1(|c: char| c.is_alphanumeric() || c == '-' || c == '_'),
+            |key: &str| (key.to_string(), None),
+        ),
+    ))
     .parse(input)
 }
 
@@ -254,7 +342,10 @@ mod tests {
     // A simplified parse_command for testing these specific parsers directly.
     // Your actual `parse_command` would be more complex and handle dispatching.
     // For these tests, we'll call the specific parsers if we know the command type.
-    fn test_parse_command_wrapper(input: &str, _state: &SessionState) -> Result<SmtpCommand> {
+    fn test_parse_command_wrapper(
+        input: &str,
+        _state: &SessionState,
+    ) -> Result<SmtpCommand, SmtpError> {
         let upper_input = input.to_uppercase();
         let result = if upper_input.starts_with("MAIL FROM:") {
             parse_mail_from(input)
@@ -266,12 +357,15 @@ mod tests {
             unimplemented!("This test wrapper only supports MAIL FROM and RCPT TO for now");
         };
 
-        Ok(result
+        result
             .map(|(_remaining, cmd)| {
                 // In a real scenario, you'd check if _remaining is empty here or in the main parse_command
                 cmd
             })
-            .unwrap())
+            .map_err(|e| SmtpError::ParseError {
+                message: e.to_string(),
+                span: (0, input.len()).into(),
+            })
     }
 
     #[test]
@@ -281,54 +375,76 @@ mod tests {
         // Test MAIL FROM
         assert_eq!(
             test_parse_command_wrapper("MAIL FROM:<user@example.com>", &connected_state).unwrap(),
-            SmtpCommand::MailFrom("<user@example.com>".to_string())
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "<user@example.com>".to_string(),
+                size: None,
+                other_params: vec![]
+            })
         );
 
         // Test MAIL FROM with leading/trailing spaces in the argument part (which trim() should handle)
         assert_eq!(
-            test_parse_command_wrapper("MAIL FROM:  <admin@test.com>  ", &connected_state).unwrap(),
-            SmtpCommand::MailFrom("<admin@test.com>".to_string())
+            test_parse_command_wrapper("MAIL FROM:  <admin@test.com>", &connected_state).unwrap(),
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "<admin@test.com>".to_string(),
+                size: None,
+                other_params: vec![]
+            })
         );
 
         // Test case-insensitivity of the command itself
         assert_eq!(
             test_parse_command_wrapper("mail from:<lowercase@example.com>", &connected_state)
                 .unwrap(),
-            SmtpCommand::MailFrom("<lowercase@example.com>".to_string())
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "<lowercase@example.com>".to_string(),
+                size: None,
+                other_params: vec![]
+            })
         );
 
         // Test the problematic case from your description
         assert_eq!(
             test_parse_command_wrapper("mail from:<me@mailtest.alertify.sh>", &connected_state)
                 .unwrap(),
-            SmtpCommand::MailFrom("<me@mailtest.alertify.sh>".to_string())
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "<me@mailtest.alertify.sh>".to_string(),
+                size: None,
+                other_params: vec![]
+            })
         );
 
         // Test MAIL FROM with no angle brackets (if your server should support this)
         assert_eq!(
             test_parse_command_wrapper("MAIL FROM:user@example.com", &connected_state).unwrap(),
-            SmtpCommand::MailFrom("user@example.com".to_string())
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "user@example.com".to_string(),
+                size: None,
+                other_params: vec![]
+            })
         );
 
         // Test MAIL FROM with empty path (null sender)
         assert_eq!(
             test_parse_command_wrapper("MAIL FROM:<>", &connected_state).unwrap(),
-            SmtpCommand::MailFrom("<>".to_string())
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "<>".to_string(),
+                size: None,
+                other_params: vec![]
+            })
         );
         assert_eq!(
             test_parse_command_wrapper("MAIL FROM: <>", &connected_state).unwrap(),
-            SmtpCommand::MailFrom("<>".to_string())
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "<>".to_string(),
+                size: None,
+                other_params: vec![]
+            })
         );
 
-        // Test MAIL FROM with only the command (should result in an empty string for the address part)
-        assert_eq!(
-            test_parse_command_wrapper("MAIL FROM:", &connected_state).unwrap(),
-            SmtpCommand::MailFrom("".to_string())
-        );
-        assert_eq!(
-            test_parse_command_wrapper("MAIL FROM: ", &connected_state).unwrap(), // space after colon
-            SmtpCommand::MailFrom("".to_string())
-        );
+        // Test MAIL FROM with only the command - this should fail now since we require an address
+        assert!(test_parse_command_wrapper("MAIL FROM:", &connected_state).is_err());
+        assert!(test_parse_command_wrapper("MAIL FROM: ", &connected_state).is_err());
 
         // Test RCPT TO
         assert_eq!(
@@ -357,6 +473,88 @@ mod tests {
             )
             .unwrap(),
             SmtpCommand::RcptTo("<charming.alpaca.noos@letterguard.net>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_esmtp_extensions() {
+        let connected_state = SessionState::Connected;
+
+        // Test MAIL FROM with SIZE parameter
+        assert_eq!(
+            test_parse_command_wrapper(
+                "MAIL FROM:<sender@example.com> SIZE=12345",
+                &connected_state
+            )
+            .unwrap(),
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "<sender@example.com>".to_string(),
+                size: Some(12345),
+                other_params: vec![]
+            })
+        );
+
+        // Test MAIL FROM with multiple parameters
+        assert_eq!(
+            test_parse_command_wrapper(
+                "MAIL FROM:<sender@example.com> SIZE=5000 SMTPUTF8",
+                &connected_state
+            )
+            .unwrap(),
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "<sender@example.com>".to_string(),
+                size: Some(5000),
+                other_params: vec![("SMTPUTF8".to_string(), None)]
+            })
+        );
+
+        // Test MAIL FROM with custom parameters
+        assert_eq!(
+            test_parse_command_wrapper(
+                "MAIL FROM:<sender@example.com> CUSTOM=value OTHER",
+                &connected_state
+            )
+            .unwrap(),
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "<sender@example.com>".to_string(),
+                size: None,
+                other_params: vec![
+                    ("CUSTOM".to_string(), Some("value".to_string())),
+                    ("OTHER".to_string(), None)
+                ]
+            })
+        );
+
+        // Test MAIL FROM without angle brackets but with SIZE
+        assert_eq!(
+            test_parse_command_wrapper("MAIL FROM:sender@example.com SIZE=1024", &connected_state)
+                .unwrap(),
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "sender@example.com".to_string(),
+                size: Some(1024),
+                other_params: vec![]
+            })
+        );
+
+        // Test MAIL FROM with null sender and SIZE
+        assert_eq!(
+            test_parse_command_wrapper("MAIL FROM:<> SIZE=0", &connected_state).unwrap(),
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "<>".to_string(),
+                size: Some(0),
+                other_params: vec![]
+            })
+        );
+
+        // Test case insensitive SIZE parameter
+        assert_eq!(
+            test_parse_command_wrapper("MAIL FROM:<sender@example.com> size=999", &connected_state)
+                .unwrap(),
+            SmtpCommand::MailFrom(MailFromCommand {
+                address: "<sender@example.com>".to_string(),
+                size: Some(999),
+                other_params: vec![]
+            })
         );
     }
 
@@ -493,7 +691,11 @@ mod tests {
             (
                 "MAIL FROM:<sender@example.com>\r\n",
                 SessionState::Authenticated,
-                SmtpCommand::MailFrom("<sender@example.com>".to_string()), // Include CRLF
+                SmtpCommand::MailFrom(MailFromCommand {
+                    address: "<sender@example.com>".to_string(),
+                    size: None,
+                    other_params: vec![],
+                }),
             ),
             (
                 "RCPT TO:<recipient@example.com>\r\n",

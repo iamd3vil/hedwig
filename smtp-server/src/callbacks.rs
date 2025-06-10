@@ -176,7 +176,11 @@ impl SmtpCallbacks for Callbacks {
     }
 
     // Handles the MAIL FROM command.
-    async fn on_mail_from(&self, from_path: &str) -> Result<(), SmtpError> {
+    async fn on_mail_from(
+        &self,
+        from_command: &smtp::parser::MailFromCommand,
+    ) -> Result<(), SmtpError> {
+        let from_path = &from_command.address;
         let sender_domain_opt: Option<String> = extract_domain_from_path(from_path);
 
         if let Some(filters) = &self.cfg.filters {
@@ -429,11 +433,21 @@ mod tests {
         Callbacks::new(storage, sender_channel, receiver_channel, cfg)
     }
 
+    fn create_mail_from_command(address: &str) -> smtp::parser::MailFromCommand {
+        smtp::parser::MailFromCommand {
+            address: address.to_string(),
+            size: None,
+            other_params: vec![],
+        }
+    }
+
     // Tests for on_mail_from
     #[tokio::test]
     async fn test_on_mail_from_no_filters() {
         let callbacks = create_test_callbacks(None);
-        let result = callbacks.on_mail_from("test@example.com").await;
+        let result = callbacks
+            .on_mail_from(&create_mail_from_command("test@example.com"))
+            .await;
         assert!(result.is_ok());
     }
 
@@ -445,7 +459,9 @@ mod tests {
             action: FilterAction::Allow,
         }];
         let callbacks = create_test_callbacks(Some(filters));
-        let result = callbacks.on_mail_from("test@example.com").await;
+        let result = callbacks
+            .on_mail_from(&create_mail_from_command("test@example.com"))
+            .await;
         assert!(result.is_ok());
     }
 
@@ -457,7 +473,9 @@ mod tests {
             action: FilterAction::Allow,
         }];
         let callbacks = create_test_callbacks(Some(filters));
-        let result = callbacks.on_mail_from("test@example.com").await;
+        let result = callbacks
+            .on_mail_from(&create_mail_from_command("test@example.com"))
+            .await;
         assert!(result.is_err());
         if let Err(SmtpError::MailFromDenied { message }) = result {
             assert_eq!(
@@ -477,7 +495,9 @@ mod tests {
             action: FilterAction::Allow,
         }];
         let callbacks = create_test_callbacks(Some(filters));
-        let result = callbacks.on_mail_from("testuser").await; // No domain in from_path
+        let result = callbacks
+            .on_mail_from(&create_mail_from_command("testuser"))
+            .await; // No domain in from_path
         assert!(result.is_err());
         if let Err(SmtpError::MailFromDenied { message }) = result {
             assert_eq!(
@@ -497,7 +517,9 @@ mod tests {
             action: FilterAction::Deny,
         }];
         let callbacks = create_test_callbacks(Some(filters));
-        let result = callbacks.on_mail_from("test@example.com").await;
+        let result = callbacks
+            .on_mail_from(&create_mail_from_command("test@example.com"))
+            .await;
         assert!(result.is_err());
         if let Err(SmtpError::MailFromDenied { message }) = result {
             assert_eq!(message, "Sender domain example.com is denied.");
@@ -514,7 +536,9 @@ mod tests {
             action: FilterAction::Deny,
         }];
         let callbacks = create_test_callbacks(Some(filters));
-        let result = callbacks.on_mail_from("test@example.com").await;
+        let result = callbacks
+            .on_mail_from(&create_mail_from_command("test@example.com"))
+            .await;
         assert!(result.is_ok());
     }
 
@@ -537,7 +561,9 @@ mod tests {
         let callbacks = create_test_callbacks(Some(filters));
         // This should be denied because example.com is denied, even if specific.example.com is on an allow list.
         // Deny rules take precedence if matched.
-        let result = callbacks.on_mail_from("user@example.com").await;
+        let result = callbacks
+            .on_mail_from(&create_mail_from_command("user@example.com"))
+            .await;
         assert!(result.is_err());
         if let Err(SmtpError::MailFromDenied { message }) = result {
             assert_eq!(message, "Sender domain example.com is denied.");
@@ -564,11 +590,15 @@ mod tests {
         ];
         let callbacks = create_test_callbacks(Some(filters));
         // Allowed because example.com is explicitly allowed and not bad.com
-        let result_allowed = callbacks.on_mail_from("user@example.com").await;
+        let result_allowed = callbacks
+            .on_mail_from(&create_mail_from_command("user@example.com"))
+            .await;
         assert!(result_allowed.is_ok());
 
         // Denied because bad.com is denied
-        let result_denied = callbacks.on_mail_from("user@bad.com").await;
+        let result_denied = callbacks
+            .on_mail_from(&create_mail_from_command("user@bad.com"))
+            .await;
         assert!(result_denied.is_err());
         if let Err(SmtpError::MailFromDenied { message }) = result_denied {
             assert_eq!(message, "Sender domain bad.com is denied.");
@@ -585,7 +615,9 @@ mod tests {
             action: FilterAction::Allow,
         }];
         let callbacks = create_test_callbacks(Some(filters));
-        let result = callbacks.on_mail_from("<testuser>").await; // no domain
+        let result = callbacks
+            .on_mail_from(&create_mail_from_command("<testuser>"))
+            .await; // no domain
         assert!(result.is_err());
         if let Err(SmtpError::MailFromDenied { message }) = result {
             assert_eq!(
