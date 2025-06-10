@@ -83,7 +83,7 @@ fn parse_ehlo(input: &str) -> IResult<&str, SmtpCommand> {
     map(
         preceded(
             alt((tag_no_case("EHLO "), tag_no_case("HELO "))),
-            verify(take_while1(is_alphanumeric), |s: &str| s.len() <= 255),
+            verify(take_while1(is_valid_domain_char), |s: &str| s.len() <= 255),
         ),
         |domain: &str| SmtpCommand::Ehlo(domain.to_string()),
     )
@@ -131,9 +131,10 @@ fn parse_simple_command(input: &str) -> IResult<&str, SmtpCommand> {
     .parse(input)
 }
 
-/// Checks if a character is valid char.
-fn is_alphanumeric(c: char) -> bool {
-    c.is_alphanumeric() || c == '.' || c == '-'
+/// Checks if a character is valid for domain names or address literals.
+/// Supports domain names (alphanumeric, dots, hyphens) and address literals (IPv4/IPv6 in brackets).
+fn is_valid_domain_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '.' || c == '-' || c == '[' || c == ']' || c == ':'
 }
 
 #[cfg(test)]
@@ -385,6 +386,56 @@ mod tests {
     }
 
     #[test]
+    fn test_address_literals() {
+        // Test IPv4 address literal - the case that was failing
+        assert_eq!(
+            parse_command("EHLO [127.0.1.1]", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("[127.0.1.1]".to_string())
+        );
+
+        // Test HELO with IPv4 address literal - the other case that was failing
+        assert_eq!(
+            parse_command("HELO [127.0.1.1]", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("[127.0.1.1]".to_string())
+        );
+
+        // Test case insensitive
+        assert_eq!(
+            parse_command("ehlo [127.0.1.1]", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("[127.0.1.1]".to_string())
+        );
+
+        assert_eq!(
+            parse_command("helo [127.0.1.1]", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("[127.0.1.1]".to_string())
+        );
+
+        // Test other IPv4 addresses
+        assert_eq!(
+            parse_command("EHLO [192.168.1.100]", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("[192.168.1.100]".to_string())
+        );
+
+        // Test IPv6 address literal (basic format)
+        assert_eq!(
+            parse_command("EHLO [::1]", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("[::1]".to_string())
+        );
+
+        // Test IPv6 address literal (full format)
+        assert_eq!(
+            parse_command("EHLO [2001:db8::1]", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("[2001:db8::1]".to_string())
+        );
+
+        // Test localhost IPv4
+        assert_eq!(
+            parse_command("EHLO [127.0.0.1]", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("[127.0.0.1]".to_string())
+        );
+    }
+
+    #[test]
     fn test_starttls_command() {
         // Basic STARTTLS command
         assert_eq!(
@@ -495,5 +546,23 @@ mod tests {
             &SessionState::Connected
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_python_smtp_client_cases() {
+        // Test the exact cases that were failing with the Python SMTP client
+        // These should now work with our updated parser
+
+        // Case 1: "ehlo [127.0.1.1]"
+        assert_eq!(
+            parse_command("ehlo [127.0.1.1]", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("[127.0.1.1]".to_string())
+        );
+
+        // Case 2: "helo [127.0.1.1]"
+        assert_eq!(
+            parse_command("helo [127.0.1.1]", &SessionState::Connected).unwrap(),
+            SmtpCommand::Ehlo("[127.0.1.1]".to_string())
+        );
     }
 }
