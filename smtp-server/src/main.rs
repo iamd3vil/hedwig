@@ -102,36 +102,41 @@ async fn run_server(config_path: &str) -> Result<()> {
         .await
         .wrap_err("error getting storage type")?;
     let storage = Arc::new(storage);
-    // Initialize TLS if configured
-    let tls_acceptor = if let Some(tls_config) = &cfg.server.tls {
-        let cert_file = tokio::fs::File::open(&tls_config.cert_path)
-            .await
-            .into_diagnostic()
-            .wrap_err("Failed to open certificate file")?;
-        let key_file = tokio::fs::File::open(&tls_config.key_path)
-            .await
-            .into_diagnostic()
-            .wrap_err("Failed to open private key file")?;
+    // Create TLS acceptors for each listener that has TLS configured
+    let mut tls_acceptors = Vec::new();
+    for listener_config in &cfg.server.listeners {
+        let tls_acceptor = if let Some(tls_config) = &listener_config.tls {
+            let cert_file = tokio::fs::File::open(&tls_config.cert_path)
+                .await
+                .into_diagnostic()
+                .wrap_err("Failed to open certificate file")?;
+            let key_file = tokio::fs::File::open(&tls_config.key_path)
+                .await
+                .into_diagnostic()
+                .wrap_err("Failed to open private key file")?;
 
-        let certs: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file.into_std().await))
-                .collect::<std::io::Result<Vec<_>>>()
+            let certs: Vec<CertificateDer<'static>> =
+                rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file.into_std().await))
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .into_diagnostic()?;
+
+            let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+                key_file.into_std().await,
+            ))
+            .into_diagnostic()?
+            .ok_or_else(|| miette::miette!("No private key found"))?;
+
+            let config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
                 .into_diagnostic()?;
 
-        let key =
-            rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file.into_std().await))
-                .into_diagnostic()?
-                .ok_or_else(|| miette::miette!("No private key found"))?;
-
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .into_diagnostic()?;
-
-        Some(TlsAcceptor::from(Arc::new(config)))
-    } else {
-        None
-    };
+            Some(TlsAcceptor::from(Arc::new(config)))
+        } else {
+            None
+        };
+        tls_acceptors.push(tls_acceptor);
+    }
 
     let auth_enabled = cfg.server.auth.is_some();
 
@@ -175,49 +180,82 @@ async fn run_server(config_path: &str) -> Result<()> {
         }
     });
 
-    let listener = TcpListener::bind(&cfg.server.addr)
-        .await
-        .into_diagnostic()?;
-    info!(
-        storage_type = cfg.storage.storage_type,
-        "SMTP server listening on {}", cfg.server.addr
-    );
-
-    loop {
-        let (socket, _) = listener
-            .accept()
+    // Create listeners for each configured address
+    let mut listeners = Vec::new();
+    for (i, listener_config) in cfg.server.listeners.iter().enumerate() {
+        let listener = TcpListener::bind(&listener_config.addr)
             .await
             .into_diagnostic()
-            .wrap_err("error accepting tcp connection")?;
-        debug!("Accepted connection");
+            .wrap_err_with(|| format!("Failed to bind to address: {}", listener_config.addr))?;
+
+        let tls_status = if listener_config.tls.is_some() {
+            "TLS"
+        } else {
+            "plaintext"
+        };
+        info!(
+            storage_type = cfg.storage.storage_type,
+            "SMTP server listening on {} ({})", listener_config.addr, tls_status
+        );
+
+        listeners.push((listener, i));
+    }
+
+    // Spawn a task for each listener
+    let mut listener_tasks = Vec::new();
+    for (listener, acceptor_index) in listeners {
         let server_clone = smtp_server.clone();
-        let tls_acceptor = tls_acceptor.clone();
+        let tls_acceptor = tls_acceptors[acceptor_index].clone();
 
-        tokio::spawn(async move {
-            let mut boxed_socket: Box<dyn SmtpStream> = if let Some(acceptor) = tls_acceptor {
-                match acceptor.accept(socket).await {
-                    Ok(tls_stream) => Box::new(tls_stream),
+        let task = tokio::spawn(async move {
+            loop {
+                let (socket, _) = match listener.accept().await {
+                    Ok(conn) => conn,
                     Err(e) => {
-                        // Ignore if it's EOF.
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                            debug!("TLS handshake failed: {}", e);
-                        } else {
-                            // Log the error.
-                            error!("TLS handshake failed: {}", e);
-                        }
-
-                        return;
+                        error!("Error accepting tcp connection: {:#}", e);
+                        continue;
                     }
-                }
-            } else {
-                Box::new(socket)
-            };
+                };
 
-            if let Err(e) = server_clone.handle_client(&mut boxed_socket).await {
-                error!("Error handling client: {:#}", e);
+                debug!("Accepted connection");
+                let server_clone = server_clone.clone();
+                let tls_acceptor = tls_acceptor.clone();
+
+                tokio::spawn(async move {
+                    let mut boxed_socket: Box<dyn SmtpStream> = if let Some(acceptor) = tls_acceptor
+                    {
+                        match acceptor.accept(socket).await {
+                            Ok(tls_stream) => Box::new(tls_stream),
+                            Err(e) => {
+                                // Ignore if it's EOF.
+                                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                    debug!("TLS handshake failed: {}", e);
+                                } else {
+                                    // Log the error.
+                                    error!("TLS handshake failed: {}", e);
+                                }
+
+                                return;
+                            }
+                        }
+                    } else {
+                        Box::new(socket)
+                    };
+
+                    if let Err(e) = server_clone.handle_client(&mut boxed_socket).await {
+                        error!("Error handling client: {:#}", e);
+                    }
+                });
             }
         });
+
+        listener_tasks.push(task);
     }
+
+    // Wait for all listener tasks to complete (which should never happen)
+    futures::future::join_all(listener_tasks).await;
+
+    Ok(())
 }
 
 async fn generate_dkim_keys(config_path: &str) -> Result<()> {

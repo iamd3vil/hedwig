@@ -53,14 +53,17 @@ This SMTP server is designed with a focus on speed and simplicity. It provides a
 
    ```toml
    [server]
-   addr = "0.0.0.0:25"  # SMTP server address
    workers = 4          # Number of worker threads
    pool_size = 100      # Outbund Connection pool size
    max_retries = 5      # Maximum number of retries for deferred emails (Default is 5)
 
+   # Configure multiple listeners - each can be plaintext or TLS
+   [[server.listeners]]
+   addr = "0.0.0.0:25"  # Plaintext SMTP listener
 
-   # Optional TLS configuration
-   [server.tls]
+   [[server.listeners]]
+   addr = "0.0.0.0:465" # TLS SMTP listener
+   [server.listeners.tls]
    cert_path = "/path/to/cert.pem"
    key_path = "/path/to/key.pem"
 
@@ -89,19 +92,35 @@ This SMTP server is designed with a focus on speed and simplicity. It provides a
 
 ### Server Configuration
 
-- `addr`: Server address and port (default: "0.0.0.0:25")
 - `workers`: Number of worker threads (optional)
 - `pool_size`: Maximum number of concurrent connections (optional)
 - `disable_outbound`: Disable outbound email delivery (optional)
 - `outbound_local`: Only allow local outbound delivery (optional)
 
-### TLS Configuration (Optional)
+### Listeners Configuration
+
+You can configure multiple listeners, each with their own address and optional TLS configuration:
 
 ```toml
-[server.tls]
+# Plaintext listener on port 25
+[[server.listeners]]
+addr = "0.0.0.0:25"
+
+# TLS listener on port 465
+[[server.listeners]]
+addr = "0.0.0.0:465"
+[server.listeners.tls]
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
+
+# Another plaintext listener on a different port
+[[server.listeners]]
+addr = "127.0.0.1:2525"
 ```
+
+Each listener can be configured independently:
+- `addr`: Server address and port for this listener
+- `tls`: Optional TLS configuration for this specific listener
 
 ### Authentication (Optional)
 

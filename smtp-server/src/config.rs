@@ -31,7 +31,7 @@ pub struct Cfg {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CfgServer {
-    pub addr: String,
+    pub listeners: Vec<CfgListener>,
     pub workers: Option<usize>,
     pub max_retries: Option<u32>,
     pub auth: Option<Vec<CfgAuth>>,
@@ -39,7 +39,6 @@ pub struct CfgServer {
     pub disable_outbound: Option<bool>,
     pub outbound_local: Option<bool>,
     pub pool_size: Option<u64>,
-    pub tls: Option<CfgTls>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -94,6 +93,12 @@ pub struct CfgDKIM {
 pub struct CfgAuth {
     pub username: String,
     pub password: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CfgListener {
+    pub addr: String,
+    pub tls: Option<CfgTls>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

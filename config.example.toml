@@ -1,0 +1,64 @@
+# Hedwig SMTP Server Configuration Example
+
+[log]
+level = "info" # Log level: error, warn, info, debug, trace
+format = "fmt" # Log format: "fmt" or "json"
+
+[server]
+workers = 4              # Number of worker threads (optional)
+pool_size = 100          # Outbound connection pool size (optional)
+max_retries = 5          # Maximum number of retries for deferred emails (optional, default: 5)
+disable_outbound = false # Disable outbound email delivery (optional)
+outbound_local = false   # Only allow local outbound delivery (optional)
+
+# Configure multiple listeners - each can be plaintext or TLS
+# Standard SMTP port (plaintext)
+[[server.listeners]]
+addr = "0.0.0.0:25"
+
+# SMTP submission port (plaintext)
+[[server.listeners]]
+addr = "0.0.0.0:587"
+
+# SMTPS port (TLS)
+[[server.listeners]]
+addr = "0.0.0.0:465"
+[server.listeners.tls]
+cert_path = "/etc/ssl/certs/smtp.crt"
+key_path = "/etc/ssl/private/smtp.key"
+
+# Local testing port (plaintext)
+[[server.listeners]]
+addr = "127.0.0.1:2525"
+
+# Optional SMTP authentication (can have multiple users)
+[[server.auth]]
+username = "user1"
+password = "password1"
+
+[[server.auth]]
+username = "user2"
+password = "password2"
+
+# Optional DKIM configuration
+[server.dkim]
+domain = "example.com"
+selector = "default"
+private_key = "/etc/hedwig/dkim/private.key"
+key_type = "rsa"                             # "rsa" or "ed25519"
+
+# Storage configuration
+[storage]
+storage_type = "fs"
+base_path = "/var/lib/hedwig/mail"
+
+# Optional email filters
+[[filters]]
+type = "from_domain_filter"
+domain = ["allowed-domain.com", "another-domain.com"]
+action = "allow"
+
+[[filters]]
+type = "to_domain_filter"
+domain = ["blocked-domain.com"]
+action = "deny"
