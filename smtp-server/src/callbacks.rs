@@ -345,7 +345,7 @@ impl SmtpCallbacks for Callbacks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CfgAuth, CfgFilter, CfgLog, CfgServer, CfgStorage};
+    use crate::config::{CfgAuth, CfgFilter, CfgListener, CfgLog, CfgServer, CfgStorage};
     use crate::worker::EmailMetadata;
     use camino::Utf8PathBuf;
     use futures::{stream, Stream};
@@ -407,7 +407,10 @@ mod tests {
         let cfg = Cfg {
             log: CfgLog::default(),
             server: CfgServer {
-                addr: "127.0.0.1:2525".to_string(),
+                listeners: vec![CfgListener {
+                    addr: "127.0.0.1:2525".to_string(),
+                    tls: None,
+                }],
                 workers: Some(1),
                 max_retries: Some(3),
                 auth: Some(vec![CfgAuth {
@@ -418,7 +421,6 @@ mod tests {
                 disable_outbound: Some(false),
                 outbound_local: Some(false),
                 pool_size: Some(10),
-                tls: None,
             },
             storage: CfgStorage {
                 storage_type: "mock".to_string(),
