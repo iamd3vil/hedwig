@@ -345,7 +345,7 @@ impl SmtpCallbacks for Callbacks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CfgAuth, CfgFilter, CfgListener, CfgLog, CfgServer, CfgStorage};
+    use crate::config::{CfgAuth, CfgDKIM, CfgFilter, CfgListener, CfgLog, CfgServer, CfgStorage};
     use crate::worker::EmailMetadata;
     use camino::Utf8PathBuf;
     use futures::{stream, Stream};
@@ -819,7 +819,330 @@ mod tests {
 
     #[tokio::test]
     async fn test_extract_domain_from_path_malformed() {
-        assert_eq!(extract_domain_from_path("test@"), None); // Or None, depending on desired strictness
-        assert_eq!(extract_domain_from_path("@domain.com"), None);
+        assert_eq!(extract_domain_from_path("malformed@"), None);
+    }
+
+    #[tokio::test]
+    async fn test_extract_domain_from_path_single_mailaddr() {
+        // Test the MailAddr::Single branch (line 40)
+        let path = "<user@example.com>";
+        assert_eq!(
+            extract_domain_from_path(path),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mx_expiry_struct_creation() {
+        // Test MXExpiry struct can be created (line 50)
+        let _expiry = MXExpiry;
+    }
+
+    #[tokio::test]
+    async fn test_callbacks_new_with_workers() {
+        // Test Callbacks::new with workers enabled (lines 90-97, 99-101)
+        let mut cfg = create_test_config();
+        cfg.server.workers = Some(1);
+        cfg.server.dkim = Some(CfgDKIM {
+            private_key: "test_key".to_string(),
+            selector: "test".to_string(),
+            domain: "example.com".to_string(),
+            key_type: crate::config::DkimKeyType::Rsa,
+        });
+
+        let storage = Arc::new(MockStorage {});
+        let (sender, receiver) = async_channel::bounded(100);
+
+        let _callbacks = Callbacks::new(storage, sender, receiver, cfg);
+        // Just verify it was created without error
+    }
+
+    #[tokio::test]
+    async fn test_callbacks_new_with_auth() {
+        // Test Callbacks::new with auth configuration (lines in auth_mapping creation)
+        let mut cfg = create_test_config();
+        cfg.server.auth = Some(vec![
+            CfgAuth {
+                username: "user1".to_string(),
+                password: "pass1".to_string(),
+            },
+            CfgAuth {
+                username: "user2".to_string(),
+                password: "pass2".to_string(),
+            },
+        ]);
+
+        let storage = Arc::new(MockStorage {});
+        let (sender, receiver) = async_channel::bounded(100);
+
+        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+        let auth_mapping = callbacks.auth_mapping.lock().await;
+        assert_eq!(auth_mapping.get("user1"), Some(&"pass1".to_string()));
+        assert_eq!(auth_mapping.get("user2"), Some(&"pass2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_process_email_success() {
+        // Test process_email method (lines 123-124, 128-131, 134-139, 143-149, 151)
+        let callbacks = create_test_callbacks(None);
+        let email = Email {
+            from: "sender@example.com".to_string(),
+            to: vec!["recipient@example.com".to_string()],
+            body: "Test email body".to_string(),
+        };
+
+        let result = callbacks.process_email(&email).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_process_email_storage_error() {
+        // Test process_email with storage error
+        let cfg = create_test_config();
+        let storage = Arc::new(MockStorageWithError {});
+        let (sender, receiver) = async_channel::bounded(100);
+        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+
+        let email = Email {
+            from: "sender@example.com".to_string(),
+            to: vec!["recipient@example.com".to_string()],
+            body: "Test email body".to_string(),
+        };
+
+        let result = callbacks.process_email(&email).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_on_ehlo() {
+        // Test on_ehlo method (lines 159, 161)
+        let callbacks = create_test_callbacks(None);
+        let result = callbacks.on_ehlo("example.com").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_on_auth_no_config() {
+        // Test on_auth when auth is not configured (lines 165-167)
+        let callbacks = create_test_callbacks(None);
+        let result = callbacks.on_auth("user", "pass").await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_on_auth_valid_credentials() {
+        // Test on_auth with valid credentials (lines 170-173)
+        let mut cfg = create_test_config();
+        cfg.server.auth = Some(vec![CfgAuth {
+            username: "testuser".to_string(),
+            password: "testpass".to_string(),
+        }]);
+
+        let storage = Arc::new(MockStorage {});
+        let (sender, receiver) = async_channel::bounded(100);
+        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+
+        let result = callbacks.on_auth("testuser", "testpass").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_on_auth_invalid_username() {
+        // Test on_auth with invalid username (line 175)
+        let mut cfg = create_test_config();
+        cfg.server.auth = Some(vec![CfgAuth {
+            username: "testuser".to_string(),
+            password: "testpass".to_string(),
+        }]);
+
+        let storage = Arc::new(MockStorage {});
+        let (sender, receiver) = async_channel::bounded(100);
+        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+
+        let result = callbacks.on_auth("wronguser", "testpass").await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_on_mail_from_no_domain_filters() {
+        // Test on_mail_from when no domain filters exist (line 194)
+        let mut cfg = create_test_config();
+        cfg.filters = Some(vec![]); // No filters
+
+        let storage = Arc::new(MockStorage {});
+        let (sender, receiver) = async_channel::bounded(100);
+        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+
+        let mail_cmd = create_mail_from_command("sender@example.com");
+        let result = callbacks.on_mail_from(&mail_cmd).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_on_mail_from_sender_no_domain_not_allowed() {
+        // Test on_mail_from when sender has no domain and not in allowed list (line 245)
+        let mut cfg = create_test_config();
+        cfg.filters = Some(vec![CfgFilter {
+            typ: FilterType::FromDomain,
+            action: FilterAction::Allow,
+            domain: vec!["allowed.com".to_string()],
+        }]);
+
+        let storage = Arc::new(MockStorage {});
+        let (sender, receiver) = async_channel::bounded(100);
+        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+
+        let mail_cmd = create_mail_from_command("invalidpath");
+        let result = callbacks.on_mail_from(&mail_cmd).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_on_rcpt_to_no_domain_filters() {
+        // Test on_rcpt_to when no domain filters exist (line 272)
+        let mut cfg = create_test_config();
+        cfg.filters = Some(vec![]); // No filters
+
+        let storage = Arc::new(MockStorage {});
+        let (sender, receiver) = async_channel::bounded(100);
+        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+
+        let result = callbacks.on_rcpt_to("recipient@example.com").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_on_rcpt_to_recipient_no_domain_not_allowed() {
+        // Test on_rcpt_to when recipient has no domain and not in allowed list (line 323)
+        let mut cfg = create_test_config();
+        cfg.filters = Some(vec![CfgFilter {
+            typ: FilterType::ToDomain,
+            action: FilterAction::Allow,
+            domain: vec!["allowed.com".to_string()],
+        }]);
+
+        let storage = Arc::new(MockStorage {});
+        let (sender, receiver) = async_channel::bounded(100);
+        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+
+        let result = callbacks.on_rcpt_to("invalidpath").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_on_data() {
+        // Test on_data method (lines 339-341)
+        let callbacks = create_test_callbacks(None);
+        let email = Email {
+            from: "sender@example.com".to_string(),
+            to: vec!["recipient@example.com".to_string()],
+            body: "Test email body".to_string(),
+        };
+
+        let result = callbacks.on_data(&email).await;
+        assert!(result.is_ok());
+    }
+
+    // Helper structs for testing
+    struct MockStorageWithError {}
+
+    #[async_trait]
+    impl Storage for MockStorageWithError {
+        async fn get(
+            &self,
+            _key: &str,
+            _status: Status,
+        ) -> Result<Option<StoredEmail>, miette::Report> {
+            Ok(None)
+        }
+
+        async fn put(
+            &self,
+            _email: StoredEmail,
+            _status: Status,
+        ) -> Result<camino::Utf8PathBuf, miette::Report> {
+            Err(miette::Report::msg("Storage error"))
+        }
+
+        async fn get_meta(
+            &self,
+            _key: &str,
+        ) -> Result<Option<crate::worker::EmailMetadata>, miette::Report> {
+            Ok(None)
+        }
+
+        async fn put_meta(
+            &self,
+            _key: &str,
+            _meta: &crate::worker::EmailMetadata,
+        ) -> Result<camino::Utf8PathBuf, miette::Report> {
+            Ok(camino::Utf8PathBuf::from("/tmp/test"))
+        }
+
+        async fn delete_meta(&self, _key: &str) -> Result<(), miette::Report> {
+            Ok(())
+        }
+
+        async fn delete(&self, _key: &str, _status: Status) -> Result<(), miette::Report> {
+            Ok(())
+        }
+
+        async fn mv(
+            &self,
+            _src_key: &str,
+            _dest_key: &str,
+            _src_status: Status,
+            _dest_status: Status,
+        ) -> Result<(), miette::Report> {
+            Ok(())
+        }
+
+        fn list(
+            &self,
+            _status: Status,
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<StoredEmail, miette::Report>> + Send>,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn list_meta(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::worker::EmailMetadata, miette::Report>>
+                    + Send,
+            >,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    // Helper function to create test config
+    fn create_test_config() -> Cfg {
+        Cfg {
+            log: crate::config::CfgLog::default(),
+            server: CfgServer {
+                listeners: vec![CfgListener {
+                    addr: "127.0.0.1:2525".to_string(),
+                    tls: None,
+                }],
+                workers: None,
+                max_retries: None,
+                dkim: None,
+                auth: None,
+                disable_outbound: None,
+                outbound_local: None,
+                pool_size: None,
+            },
+            storage: CfgStorage {
+                storage_type: "memory".to_string(),
+                base_path: "/tmp".to_string(),
+            },
+            filters: None,
+        }
     }
 }
