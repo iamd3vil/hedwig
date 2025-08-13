@@ -33,6 +33,9 @@ use crate::{
 
 pub mod deferred_worker;
 mod pool;
+pub mod rate_limiter;
+
+use rate_limiter::{RateLimitConfig, RateLimiter, RateLimitResult};
 
 const HEADER_BODY_SEPARATOR: &[u8] = b"\r\n\r\n";
 const BCC_HEADER_PREFIX: &[u8] = b"Bcc:";
@@ -49,6 +52,13 @@ pub struct EmailMetadata {
 pub enum DkimSignerType {
     Rsa(DkimSigner<RsaKey<Sha256>, Done>),
     Ed25519(DkimSigner<Ed25519Key, Done>),
+}
+
+pub struct WorkerConfig {
+    pub disable_outbound: bool,
+    pub outbound_local: bool,
+    pub pool_size: u64,
+    pub rate_limit_config: RateLimitConfig,
 }
 
 pub struct Worker {
@@ -70,6 +80,9 @@ pub struct Worker {
 
     /// max_delay is the maximum delay before retrying a deferred email.
     max_delay: Duration,
+
+    /// rate_limiter controls the rate of email sending per domain.
+    rate_limiter: RateLimiter,
 }
 
 impl Worker {
@@ -77,16 +90,14 @@ impl Worker {
         channel: Receiver<Job>,
         storage: Arc<dyn Storage>,
         dkim: &Option<CfgDKIM>,
-        disable_outbound: bool,
-        outbound_local: bool,
         mx_cache: Cache<String, MxLookup>,
-        pool_size: u64,
+        config: WorkerConfig,
     ) -> Result<Self> {
         info!("Initializing SMTP worker");
         let resolver = TokioAsyncResolver::tokio_from_system_conf()
             .into_diagnostic()
             .wrap_err("creating dns resolver")?;
-        let pool = PoolManager::new(pool_size, outbound_local);
+        let pool = PoolManager::new(config.pool_size, config.outbound_local);
 
         // Create DKIM signer if dkim is enabled.
         let dkim_signer = match dkim {
@@ -108,10 +119,11 @@ impl Worker {
             resolver,
             pool,
             mx_cache,
-            disable_outbound,
+            disable_outbound: config.disable_outbound,
             initial_delay: Duration::from_secs(60),
             max_delay: Duration::from_secs(60 * 60 * 24),
             dkim_signer,
+            rate_limiter: RateLimiter::new(config.rate_limit_config),
         })
     }
 
@@ -404,6 +416,22 @@ impl Worker {
             }
 
             let parsed_email_id = parsed_email_id.unwrap();
+
+            // Check rate limit for this domain
+            let domain = parsed_email_id.get_domain();
+            match self.rate_limiter.check_rate_limit(domain).await {
+                RateLimitResult::Allowed => {
+                    debug!(domain = ?domain, "Rate limit check passed");
+                }
+                RateLimitResult::RateLimited { retry_after } => {
+                    info!(
+                        domain = ?domain,
+                        retry_after_ms = retry_after.as_millis(),
+                        "Rate limited, waiting before sending"
+                    );
+                    tokio::time::sleep(retry_after).await;
+                }
+            }
 
             debug!(?parsed_email_id, "Looking up MX records");
 

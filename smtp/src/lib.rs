@@ -234,7 +234,7 @@ impl SmtpServer {
                     }
                     _ => socket.write_line(b"500 Internal server error\r\n").await,
                 },
-                _ => return Ok(()),
+                _ => Ok(()),
             }
         } else {
             // Handle successful connection termination

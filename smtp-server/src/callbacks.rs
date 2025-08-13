@@ -5,7 +5,6 @@ use mailparse::MailAddr;
 /// This module implements the `SmtpCallbacks` trait, providing the logic for
 /// handling SMTP commands such as `EHLO`, `AUTH`, `MAIL FROM`, `RCPT TO`, and `DATA`.
 use std::{collections::HashMap, sync::Arc};
-use tracing;
 
 use async_trait::async_trait;
 use hickory_resolver::lookup::MxLookup;
@@ -31,7 +30,7 @@ pub struct Callbacks {
 
 fn extract_domain_from_path(path: &str) -> Option<String> {
     mailparse::addrparse(path).ok().and_then(|addr| {
-        if let Some(email) = addr.get(0) {
+        if let Some(email) = addr.first() {
             match email {
                 MailAddr::Single(info) => {
                     return EmailAddress::parse(info.addr.as_ref(), None)
@@ -81,20 +80,31 @@ impl Callbacks {
 
         // Start workers.
         let worker_count = cfg.server.workers.unwrap_or(1).max(1);
+        let rate_limit_config = cfg.server.rate_limits
+            .as_ref()
+            .map(|rl| rl.to_rate_limit_config())
+            .unwrap_or_default();
+
         for _ in 0..worker_count {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
             let dkim = cfg.server.dkim.clone();
             let mx_cache = mx_cache.clone();
+            let rate_limit_config = rate_limit_config.clone();
             tokio::spawn(async move {
+
+                let worker_config = worker::WorkerConfig {
+                    disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
+                    outbound_local: cfg.server.outbound_local.unwrap_or(false),
+                    pool_size: cfg.server.pool_size.unwrap_or(100),
+                    rate_limit_config,
+                };
                 let mut worker = Worker::new(
                     receiver_channel,
                     storage_cloned.clone(),
                     &dkim,
-                    cfg.server.disable_outbound.unwrap_or(false),
-                    cfg.server.outbound_local.unwrap_or(false),
                     mx_cache,
-                    cfg.server.pool_size.unwrap_or(100),
+                    worker_config,
                 )
                 .await
                 .expect("Failed to create worker");
@@ -197,16 +207,15 @@ impl SmtpCallbacks for Callbacks {
             // 1. Check DENY rules
             if let Some(ref sender_domain) = sender_domain_opt {
                 for filter in &from_domain_filters {
-                    if matches!(filter.action, FilterAction::Deny) {
-                        if filter
+                    if matches!(filter.action, FilterAction::Deny)
+                        && filter
                             .domain
                             .iter()
                             .any(|d| d.eq_ignore_ascii_case(sender_domain))
-                        {
-                            let message = format!("Sender domain {} is denied.", sender_domain);
-                            tracing::warn!("Denying email from [{}]: {}", from_path, message);
-                            return Err(SmtpError::MailFromDenied { message });
-                        }
+                    {
+                        let message = format!("Sender domain {} is denied.", sender_domain);
+                        tracing::warn!("Denying email from [{}]: {}", from_path, message);
+                        return Err(SmtpError::MailFromDenied { message });
                     }
                 }
             }
@@ -221,15 +230,14 @@ impl SmtpCallbacks for Callbacks {
                 let mut explicitly_allowed = false;
                 if let Some(ref sender_domain) = sender_domain_opt {
                     for filter in &from_domain_filters {
-                        if matches!(filter.action, FilterAction::Allow) {
-                            if filter
+                        if matches!(filter.action, FilterAction::Allow)
+                            && filter
                                 .domain
                                 .iter()
                                 .any(|d| d.eq_ignore_ascii_case(sender_domain))
-                            {
-                                explicitly_allowed = true;
-                                break;
-                            }
+                        {
+                            explicitly_allowed = true;
+                            break;
                         }
                     }
                 }
@@ -275,17 +283,16 @@ impl SmtpCallbacks for Callbacks {
             // 1. Check DENY rules
             if let Some(ref recipient_domain) = recipient_domain_opt {
                 for filter in &to_domain_filters {
-                    if matches!(filter.action, FilterAction::Deny) {
-                        if filter
+                    if matches!(filter.action, FilterAction::Deny)
+                        && filter
                             .domain
                             .iter()
                             .any(|d| d.eq_ignore_ascii_case(recipient_domain))
-                        {
-                            let message =
-                                format!("Recipient domain {} is denied.", recipient_domain);
-                            tracing::warn!("Denying email to [{}]: {}", rcpt_path, message);
-                            return Err(SmtpError::RcptToDenied { message });
-                        }
+                    {
+                        let message =
+                            format!("Recipient domain {} is denied.", recipient_domain);
+                        tracing::warn!("Denying email to [{}]: {}", rcpt_path, message);
+                        return Err(SmtpError::RcptToDenied { message });
                     }
                 }
             }
@@ -300,15 +307,14 @@ impl SmtpCallbacks for Callbacks {
                 let mut explicitly_allowed = false;
                 if let Some(ref recipient_domain) = recipient_domain_opt {
                     for filter in &to_domain_filters {
-                        if matches!(filter.action, FilterAction::Allow) {
-                            if filter
+                        if matches!(filter.action, FilterAction::Allow)
+                            && filter
                                 .domain
                                 .iter()
                                 .any(|d| d.eq_ignore_ascii_case(recipient_domain))
-                            {
-                                explicitly_allowed = true;
-                                break;
-                            }
+                        {
+                            explicitly_allowed = true;
+                            break;
                         }
                     }
                 }
@@ -421,6 +427,7 @@ mod tests {
                 disable_outbound: Some(false),
                 outbound_local: Some(false),
                 pool_size: Some(10),
+                rate_limits: None,
             },
             storage: CfgStorage {
                 storage_type: "mock".to_string(),
@@ -1137,6 +1144,7 @@ mod tests {
                 disable_outbound: None,
                 outbound_local: None,
                 pool_size: None,
+                rate_limits: None,
             },
             storage: CfgStorage {
                 storage_type: "memory".to_string(),

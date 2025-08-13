@@ -28,6 +28,7 @@ For detailed technical information about the server's architecture and design, s
 - **Persistent Queue**: Emails are queued on the filesystem, ensuring durability across server restarts.
 - **Forward-Only**: Specializes in receiving and forwarding emails, not full SMTP functionality.
 - **Security Features**: Supports DKIM, TLS, and SMTP authentication.
+- **Rate Limiting**: Per-domain rate limiting to prevent overwhelming destination servers and maintain sender reputation.
 
 ## Getting Started
 
@@ -80,6 +81,16 @@ For detailed technical information about the server's architecture and design, s
    selector = "default"
    private_key = "/path/to/dkim/private.key"
 
+   # Optional rate limiting configuration
+   [server.rate_limits]
+   enabled = true
+   default_limit = 60  # emails per minute
+
+   # Domain-specific rate limits
+   [server.rate_limits.domain_limits]
+   "gmail.com" = 30
+   "outlook.com" = 25
+
    [storage]
    storage_type = "fs"
    base_path = "/var/lib/hedwig/mail"
@@ -92,10 +103,14 @@ For detailed technical information about the server's architecture and design, s
 
 ## Configuration
 
+For detailed configuration information, see:
+- [Configuration Guide](docs/CONFIGURATION.md) - Complete configuration reference
+- [Example Configurations](examples/) - Ready-to-use configuration examples
+
 ### Server Configuration
 
 - `workers`: Number of worker threads (optional)
-- `pool_size`: Maximum number of concurrent connections (optional)
+- `pool_size`: Maximum number of concurrent connections (optional)  
 - `disable_outbound`: Disable outbound email delivery (optional)
 - `outbound_local`: Only allow local outbound delivery (optional)
 
@@ -175,6 +190,44 @@ DKIM (DomainKeys Identified Mail) allows receiving mail servers to verify that e
    selector = "selector"
    private_key = "/path/to/private.key"
    ```
+
+## Rate Limiting
+
+Hedwig supports per-domain rate limiting to prevent overwhelming destination SMTP servers and maintain good sender reputation. This feature uses a token bucket algorithm for smooth rate control.
+
+### Basic Rate Limiting
+
+Enable rate limiting with default settings:
+
+```toml
+[server.rate_limits]
+enabled = true
+default_limit = 60  # 60 emails per minute for all domains
+```
+
+### Domain-Specific Limits
+
+Configure different limits for specific domains:
+
+```toml
+[server.rate_limits]
+enabled = true
+default_limit = 60
+
+[server.rate_limits.domain_limits]
+"gmail.com" = 30        # Limit Gmail to 30 emails/minute
+"outlook.com" = 25      # Limit Outlook to 25 emails/minute
+"internal.com" = 200    # Higher limit for internal domains
+```
+
+### Rate Limiting Benefits
+
+- **Prevents Blocks**: Avoids being rate-limited by destination servers
+- **Maintains Reputation**: Helps maintain good sender reputation
+- **Configurable**: Fine-tune limits for different providers
+- **Non-Blocking**: Workers handle other emails while rate-limited emails wait
+
+For detailed rate limiting configuration and examples, see the [Configuration Guide](docs/CONFIGURATION.md) and [Example Configurations](examples/).
 
 ## Environment Variables
 

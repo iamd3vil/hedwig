@@ -9,6 +9,9 @@ use nom::{
     IResult, Parser,
 };
 
+/// Type alias for ESMTP parameter parsing result: (size, other_params)
+type EsmtpParseResult = (Option<u64>, Vec<(String, Option<String>)>);
+
 /// Represents ESMTP parameters for MAIL FROM command
 #[derive(Debug, PartialEq, Clone)]
 pub struct MailFromCommand {
@@ -157,9 +160,7 @@ fn parse_email_address(input: &str) -> IResult<&str, String> {
 }
 
 /// Parses ESMTP parameters and returns (size, other_params)
-fn parse_esmtp_parameters(
-    input: &str,
-) -> IResult<&str, (Option<u64>, Vec<(String, Option<String>)>)> {
+fn parse_esmtp_parameters(input: &str) -> IResult<&str, EsmtpParseResult> {
     let (input, params) = separated_list0(space1, parse_single_parameter).parse(input)?;
 
     let mut size = None;

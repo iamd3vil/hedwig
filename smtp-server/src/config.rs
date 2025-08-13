@@ -2,6 +2,7 @@ use config::{Config, File};
 use miette::{IntoDiagnostic, Result};
 use serde::Deserialize;
 use tracing::Level;
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub enum FilterType {
@@ -39,6 +40,7 @@ pub struct CfgServer {
     pub disable_outbound: Option<bool>,
     pub outbound_local: Option<bool>,
     pub pool_size: Option<u64>,
+    pub rate_limits: Option<CfgRateLimits>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -107,6 +109,14 @@ pub struct CfgTls {
     pub key_path: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct CfgRateLimits {
+    #[serde(default)]
+    pub enabled: bool,
+    pub default_limit: Option<u32>,
+    pub domain_limits: Option<HashMap<String, u32>>,
+}
+
 impl Cfg {
     pub fn load(cfg_path: &str) -> Result<Self> {
         let settings = Config::builder()
@@ -117,5 +127,15 @@ impl Cfg {
         let cfg: Cfg = settings.try_deserialize().into_diagnostic()?;
 
         Ok(cfg)
+    }
+}
+
+impl CfgRateLimits {
+    pub fn to_rate_limit_config(&self) -> crate::worker::rate_limiter::RateLimitConfig {
+        crate::worker::rate_limiter::RateLimitConfig {
+            enabled: self.enabled,
+            default_limit: self.default_limit.unwrap_or(60), // 60 emails per minute default
+            domain_limits: self.domain_limits.clone().unwrap_or_default(),
+        }
     }
 }
