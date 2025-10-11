@@ -94,6 +94,12 @@ For detailed technical information about the server's architecture and design, s
    [storage]
    storage_type = "fs"
    base_path = "/var/lib/hedwig/mail"
+
+   # Optional spool retention policy
+   [storage.cleanup]
+   bounced_retention = "7d"
+   deferred_retention = "2d"
+   interval = "1h"
    ```
 
 4. Run the server:
@@ -155,7 +161,18 @@ password = "your_password"
 [storage]
 storage_type = "filesystem"  # Currently only filesystem storage is supported
 base_path = "/var/lib/hedwig/mail"
+
+# Optional retention policy for local spool cleanup
+[storage.cleanup]
+bounced_retention = "7d"      # Remove bounced messages after 7 days
+deferred_retention = "2d"     # Remove deferred entries after 2 days
+interval = "1h"               # Run cleanup task hourly
 ```
+
+- `storage.cleanup` is optional; omit keys you do not want enforced
+- `bounced_retention` controls how long bounced messages remain on disk
+- `deferred_retention` sets retention for deferred queue entries and metadata
+- `interval` dictates how often the cleanup task runs (default: 1h)
 
 ## DKIM Setup
 

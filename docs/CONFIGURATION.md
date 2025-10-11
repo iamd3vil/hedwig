@@ -114,7 +114,17 @@ Configure email storage backend.
 [storage]
 storage_type = "fs"                      # Storage type: "fs" (filesystem)
 base_path = "/var/spool/hedwig"         # Base directory for email storage
+
+# Optional retention policy for cleaning up local spool data
+[storage.cleanup]
+bounced_retention = "7d"                 # Remove bounced messages after 7 days
+deferred_retention = "2d"                # Remove deferred messages after 2 days
+interval = "1h"                          # Run the cleanup task hourly
 ```
+
+- All keys inside `[storage.cleanup]` are optional; omit them to disable specific cleanups
+- Retention values accept human-readable durations (e.g., `"24h"`, `"5m"`)
+- The cleanup task runs on a background interval and also executes once during startup
 
 ### Domain Filtering (`[[filters]]`)
 
@@ -182,6 +192,11 @@ default_limit = 60
 [storage]
 storage_type = "fs"
 base_path = "/var/spool/hedwig"
+
+[storage.cleanup]
+bounced_retention = "7d"
+deferred_retention = "2d"
+interval = "1h"
 
 # Domain filtering
 [[filters]]

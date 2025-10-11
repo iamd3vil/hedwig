@@ -65,7 +65,15 @@ impl DeferredWorker {
         self.storage
             .mv(msg_id, msg_id, Status::Deferred, Status::Bounced)
             .await
-            .wrap_err("moving from deferred to error")
+            .wrap_err("moving from deferred to error")?;
+
+        // Drop metadata so the cleanup job doesn't repeatedly inspect a terminal message.
+        self.storage
+            .delete_meta(msg_id)
+            .await
+            .wrap_err("removing deferred metadata")?;
+
+        Ok(())
     }
 
     async fn process_retry(&self, metadata: EmailMetadata) -> Result<()> {

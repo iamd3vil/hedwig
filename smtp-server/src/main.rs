@@ -15,6 +15,7 @@ use std::sync::Arc;
 use storage::{fs_storage::FileSystemStorage, Status, Storage};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
+use tokio::time::MissedTickBehavior;
 use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, Level};
@@ -102,6 +103,40 @@ async fn run_server(config_path: &str) -> Result<()> {
         .await
         .wrap_err("error getting storage type")?;
     let storage = Arc::new(storage);
+
+    // Spawn periodic cleanup for any storage retention policy that has been configured.
+    let cleanup_config = cfg.storage.cleanup_config();
+    if cleanup_config.is_enabled() {
+        info!(
+            deferred_ttl_seconds = cleanup_config
+                .deferred_retention
+                .map(|duration| duration.as_secs()),
+            bounced_ttl_seconds = cleanup_config
+                .bounced_retention
+                .map(|duration| duration.as_secs()),
+            interval_seconds = cleanup_config.interval.as_secs(),
+            "starting storage cleanup task"
+        );
+
+        // Run once during startup so old data is purged even before the first tick fires.
+        if let Err(err) = storage.cleanup(&cleanup_config).await {
+            error!("error performing initial storage cleanup: {:#}", err);
+        }
+
+        let storage_for_cleanup = Arc::clone(&storage);
+        let cleanup_config_task = cleanup_config.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(cleanup_config_task.interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                ticker.tick().await;
+                if let Err(err) = storage_for_cleanup.cleanup(&cleanup_config_task).await {
+                    error!("error performing storage cleanup: {:#}", err);
+                }
+            }
+        });
+    }
     // Create TLS acceptors for each listener that has TLS configured
     let mut tls_acceptors = Vec::new();
     for listener_config in &cfg.server.listeners {

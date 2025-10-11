@@ -35,7 +35,7 @@ pub mod deferred_worker;
 mod pool;
 pub mod rate_limiter;
 
-use rate_limiter::{RateLimitConfig, RateLimiter, RateLimitResult};
+use rate_limiter::{RateLimitConfig, RateLimitResult, RateLimiter};
 
 const HEADER_BODY_SEPARATOR: &[u8] = b"\r\n\r\n";
 const BCC_HEADER_PREFIX: &[u8] = b"Bcc:";

@@ -1,8 +1,9 @@
 use config::{Config, File};
 use miette::{IntoDiagnostic, Result};
 use serde::Deserialize;
-use tracing::Level;
 use std::collections::HashMap;
+use std::time::Duration;
+use tracing::Level;
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub enum FilterType {
@@ -56,6 +57,8 @@ pub struct CfgFilter {
 pub struct CfgStorage {
     pub storage_type: String,
     pub base_path: String,
+    #[serde(default)]
+    pub cleanup: Option<CfgCleanup>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -117,6 +120,17 @@ pub struct CfgRateLimits {
     pub domain_limits: Option<HashMap<String, u32>>,
 }
 
+/// Configuration for on-disk spool cleanup.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CfgCleanup {
+    #[serde(default, with = "humantime_serde::option")]
+    pub deferred_retention: Option<Duration>,
+    #[serde(default, with = "humantime_serde::option")]
+    pub bounced_retention: Option<Duration>,
+    #[serde(default = "default_cleanup_interval", with = "humantime_serde")]
+    pub interval: Duration,
+}
+
 impl Cfg {
     pub fn load(cfg_path: &str) -> Result<Self> {
         let settings = Config::builder()
@@ -138,4 +152,28 @@ impl CfgRateLimits {
             domain_limits: self.domain_limits.clone().unwrap_or_default(),
         }
     }
+}
+
+impl CfgCleanup {
+    pub fn to_cleanup_config(&self) -> crate::storage::CleanupConfig {
+        crate::storage::CleanupConfig {
+            deferred_retention: self.deferred_retention,
+            bounced_retention: self.bounced_retention,
+            interval: self.interval,
+        }
+    }
+}
+
+impl CfgStorage {
+    pub fn cleanup_config(&self) -> crate::storage::CleanupConfig {
+        self.cleanup
+            .as_ref()
+            .map(|cfg| cfg.to_cleanup_config())
+            .unwrap_or_default()
+    }
+}
+
+/// Default cleanup interval used when the configuration omits an explicit value (1 hour).
+fn default_cleanup_interval() -> Duration {
+    Duration::from_secs(60 * 60)
 }

@@ -52,6 +52,12 @@ key_type = "rsa"                             # "rsa" or "ed25519"
 storage_type = "fs"
 base_path = "/var/lib/hedwig/mail"
 
+# Optional retention policy for local spool cleanup
+[storage.cleanup]
+bounced_retention = "7d"
+deferred_retention = "2d"
+interval = "1h"
+
 # Optional email filters
 [[filters]]
 type = "from_domain_filter"

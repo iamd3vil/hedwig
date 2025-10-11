@@ -4,14 +4,15 @@
 /// allowing emails to be stored and managed on disk in JSON format. Emails are organized
 /// into different directories based on their status (queued, deferred, or bounced).
 use crate::{
-    storage::{Status, Storage, StoredEmail},
+    storage::{CleanupConfig, Status, Storage, StoredEmail},
     worker::EmailMetadata,
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use miette::{Context, IntoDiagnostic, Result};
 use std::pin::Pin;
+use std::time::{Duration, SystemTime};
 use tokio::fs;
 
 /// A storage implementation that uses the file system to store emails and metadata.
@@ -143,6 +144,87 @@ impl FileSystemStorage {
                 }
             }
         })
+    }
+
+    /// Returns the earliest timestamp considered valid for a given retention duration.
+    fn cutoff_time(retention: Duration) -> SystemTime {
+        SystemTime::now()
+            .checked_sub(retention)
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+
+    /// Purges files for the provided status that are older than the retention period.
+    async fn cleanup_status_dir(&self, status: Status, retention: Duration) -> Result<()> {
+        let dir = self.dir(&status);
+        let cutoff = Self::cutoff_time(retention);
+        let mut entries = fs::read_dir(&dir).await.into_diagnostic()?;
+
+        while let Some(entry) = entries.next_entry().await.into_diagnostic()? {
+            let path = entry.path();
+            let file_name = match path.file_name().and_then(|f| f.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            if !file_name.ends_with(".json") || file_name.ends_with(".meta.json") {
+                continue;
+            }
+
+            let metadata = entry.metadata().await.into_diagnostic()?;
+            let modified = metadata.modified().into_diagnostic()?;
+            if modified < cutoff {
+                fs::remove_file(&path).await.into_diagnostic()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Removes deferred messages that exceeded retention, including orphaned JSON bodies.
+    async fn cleanup_deferred(&self, retention: Duration) -> Result<()> {
+        let now = SystemTime::now();
+        let mut meta_stream = self.list_meta();
+
+        while let Some(meta_result) = meta_stream.next().await {
+            let metadata = meta_result?;
+            let age = now
+                .duration_since(metadata.last_attempt)
+                .unwrap_or_default();
+            if age >= retention {
+                self.delete(&metadata.msg_id, Status::Deferred).await?;
+                self.delete_meta(&metadata.msg_id).await?;
+            }
+        }
+
+        let cutoff = Self::cutoff_time(retention);
+        let deferred_dir = self.dir(&Status::Deferred);
+        let mut entries = fs::read_dir(&deferred_dir).await.into_diagnostic()?;
+        while let Some(entry) = entries.next_entry().await.into_diagnostic()? {
+            let path = entry.path();
+            let file_name = match path.file_name().and_then(|f| f.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            if !file_name.ends_with(".json") || file_name.ends_with(".meta.json") {
+                continue;
+            }
+
+            let metadata = entry.metadata().await.into_diagnostic()?;
+            let modified = metadata.modified().into_diagnostic()?;
+            if modified >= cutoff {
+                continue;
+            }
+
+            let key = file_name.trim_end_matches(".json");
+            if fs::metadata(self.meta_file_path(key)).await.is_ok() {
+                continue;
+            }
+
+            fs::remove_file(&path).await.into_diagnostic()?;
+        }
+
+        Ok(())
     }
 }
 
@@ -278,6 +360,18 @@ impl Storage for FileSystemStorage {
     /// * Stream of EmailMetadata results
     fn list_meta(&self) -> Pin<Box<dyn Stream<Item = Result<EmailMetadata>> + Send>> {
         Self::create_meta_list_stream(self.base_path.clone())
+    }
+
+    async fn cleanup(&self, config: &CleanupConfig) -> Result<()> {
+        if let Some(retention) = config.bounced_retention {
+            self.cleanup_status_dir(Status::Bounced, retention).await?;
+        }
+
+        if let Some(retention) = config.deferred_retention {
+            self.cleanup_deferred(retention).await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -525,5 +619,69 @@ mod tests {
         assert_eq!(bounced_emails.len(), 0);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_bounced_removes_old_messages() {
+        let (storage, _temp) = create_test_storage().await;
+        let email = create_test_email("bounced_old");
+        storage.put(email, Status::Bounced).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut cleanup_config = CleanupConfig::default();
+        cleanup_config.bounced_retention = Some(Duration::from_millis(1));
+
+        storage.cleanup(&cleanup_config).await.unwrap();
+
+        let retrieved = storage.get("bounced_old", Status::Bounced).await.unwrap();
+        assert!(retrieved.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_deferred_removes_old_entries() {
+        let (storage, _temp) = create_test_storage().await;
+        let email = create_test_email("deferred_old");
+        storage.put(email, Status::Deferred).await.unwrap();
+
+        let meta = EmailMetadata {
+            msg_id: "deferred_old".to_string(),
+            attempts: 3,
+            last_attempt: SystemTime::now() - Duration::from_secs(3600),
+            next_attempt: SystemTime::now() - Duration::from_secs(300),
+        };
+        storage.put_meta("deferred_old", &meta).await.unwrap();
+
+        let mut cleanup_config = CleanupConfig::default();
+        cleanup_config.deferred_retention = Some(Duration::from_secs(60));
+
+        storage.cleanup(&cleanup_config).await.unwrap();
+
+        assert!(storage
+            .get("deferred_old", Status::Deferred)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(storage.get_meta("deferred_old").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_deferred_orphaned_email() {
+        let (storage, _temp) = create_test_storage().await;
+        let email = create_test_email("deferred_orphan");
+        storage.put(email, Status::Deferred).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut cleanup_config = CleanupConfig::default();
+        cleanup_config.deferred_retention = Some(Duration::from_millis(1));
+
+        storage.cleanup(&cleanup_config).await.unwrap();
+
+        assert!(storage
+            .get("deferred_orphan", Status::Deferred)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

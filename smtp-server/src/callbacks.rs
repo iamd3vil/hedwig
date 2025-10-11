@@ -80,7 +80,9 @@ impl Callbacks {
 
         // Start workers.
         let worker_count = cfg.server.workers.unwrap_or(1).max(1);
-        let rate_limit_config = cfg.server.rate_limits
+        let rate_limit_config = cfg
+            .server
+            .rate_limits
             .as_ref()
             .map(|rl| rl.to_rate_limit_config())
             .unwrap_or_default();
@@ -92,7 +94,6 @@ impl Callbacks {
             let mx_cache = mx_cache.clone();
             let rate_limit_config = rate_limit_config.clone();
             tokio::spawn(async move {
-
                 let worker_config = worker::WorkerConfig {
                     disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
                     outbound_local: cfg.server.outbound_local.unwrap_or(false),
@@ -289,8 +290,7 @@ impl SmtpCallbacks for Callbacks {
                             .iter()
                             .any(|d| d.eq_ignore_ascii_case(recipient_domain))
                     {
-                        let message =
-                            format!("Recipient domain {} is denied.", recipient_domain);
+                        let message = format!("Recipient domain {} is denied.", recipient_domain);
                         tracing::warn!("Denying email to [{}]: {}", rcpt_path, message);
                         return Err(SmtpError::RcptToDenied { message });
                     }
@@ -432,6 +432,7 @@ mod tests {
             storage: CfgStorage {
                 storage_type: "mock".to_string(),
                 base_path: "/tmp/hedwig".to_string(),
+                cleanup: None,
             },
             filters,
         };
@@ -1149,6 +1150,7 @@ mod tests {
             storage: CfgStorage {
                 storage_type: "memory".to_string(),
                 base_path: "/tmp".to_string(),
+                cleanup: None,
             },
             filters: None,
         }
