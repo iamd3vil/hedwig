@@ -2,6 +2,7 @@ use config::{Config, File};
 use miette::{IntoDiagnostic, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 use tracing::Level;
 
@@ -139,6 +140,18 @@ pub struct CfgCleanup {
 
 impl Cfg {
     pub fn load(cfg_path: &str) -> Result<Self> {
+        let path = Path::new(cfg_path);
+
+        // For HUML files, deserialize directly without using the config crate
+        if path.extension().and_then(|s| s.to_str()) == Some("huml") {
+            println!("Loading HUML configuration from {}", cfg_path);
+            let huml_content = std::fs::read_to_string(cfg_path).into_diagnostic()?;
+            let cfg: Cfg = huml_rs::serde::from_str(&huml_content)
+                .map_err(|e| miette::miette!("Failed to parse HUML: {}", e))?;
+            return Ok(cfg);
+        }
+
+        // For other formats (TOML, JSON), use the config crate
         let settings = Config::builder()
             .add_source(File::with_name(cfg_path))
             .build()

@@ -468,6 +468,7 @@ dependencies = [
  "nom 7.1.3",
  "pathdiff",
  "serde",
+ "serde_json",
  "toml",
 ]
 
@@ -1054,6 +1055,7 @@ dependencies = [
  "futures",
  "hickory-resolver",
  "humantime-serde",
+ "huml-rs",
  "hyper",
  "lettre",
  "mail-auth 0.6.1",
@@ -1224,6 +1226,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57a3db5ea5923d99402c94e9feb261dc5ee9b4efa158b0315f788cf549cc200c"
 dependencies = [
  "humantime",
+ "serde",
+]
+
+[[package]]
+name = "huml-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83a0e51344ec6747e6de1bef2e891e176a20bfa8e26649214595cfc7034a22a8"
+dependencies = [
+ "nom 8.0.0",
  "serde",
 ]
 

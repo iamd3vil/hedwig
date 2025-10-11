@@ -1,0 +1,56 @@
+server::
+  auth::
+    - ::
+      password: "password1"
+      username: "user1"
+    - ::
+      password: "password2"
+      username: "user2"
+  disable_outbound: false
+  dkim::
+    domain: "example.com"
+    key_type: "rsa"
+    private_key: "/etc/hedwig/dkim/private.key"
+    selector: "default"
+  listeners::
+    - ::
+      addr: "0.0.0.0:25"
+    - ::
+      addr: "0.0.0.0:587"
+    - ::
+      addr: "0.0.0.0:465"
+      tls::
+        cert_path: "/etc/ssl/certs/smtp.crt"
+        key_path: "/etc/ssl/private/smtp.key"
+    - ::
+      addr: "127.0.0.1:2525"
+  max_retries: 5
+  metrics::
+    bind: "0.0.0.0:9090"
+  outbound_local: false
+  pool_size: 100
+  workers: 4
+
+storage::
+  base_path: "/var/lib/hedwig/mail"
+  cleanup::
+    bounced_retention: "7d"
+    deferred_retention: "2d"
+    interval: "1h"
+  storage_type: "fs"
+
+filters::
+  - ::
+    action: "allow"
+    domain::
+      - "allowed-domain.com"
+      - "another-domain.com"
+    type: "from_domain_filter"
+  - ::
+    action: "deny"
+    domain::
+      - "blocked-domain.com"
+    type: "to_domain_filter"
+log::
+  format: "fmt"
+  level: "info"

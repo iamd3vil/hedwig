@@ -1,6 +1,7 @@
 /target
 /tmp
 config.toml
+config.huml
 certs/
 .envrc
 .aider*
