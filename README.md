@@ -246,6 +246,52 @@ default_limit = 60
 
 For detailed rate limiting configuration and examples, see the [Configuration Guide](docs/CONFIGURATION.md) and [Example Configurations](examples/).
 
+## Metrics
+
+Hedwig exposes Prometheus-compatible metrics over HTTP when configured.
+
+### Enable Metrics
+
+```toml
+[server.metrics]
+bind = "0.0.0.0:9090"  # HTTP listener for /metrics
+```
+
+- Endpoint: `GET /metrics` on the configured `bind` address
+- Protocol: plain HTTP (place behind a firewall or reverse proxy if exposed)
+- Disable by omission: remove `[server.metrics]` to turn it off
+
+### Quick Check
+
+```bash
+curl -s http://localhost:9090/metrics | head
+```
+
+### Prometheus Scrape
+
+```yaml
+scrape_configs:
+  - job_name: "hedwig"
+    static_configs:
+      - targets: ["hedwig-host:9090"]
+```
+
+### Exported Metrics
+
+- `hedwig_queue_depth`: number of emails currently queued
+- `hedwig_retry_attempts_total`: total retry attempts scheduled
+- `hedwig_connection_pool_entries`: cached SMTP transports in pool
+- `hedwig_dkim_signing_latency_seconds`: DKIM signing latency histogram
+- `hedwig_emails_received_total`: emails accepted by the server
+- `hedwig_emails_sent_total`: emails successfully delivered upstream
+- `hedwig_emails_deferred_total`: emails deferred for retry
+- `hedwig_emails_bounced_total`: emails permanently bounced
+- `hedwig_emails_dropped_total`: emails dropped without delivery attempt
+- `hedwig_worker_jobs_processed_total`: worker jobs processed
+- `hedwig_worker_job_duration_seconds`: job processing time histogram
+- `hedwig_send_latency_seconds{domain}`: upstream handoff latency by domain
+- `hedwig_send_attempts_total{domain,status}`: send attempts by domain and outcome (`success|failure`)
+
 ## Environment Variables
 
 - `HEDWIG_LOG_LEVEL`: Set logging level (error, warn, info, debug, trace)
