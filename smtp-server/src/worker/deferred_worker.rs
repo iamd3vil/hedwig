@@ -4,7 +4,10 @@ use async_channel::Sender;
 use futures::StreamExt;
 use miette::{Context, IntoDiagnostic, Result};
 
-use crate::storage::{Status, Storage};
+use crate::{
+    metrics,
+    storage::{Status, Storage},
+};
 
 use super::{EmailMetadata, Job};
 
@@ -73,6 +76,8 @@ impl DeferredWorker {
             .await
             .wrap_err("removing deferred metadata")?;
 
+        metrics::email_bounced();
+
         Ok(())
     }
 
@@ -86,6 +91,9 @@ impl DeferredWorker {
             )
             .await
             .wrap_err("moving from deferred to queued")?;
+
+        metrics::queue_depth_inc();
+        metrics::retry_scheduled();
 
         let job = Job::new(metadata.msg_id, metadata.attempts);
         self.channel.send(job).await.into_diagnostic()?;

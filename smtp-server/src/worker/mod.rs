@@ -21,13 +21,14 @@ use memchr::memmem;
 use moka::future::Cache;
 use pool::PoolManager;
 use serde::{Deserialize, Serialize};
-use std::time::SystemTime;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::fs;
 use tracing::{debug, error, info, warn};
 
 use crate::{
     config::CfgDKIM,
+    metrics,
     storage::{Status, Storage},
 };
 
@@ -188,11 +189,13 @@ impl Worker {
     }
 
     async fn process_job(&self, job: &Job) -> Result<()> {
+        let _job_guard = metrics::job_processing_guard();
         debug!(msg_id = ?job.job_id, "Processing job");
         let email = match self.storage.get(&job.job_id, Status::Queued).await {
             Ok(Some(email)) => email,
             Ok(None) => {
                 warn!(msg_id = ?job.job_id, "Email not found in queue");
+                metrics::queue_depth_dec();
                 return self.storage.delete(&job.job_id, Status::Queued).await;
             }
             Err(e) => return Err(e).wrap_err("failed to get email from storage"),
@@ -213,7 +216,10 @@ impl Worker {
                 to_email = email.to.join(","),
                 "Outbound mail disabled, dropping message"
             );
-            return self.storage.delete(&job.job_id, Status::Queued).await;
+            self.storage.delete(&job.job_id, Status::Queued).await?;
+            metrics::queue_depth_dec();
+            metrics::email_dropped();
+            return Ok(());
         }
 
         match self.send_email(&email.to, &msg, &email.body).await {
@@ -225,6 +231,8 @@ impl Worker {
                     "Successfully sent email"
                 );
                 self.storage.delete(&job.job_id, Status::Queued).await?;
+                metrics::queue_depth_dec();
+                metrics::email_sent();
                 // Delete any meta file in deferred.
                 self.storage
                     .delete_meta(&job.job_id)
@@ -261,7 +269,10 @@ impl Worker {
                         self.storage
                             .mv(&job.job_id, &job.job_id, Status::Queued, Status::Bounced)
                             .await
-                            .wrap_err("moving from queued to bounced")
+                            .wrap_err("moving from queued to bounced")?;
+                        metrics::queue_depth_dec();
+                        metrics::email_bounced();
+                        Ok(())
                     }
                 }
             }
@@ -295,6 +306,9 @@ impl Worker {
             .mv(&job.job_id, &job.job_id, Status::Queued, Status::Deferred)
             .await
             .wrap_err("moving from queued to deferred")?;
+
+        metrics::queue_depth_dec();
+        metrics::email_deferred();
 
         Ok(())
     }
@@ -359,17 +373,27 @@ impl Worker {
         let raw_email = match &self.dkim_signer {
             Some(signer) => {
                 debug!("Signing email with DKIM");
-                let signature = match &signer {
-                    DkimSignerType::Rsa(signer) => signer
-                        .sign(&email_bytes_no_bcc)
-                        .into_diagnostic()
-                        .wrap_err("signing email with dkim")?
-                        .to_header(),
-                    DkimSignerType::Ed25519(signer) => signer
-                        .sign(&email_bytes_no_bcc)
-                        .into_diagnostic()
-                        .wrap_err("signing email with dkim")?
-                        .to_header(),
+                let signature = match signer {
+                    DkimSignerType::Rsa(signer) => {
+                        let started = Instant::now();
+                        let header = signer
+                            .sign(&email_bytes_no_bcc)
+                            .into_diagnostic()
+                            .wrap_err("signing email with dkim")?
+                            .to_header();
+                        metrics::observe_dkim_sign_latency(started.elapsed());
+                        header
+                    }
+                    DkimSignerType::Ed25519(signer) => {
+                        let started = Instant::now();
+                        let header = signer
+                            .sign(&email_bytes_no_bcc)
+                            .into_diagnostic()
+                            .wrap_err("signing email with dkim")?
+                            .to_header();
+                        metrics::observe_dkim_sign_latency(started.elapsed());
+                        header
+                    }
                 };
 
                 signed_email = Self::insert_dkim_signature(&email_bytes_no_bcc, &signature)?;
@@ -442,6 +466,7 @@ impl Worker {
                 .wrap_err("looking up mx record")?;
             if mx_lookup.iter().count() == 0 {
                 warn!(domain = ?parsed_email_id.get_domain(), "No MX records found");
+                metrics::record_send_failure(parsed_email_id.get_domain());
                 continue;
             }
 
@@ -468,26 +493,41 @@ impl Worker {
 
             // Try each MX record in order of preference
             let mut success = false;
+            let mut last_error: Option<miette::Report> = None;
             for mx_record in mx.iter() {
                 debug!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
 
+                let exchange = mx_record.exchange().to_string();
                 let transport: AsyncSmtpTransport<Tokio1Executor> =
-                    self.pool.get(&mx_record.exchange().to_string()).await?;
+                    self.pool.get(&exchange).await?;
 
-                transport
-                    .send_raw(&envelope, raw_email)
-                    .await
-                    .into_diagnostic()
-                    .wrap_err("sending raw message")?;
-                success = true;
-
-                if success {
-                    break;
+                let send_start = Instant::now();
+                match transport.send_raw(&envelope, raw_email).await {
+                    Ok(_) => {
+                        metrics::record_send_success(
+                            parsed_email_id.get_domain(),
+                            send_start.elapsed(),
+                        );
+                        success = true;
+                        break;
+                    }
+                    Err(err) => {
+                        metrics::record_send_failure(parsed_email_id.get_domain());
+                        let report = Err::<(), _>(err)
+                            .into_diagnostic()
+                            .wrap_err("sending raw message")
+                            .unwrap_err();
+                        last_error = Some(report);
+                    }
                 }
             }
 
             if !success {
                 error!(to = ?to, "Failed to send email through any MX server");
+                if let Some(err) = last_error {
+                    return Err(err);
+                }
+                metrics::record_send_failure(parsed_email_id.get_domain());
                 bail!("failed to send email through any MX server");
             }
         }

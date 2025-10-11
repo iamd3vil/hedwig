@@ -23,6 +23,7 @@ use worker::{deferred_worker::DeferredWorker, Job};
 
 mod callbacks;
 mod config;
+mod metrics;
 mod storage;
 mod worker;
 
@@ -95,6 +96,15 @@ async fn run_server(config_path: &str) -> Result<()> {
         info!("DKIM is disabled");
     }
 
+    if let Some(metrics_cfg) = &cfg.server.metrics {
+        let addr: std::net::SocketAddr = metrics_cfg
+            .bind
+            .parse()
+            .into_diagnostic()
+            .wrap_err("invalid metrics bind address")?;
+        metrics::spawn_metrics_server(addr);
+    }
+
     // Initialize channels for background processing of emails.
     let (sender_channel, receiver_channel) = async_channel::bounded(1);
 
@@ -103,6 +113,17 @@ async fn run_server(config_path: &str) -> Result<()> {
         .await
         .wrap_err("error getting storage type")?;
     let storage = Arc::new(storage);
+
+    // Capture the current queue depth before workers start consuming jobs.
+    let mut queued_jobs = Vec::new();
+    {
+        let mut stream = storage.list(Status::Queued);
+        while let Some(email) = stream.next().await {
+            let email = email?;
+            queued_jobs.push(email.message_id.clone());
+        }
+    }
+    metrics::queue_depth_set(queued_jobs.len());
 
     // Spawn periodic cleanup for any storage retention policy that has been configured.
     let cleanup_config = cfg.storage.cleanup_config();
@@ -187,20 +208,24 @@ async fn run_server(config_path: &str) -> Result<()> {
         auth_enabled,
     );
 
-    // Check if there are any emails to process.
-    // Spawn a task to process the emails.
-    info!("checking for any emails to process in queue");
-    let mut emails = storage.list(Status::Queued);
-    while let Some(email) = emails.next().await {
-        let email = email.unwrap();
-        let job = Job::new(email.message_id, 0);
-        sender_channel
-            .send(job)
-            .await
-            .into_diagnostic()
-            .wrap_err("error sending job to receiver channel")?;
+    // Replay any queued emails so workers process them immediately.
+    if !queued_jobs.is_empty() {
+        info!(
+            queued = queued_jobs.len(),
+            "replaying queued jobs to workers"
+        );
+        for msg_id in queued_jobs {
+            let job = Job::new(msg_id, 0);
+            sender_channel
+                .send(job)
+                .await
+                .into_diagnostic()
+                .wrap_err("error sending job to receiver channel")?;
+        }
+        info!("replayed queued jobs");
+    } else {
+        info!("no queued jobs found on startup");
     }
-    info!("processed queued emails");
 
     // Start the deferred worker.
     tokio::spawn(async move {

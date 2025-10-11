@@ -629,8 +629,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        let mut cleanup_config = CleanupConfig::default();
-        cleanup_config.bounced_retention = Some(Duration::from_millis(1));
+        let cleanup_config = CleanupConfig {
+            bounced_retention: Some(Duration::from_millis(1)),
+            ..Default::default()
+        };
 
         storage.cleanup(&cleanup_config).await.unwrap();
 
@@ -652,8 +654,10 @@ mod tests {
         };
         storage.put_meta("deferred_old", &meta).await.unwrap();
 
-        let mut cleanup_config = CleanupConfig::default();
-        cleanup_config.deferred_retention = Some(Duration::from_secs(60));
+        let cleanup_config = CleanupConfig {
+            deferred_retention: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
 
         storage.cleanup(&cleanup_config).await.unwrap();
 
@@ -673,8 +677,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        let mut cleanup_config = CleanupConfig::default();
-        cleanup_config.deferred_retention = Some(Duration::from_millis(1));
+        let cleanup_config = CleanupConfig {
+            deferred_retention: Some(Duration::from_millis(1)),
+            ..Default::default()
+        };
 
         storage.cleanup(&cleanup_config).await.unwrap();
 

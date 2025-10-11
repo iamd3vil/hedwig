@@ -1,3 +1,4 @@
+use crate::metrics;
 use lettre::{
     transport::smtp::{client::TlsParameters, PoolConfig},
     AsyncSmtpTransport, Tokio1Executor,
@@ -43,6 +44,8 @@ impl PoolManager {
             })
             .await
             .map_err(|e| miette::Error::msg(e.to_string()))?;
+
+        metrics::set_pool_entries(self.pools.entry_count());
 
         Ok(transport)
     }

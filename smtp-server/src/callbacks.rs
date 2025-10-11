@@ -15,7 +15,7 @@ use ulid::Ulid;
 
 use crate::{
     config::{Cfg, FilterAction, FilterType},
-    constant_time_eq,
+    constant_time_eq, metrics,
     storage::{Status, Storage, StoredEmail},
     worker::{self, Job, Worker},
 };
@@ -149,6 +149,8 @@ impl Callbacks {
                 message: format!("Failed to store email: {}", e),
                 span: (0, email.body.len()).into(),
             })?;
+        metrics::email_received();
+        metrics::queue_depth_inc();
 
         // Send the email to the worker.
         let job = Job::new(ulid, 0);
@@ -428,6 +430,7 @@ mod tests {
                 outbound_local: Some(false),
                 pool_size: Some(10),
                 rate_limits: None,
+                metrics: None,
             },
             storage: CfgStorage {
                 storage_type: "mock".to_string(),
@@ -1146,6 +1149,7 @@ mod tests {
                 outbound_local: None,
                 pool_size: None,
                 rate_limits: None,
+                metrics: None,
             },
             storage: CfgStorage {
                 storage_type: "memory".to_string(),

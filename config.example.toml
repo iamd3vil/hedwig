@@ -11,6 +11,10 @@ max_retries = 5          # Maximum number of retries for deferred emails (option
 disable_outbound = false # Disable outbound email delivery (optional)
 outbound_local = false   # Only allow local outbound delivery (optional)
 
+# Optional Prometheus metrics endpoint
+[server.metrics]
+bind = "0.0.0.0:9090"
+
 # Configure multiple listeners - each can be plaintext or TLS
 # Standard SMTP port (plaintext)
 [[server.listeners]]

@@ -42,6 +42,7 @@ pub struct CfgServer {
     pub outbound_local: Option<bool>,
     pub pool_size: Option<u64>,
     pub rate_limits: Option<CfgRateLimits>,
+    pub metrics: Option<CfgMetrics>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -110,6 +111,11 @@ pub struct CfgListener {
 pub struct CfgTls {
     pub cert_path: String,
     pub key_path: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CfgMetrics {
+    pub bind: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
