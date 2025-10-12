@@ -180,33 +180,45 @@ DKIM (DomainKeys Identified Mail) allows receiving mail servers to verify that e
 
 ### Generating DKIM Keys
 
-1. Generate a private key:
-
-   ```bash
-   openssl genrsa -out private.key 4096
-   ```
-
-2. Extract the public key:
-
-   ```bash
-   openssl rsa -in private.key -pubout -outform der 2>/dev/null | openssl base64 -A
-   ```
-
-3. Add a DNS TXT record for your domain:
-
-   ```
-   selector._domainkey.yourdomain.com. IN TXT "v=DKIM1; k=rsa; p=[public_key]"
-   ```
-
-   Replace `selector` with your chosen selector name and `[public_key]` with the base64-encoded public key.
-
-4. Configure DKIM in config.toml:
+1. Configure DKIM in config.toml:
    ```toml
    [server.dkim]
    domain = "yourdomain.com"
-   selector = "selector"
-   private_key = "/path/to/private.key"
+   selector = "default"
+   private_key = "/path/to/dkim/private.key"
    ```
+
+2. Generate DKIM keys using the built-in command:
+
+   ```bash
+   ./target/release/hedwig dkim-generate
+   ```
+
+   Or use command line flags to override config settings:
+
+   ```bash
+   ./target/release/hedwig dkim-generate --domain yourdomain.com --selector default --private-key /path/to/dkim/private.key --key-type rsa
+   ```
+
+   Available flags:
+   - `--domain`: Domain for DKIM signature
+   - `--selector`: DKIM selector  
+   - `--private-key`: Path to save the private key
+   - `--key-type`: Key type (rsa or ed25519, default: rsa)
+
+   This will:
+   - Generate a new key pair (RSA 2048-bit by default, or Ed25519 if specified)
+   - Save the private key to the configured or specified path
+   - Output the DNS TXT record you need to add
+
+3. Add the DNS TXT record to your domain:
+
+   The command will output a record like:
+   ```
+   default._domainkey.yourdomain.com. IN TXT "v=DKIM1; k=rsa; p=[public_key]"
+   ```
+
+   Add this record to your DNS configuration. Replace the `[public_key]` placeholder with the actual base64-encoded public key shown in the output.
 
 ## Rate Limiting
 

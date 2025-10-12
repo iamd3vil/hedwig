@@ -45,7 +45,26 @@ enum Commands {
     /// Start the SMTP server (default)
     Server,
     /// Generate DKIM keys
-    DkimGenerate,
+    DkimGenerate(DkimGenerateArgs),
+}
+
+#[derive(Parser)]
+struct DkimGenerateArgs {
+    /// Domain for DKIM signature
+    #[arg(long)]
+    domain: Option<String>,
+
+    /// DKIM selector
+    #[arg(long)]
+    selector: Option<String>,
+
+    /// Path to save the private key
+    #[arg(long)]
+    private_key: Option<String>,
+
+    /// Key type (rsa or ed25519)
+    #[arg(long, default_value = "rsa")]
+    key_type: String,
 }
 
 #[tokio::main]
@@ -58,7 +77,7 @@ async fn main() -> Result<()> {
 
     match args.command.unwrap_or(Commands::Server) {
         Commands::Server => run_server(&args.config).await,
-        Commands::DkimGenerate => generate_dkim_keys(&args.config).await,
+        Commands::DkimGenerate(dkim_args) => generate_dkim_keys(&args.config, dkim_args).await,
     }
 }
 
@@ -318,17 +337,57 @@ async fn run_server(config_path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn generate_dkim_keys(config_path: &str) -> Result<()> {
+async fn generate_dkim_keys(config_path: &str, args: DkimGenerateArgs) -> Result<()> {
     let cfg = config::Cfg::load(config_path).wrap_err("error loading configuration")?;
 
-    let dkim_config = match &cfg.server.dkim {
-        Some(config) => config,
-        None => bail!("DKIM configuration is missing in config file"),
-    };
+    let dkim_config =
+        if args.domain.is_some() || args.selector.is_some() || args.private_key.is_some() {
+            let domain = match args.domain {
+                Some(d) => d,
+                None => match &cfg.server.dkim {
+                    Some(config) => config.domain.clone(),
+                    None => bail!("Domain is required when not in config file"),
+                },
+            };
+
+            let selector = match args.selector {
+                Some(s) => s,
+                None => match &cfg.server.dkim {
+                    Some(config) => config.selector.clone(),
+                    None => bail!("Selector is required when not in config file"),
+                },
+            };
+
+            let private_key = match args.private_key {
+                Some(p) => p,
+                None => match &cfg.server.dkim {
+                    Some(config) => config.private_key.clone(),
+                    None => bail!("Private key path is required when not in config file"),
+                },
+            };
+
+            let key_type = match args.key_type.as_str() {
+                "rsa" => DkimKeyType::Rsa,
+                "ed25519" => DkimKeyType::Ed25519,
+                _ => bail!("Invalid key type. Use 'rsa' or 'ed25519'"),
+            };
+
+            CfgDKIM {
+                domain,
+                selector,
+                private_key,
+                key_type,
+            }
+        } else {
+            match &cfg.server.dkim {
+                Some(config) => config.clone(),
+                None => bail!("DKIM configuration is missing in config file and no flags provided"),
+            }
+        };
 
     match dkim_config.key_type {
-        DkimKeyType::Rsa => generate_rsa_keys(dkim_config).await,
-        DkimKeyType::Ed25519 => generate_ed25519_keys(dkim_config).await,
+        DkimKeyType::Rsa => generate_rsa_keys(&dkim_config).await,
+        DkimKeyType::Ed25519 => generate_ed25519_keys(&dkim_config).await,
     }
 }
 
