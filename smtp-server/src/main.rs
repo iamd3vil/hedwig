@@ -8,10 +8,12 @@ use std::sync::Arc;
 use storage::{fs_storage::FileSystemStorage, Status, Storage};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, Level};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn, Level};
 use worker::{deferred_worker::DeferredWorker, Job};
 
 mod callbacks;
@@ -99,14 +101,18 @@ async fn run_server(config_path: &str) -> Result<()> {
         metrics::spawn_metrics_server(addr);
     }
 
-    // Initialize channels for background processing of emails.
+    // Initialize the work queue that powers outbound processing. Closing these channels
+    // later is the cue for workers to stop draining jobs.
     let (sender_channel, receiver_channel) = async_channel::bounded(1);
+    // Shared cancellation token used to broadcast a shutdown request to every task we spawn.
+    let shutdown_token = CancellationToken::new();
+    // Track JoinHandles for background tasks so we can await them during shutdown.
+    let mut background_tasks: Vec<JoinHandle<()>> = Vec::new();
 
     // Initialize storage.
     let storage = get_storage_type(&cfg.storage)
         .await
         .wrap_err("error getting storage type")?;
-    let storage = Arc::new(storage);
 
     // Capture the current queue depth before workers start consuming jobs.
     let mut queued_jobs = Vec::new();
@@ -140,17 +146,27 @@ async fn run_server(config_path: &str) -> Result<()> {
 
         let storage_for_cleanup = Arc::clone(&storage);
         let cleanup_config_task = cleanup_config.clone();
-        tokio::spawn(async move {
+        let cleanup_shutdown = shutdown_token.clone();
+        let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(cleanup_config_task.interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
             loop {
-                ticker.tick().await;
-                if let Err(err) = storage_for_cleanup.cleanup(&cleanup_config_task).await {
-                    error!("error performing storage cleanup: {:#}", err);
+                tokio::select! {
+                    _ = cleanup_shutdown.cancelled() => {
+                        info!("storage cleanup task shutting down");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        if let Err(err) = storage_for_cleanup.cleanup(&cleanup_config_task).await {
+                            error!("error performing storage cleanup: {:#}", err);
+                        }
+                    }
                 }
             }
+            info!("storage cleanup task stopped");
         });
+        background_tasks.push(handle);
     }
     // Create TLS acceptors for each listener that has TLS configured
     let mut tls_acceptors = Vec::new();
@@ -192,15 +208,14 @@ async fn run_server(config_path: &str) -> Result<()> {
 
     info!("Auth enabled: {}", auth_enabled);
 
-    let smtp_server = SmtpServer::new(
-        callbacks::Callbacks::new(
-            Arc::clone(&storage),
-            sender_channel.clone(),
-            receiver_channel.clone(),
-            cfg.clone(),
-        ),
-        auth_enabled,
+    let (callbacks, worker_handles) = callbacks::Callbacks::new(
+        Arc::clone(&storage),
+        sender_channel.clone(),
+        receiver_channel.clone(),
+        cfg.clone(),
     );
+
+    let smtp_server = SmtpServer::new(callbacks, auth_enabled);
 
     // Replay any queued emails so workers process them immediately.
     if !queued_jobs.is_empty() {
@@ -222,17 +237,16 @@ async fn run_server(config_path: &str) -> Result<()> {
     }
 
     // Start the deferred worker.
-    tokio::spawn(async move {
-        let worker = DeferredWorker::new(
-            Arc::clone(&storage),
-            sender_channel.clone(),
-            cfg.server.max_retries,
-        );
-        let res = worker.process_deferred_jobs().await;
-        if let Err(e) = res {
+    let deferred_storage = Arc::clone(&storage);
+    let deferred_sender = sender_channel.clone();
+    let max_retries = cfg.server.max_retries;
+    let deferred_handle = tokio::spawn(async move {
+        let worker = DeferredWorker::new(deferred_storage, deferred_sender, max_retries);
+        if let Err(e) = worker.process_deferred_jobs().await {
             error!("Error running deferred worker: {:#}", e);
         }
     });
+    background_tasks.push(deferred_handle);
 
     // Create listeners for each configured address
     let mut listeners = Vec::new();
@@ -255,59 +269,129 @@ async fn run_server(config_path: &str) -> Result<()> {
         listeners.push((listener, i));
     }
 
-    // Spawn a task for each listener
-    let mut listener_tasks = Vec::new();
     for (listener, acceptor_index) in listeners {
         let server_clone = smtp_server.clone();
         let tls_acceptor = tls_acceptors[acceptor_index].clone();
+        let shutdown = shutdown_token.clone();
+        let listener_addr = cfg.server.listeners[acceptor_index].addr.clone();
 
-        let task = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
-                let (socket, _) = match listener.accept().await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        error!("Error accepting tcp connection: {:#}", e);
-                        continue;
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        info!(%listener_addr, "listener shutting down");
+                        break;
                     }
-                };
-
-                debug!("Accepted connection");
-                let server_clone = server_clone.clone();
-                let tls_acceptor = tls_acceptor.clone();
-
-                tokio::spawn(async move {
-                    let mut boxed_socket: Box<dyn SmtpStream> = if let Some(acceptor) = tls_acceptor
-                    {
-                        match acceptor.accept(socket).await {
-                            Ok(tls_stream) => Box::new(tls_stream),
+                    accept_result = listener.accept() => {
+                        let (socket, _) = match accept_result {
+                            Ok(conn) => conn,
                             Err(e) => {
-                                // Ignore if it's EOF.
-                                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                                    debug!("TLS handshake failed: {}", e);
-                                } else {
-                                    // Log the error.
-                                    error!("TLS handshake failed: {}", e);
-                                }
-
-                                return;
+                                error!(%listener_addr, "Error accepting tcp connection: {:#}", e);
+                                continue;
                             }
-                        }
-                    } else {
-                        Box::new(socket)
-                    };
+                        };
 
-                    if let Err(e) = server_clone.handle_client(&mut boxed_socket).await {
-                        error!("Error handling client: {:#}", e);
+                        debug!("Accepted connection");
+                        let server_clone = server_clone.clone();
+                        let tls_acceptor = tls_acceptor.clone();
+
+                        tokio::spawn(async move {
+                            let mut boxed_socket: Box<dyn SmtpStream> =
+                                if let Some(acceptor) = tls_acceptor {
+                                    match acceptor.accept(socket).await {
+                                        Ok(tls_stream) => Box::new(tls_stream),
+                                        Err(e) => {
+                                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                                debug!("TLS handshake failed: {}", e);
+                                            } else {
+                                                error!("TLS handshake failed: {}", e);
+                                            }
+
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    Box::new(socket)
+                                };
+
+                            if let Err(e) = server_clone.handle_client(&mut boxed_socket).await {
+                                error!("Error handling client: {:#}", e);
+                            }
+                        });
                     }
-                });
+                }
             }
+            info!(%listener_addr, "listener stopped");
         });
 
-        listener_tasks.push(task);
+        background_tasks.push(handle);
     }
 
-    // Wait for all listener tasks to complete (which should never happen)
-    futures::future::join_all(listener_tasks).await;
+    wait_for_shutdown_signal().await?;
+    info!("shutdown signal received, beginning graceful shutdown");
+
+    // Notify every background task to stop accepting new work, then close the queues to
+    // allow worker loops to observe the shutdown.
+    shutdown_token.cancel();
+    sender_channel.close();
+    receiver_channel.close();
+
+    for handle in worker_handles {
+        if let Err(err) = handle.await {
+            if err.is_cancelled() {
+                warn!("worker task cancelled before completion");
+            } else if err.is_panic() {
+                error!("worker task panicked: {:?}", err);
+            } else {
+                error!("worker task failed: {}", err);
+            }
+        }
+    }
+
+    for handle in background_tasks {
+        if let Err(err) = handle.await {
+            if err.is_cancelled() {
+                warn!("background task cancelled before completion");
+            } else if err.is_panic() {
+                error!("background task panicked: {:?}", err);
+            } else {
+                error!("background task failed: {}", err);
+            }
+        }
+    }
+
+    info!("shutdown complete");
+    Ok(())
+}
+
+/// Block until an OS signal such as Ctrl+C (and SIGTERM on Unix) is delivered, giving the
+/// server a clear indication it should begin graceful shutdown.
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigterm = signal(SignalKind::terminate())
+            .into_diagnostic()
+            .wrap_err("failed to listen for SIGTERM")?;
+
+        tokio::select! {
+            ctrl_c = tokio::signal::ctrl_c() => {
+                ctrl_c
+                    .into_diagnostic()
+                    .wrap_err("failed to wait for ctrl+c")?;
+            }
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to wait for ctrl+c")?;
+    }
 
     Ok(())
 }
