@@ -11,6 +11,7 @@ use hickory_resolver::lookup::MxLookup;
 use moka::{future::Cache, Expiry};
 use smtp::{Email, SmtpCallbacks, SmtpError};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use ulid::Ulid;
 
 use crate::{
@@ -65,13 +66,18 @@ impl Expiry<String, MxLookup> for MXExpiry {
 
 /// The Callbacks struct implements the SmtpCallbacks trait.
 impl Callbacks {
-    /// Creates a new Callbacks instance.
+    /// Creates a new Callbacks instance, spins up the worker pool, and returns the
+    /// corresponding join handles so the caller can coordinate shutdown.
+    ///
+    /// Keeping the join handles at the call site (e.g. `run_server`) allows the
+    /// application to await worker completion and ensure any in-flight mail is
+    /// processed before exit.
     pub fn new(
         storage: Arc<dyn Storage>,
         sender_channel: async_channel::Sender<Job>,
         receiver_channel: async_channel::Receiver<Job>,
         cfg: Cfg,
-    ) -> Self {
+    ) -> (Self, Vec<JoinHandle<()>>) {
         let expiry = MXExpiry;
         let mx_cache: Cache<_, _> = Cache::builder()
             .max_capacity(10000)
@@ -87,13 +93,14 @@ impl Callbacks {
             .map(|rl| rl.to_rate_limit_config())
             .unwrap_or_default();
 
+        let mut worker_handles = Vec::new();
         for _ in 0..worker_count {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
             let dkim = cfg.server.dkim.clone();
             let mx_cache = mx_cache.clone();
             let rate_limit_config = rate_limit_config.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let worker_config = worker::WorkerConfig {
                     disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
                     outbound_local: cfg.server.outbound_local.unwrap_or(false),
@@ -111,6 +118,7 @@ impl Callbacks {
                 .expect("Failed to create worker");
                 worker.run().await;
             });
+            worker_handles.push(handle);
         }
 
         // Create the auth mapping.
@@ -122,12 +130,14 @@ impl Callbacks {
             }
         }
 
-        Callbacks {
+        let callbacks = Callbacks {
             storage,
             sender_channel,
             cfg,
             auth_mapping: Mutex::new(auth_mapping),
-        }
+        };
+
+        (callbacks, worker_handles)
     }
 
     /// Processes an email by parsing it, storing it, and sending it to a worker.
@@ -443,7 +453,15 @@ mod tests {
         let (sender_channel, receiver_channel) = async_channel::unbounded::<worker::Job>();
         let storage: Arc<dyn Storage> = Arc::new(MockStorage);
 
-        Callbacks::new(storage, sender_channel, receiver_channel, cfg)
+        let (callbacks, worker_handles) =
+            Callbacks::new(storage, sender_channel, receiver_channel, cfg);
+        for handle in worker_handles {
+            // These handles outlive the test scope; aborting avoids leaking tasks into
+            // other async tests once we have exercised the setup logic.
+            handle.abort();
+        }
+
+        callbacks
     }
 
     fn create_mail_from_command(address: &str) -> smtp::parser::MailFromCommand {
@@ -864,7 +882,11 @@ mod tests {
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
 
-        let _callbacks = Callbacks::new(storage, sender, receiver, cfg);
+        let (_callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
+        for handle in worker_handles {
+            // Abort so the spawned worker does not keep running past the test lifetime.
+            handle.abort();
+        }
         // Just verify it was created without error
     }
 
@@ -886,10 +908,15 @@ mod tests {
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
 
-        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
         let auth_mapping = callbacks.auth_mapping.lock().await;
         assert_eq!(auth_mapping.get("user1"), Some(&"pass1".to_string()));
         assert_eq!(auth_mapping.get("user2"), Some(&"pass2".to_string()));
+        drop(auth_mapping);
+        for handle in worker_handles {
+            // Abort so the worker pool we spawned for the test does not leak.
+            handle.abort();
+        }
     }
 
     #[tokio::test]
@@ -912,7 +939,7 @@ mod tests {
         let cfg = create_test_config();
         let storage = Arc::new(MockStorageWithError {});
         let (sender, receiver) = async_channel::bounded(100);
-        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
 
         let email = Email {
             from: "sender@example.com".to_string(),
@@ -922,6 +949,10 @@ mod tests {
 
         let result = callbacks.process_email(&email).await;
         assert!(result.is_err());
+        for handle in worker_handles {
+            // Prevent the worker task spawned during the test from leaking.
+            handle.abort();
+        }
     }
 
     #[tokio::test]
@@ -952,11 +983,16 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
 
         let result = callbacks.on_auth("testuser", "testpass").await;
         assert!(result.is_ok());
         assert!(result.unwrap());
+        for handle in worker_handles {
+            // Tests do not exercise the long-running worker loop, so abort the task to
+            // keep the runtime clean once assertions complete.
+            handle.abort();
+        }
     }
 
     #[tokio::test]
@@ -970,11 +1006,15 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
 
         let result = callbacks.on_auth("wronguser", "testpass").await;
         assert!(result.is_ok());
         assert!(!result.unwrap());
+        for handle in worker_handles {
+            // Abort the spawned worker to avoid leaking background work between tests.
+            handle.abort();
+        }
     }
 
     #[tokio::test]
@@ -985,11 +1025,15 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
 
         let mail_cmd = create_mail_from_command("sender@example.com");
         let result = callbacks.on_mail_from(&mail_cmd).await;
         assert!(result.is_ok());
+        for handle in worker_handles {
+            // Abort the worker spawned for the test so the runtime remains quiescent.
+            handle.abort();
+        }
     }
 
     #[tokio::test]
@@ -1004,11 +1048,15 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
 
         let mail_cmd = create_mail_from_command("invalidpath");
         let result = callbacks.on_mail_from(&mail_cmd).await;
         assert!(result.is_err());
+        for handle in worker_handles {
+            // Abort the worker spawned for the test so it does not persist past this case.
+            handle.abort();
+        }
     }
 
     #[tokio::test]
@@ -1019,10 +1067,14 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
 
         let result = callbacks.on_rcpt_to("recipient@example.com").await;
         assert!(result.is_ok());
+        for handle in worker_handles {
+            // Abort the worker spawned in the test to keep the executor clean.
+            handle.abort();
+        }
     }
 
     #[tokio::test]
@@ -1037,10 +1089,14 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let callbacks = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
 
         let result = callbacks.on_rcpt_to("invalidpath").await;
         assert!(result.is_err());
+        for handle in worker_handles {
+            // Abort the test's worker to avoid leaking background work to later tests.
+            handle.abort();
+        }
     }
 
     #[tokio::test]
