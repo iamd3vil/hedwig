@@ -441,6 +441,7 @@ mod tests {
                 pool_size: Some(10),
                 rate_limits: None,
                 metrics: None,
+                health: None,
             },
             storage: CfgStorage {
                 storage_type: "mock".to_string(),
@@ -1206,6 +1207,7 @@ mod tests {
                 pool_size: None,
                 rate_limits: None,
                 metrics: None,
+                health: None,
             },
             storage: CfgStorage {
                 storage_type: "memory".to_string(),

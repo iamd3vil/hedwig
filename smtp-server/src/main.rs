@@ -19,6 +19,7 @@ use worker::{deferred_worker::DeferredWorker, Job};
 mod callbacks;
 mod config;
 mod dkim;
+mod health;
 mod metrics;
 mod storage;
 mod worker;
@@ -100,12 +101,19 @@ async fn run_server(config_path: &str) -> Result<()> {
             .wrap_err("invalid metrics bind address")?;
         metrics::spawn_metrics_server(addr);
     }
-
     // Initialize the work queue that powers outbound processing. Closing these channels
     // later is the cue for workers to stop draining jobs.
     let (sender_channel, receiver_channel) = async_channel::bounded(1);
     // Shared cancellation token used to broadcast a shutdown request to every task we spawn.
     let shutdown_token = CancellationToken::new();
+    if let Some(health_cfg) = &cfg.server.health {
+        let addr: std::net::SocketAddr = health_cfg
+            .bind
+            .parse()
+            .into_diagnostic()
+            .wrap_err("invalid health bind address")?;
+        health::spawn_health_server(addr, shutdown_token.clone());
+    }
     // Track JoinHandles for background tasks so we can await them during shutdown.
     let mut background_tasks: Vec<JoinHandle<()>> = Vec::new();
 

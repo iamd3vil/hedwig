@@ -106,6 +106,29 @@ default_limit = 60                       # Default emails per minute (default: 6
 - When rate limited, workers wait for tokens to become available
 - Tokens refill continuously (e.g., 60/minute = 1 token per second)
 
+#### Metrics (`[server.metrics]`)
+
+Expose Prometheus metrics over HTTP for scraping.
+
+```toml
+[server.metrics]
+bind = "0.0.0.0:9090"                     # Address where metrics are served
+```
+
+The `/metrics` endpoint responds with a Prometheus-compatible payload.
+
+#### Health Checks (`[server.health]`)
+
+Enable a simple HTTP liveness probe so orchestration platforms can monitor Hedwig.
+
+```toml
+[server.health]
+bind = "0.0.0.0:8080"                      # Address that serves /healthz
+```
+
+Requests to `/healthz` return `200 OK` while the server is running and `503 Service Unavailable`
+during shutdown.
+
 ### Storage Configuration (`[storage]`)
 
 Configure email storage backend.
@@ -187,6 +210,14 @@ default_limit = 60
 "gmail.com" = 30
 "outlook.com" = 25
 "yahoo.com" = 20
+
+# Metrics
+[server.metrics]
+bind = "0.0.0.0:9090"
+
+# Health checks
+[server.health]
+bind = "0.0.0.0:8080"
 
 # Storage
 [storage]
