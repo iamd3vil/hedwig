@@ -27,6 +27,8 @@ server::
   max_retries: 5
   metrics::
     bind: "0.0.0.0:9090"
+  health::
+    bind: "0.0.0.0:8080"
   outbound_local: false
   pool_size: 100
   workers: 4

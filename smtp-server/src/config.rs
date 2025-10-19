@@ -44,6 +44,7 @@ pub struct CfgServer {
     pub pool_size: Option<u64>,
     pub rate_limits: Option<CfgRateLimits>,
     pub metrics: Option<CfgMetrics>,
+    pub health: Option<CfgHealth>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -116,6 +117,11 @@ pub struct CfgTls {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CfgMetrics {
+    pub bind: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CfgHealth {
     pub bind: String,
 }
 

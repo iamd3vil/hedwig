@@ -15,6 +15,10 @@ outbound_local = false   # Only allow local outbound delivery (optional)
 [server.metrics]
 bind = "0.0.0.0:9090"
 
+# Optional HTTP health endpoint for liveness probes
+[server.health]
+bind = "0.0.0.0:8080"
+
 # Configure multiple listeners - each can be plaintext or TLS
 # Standard SMTP port (plaintext)
 [[server.listeners]]
