@@ -2,6 +2,11 @@
 members = ["smtp-server", "smtp"]
 resolver = "2"
 
+[patch.crates-io]
+# Fix future incompatibility warning in num-bigint-dig 0.8.4
+# See: https://github.com/rust-lang/rust/issues/120192
+num-bigint-dig = { git = "https://github.com/dignifiedquire/num-bigint", tag = "v0.8.6" }
+
 [workspace.dependencies]
 miette = { version = "7.2.0", features = ["fancy"] }
 thiserror = "1.0.64"
