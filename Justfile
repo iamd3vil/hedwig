@@ -20,11 +20,18 @@ build-macos $RUSTFLAGS="-C target-feature=+crt-static":
     else
         # Running on non-macOS (Linux, Windows)
         docker run --rm \
-        --volume ${PWD}:/root/src \
-        --workdir /root/src \
-        joseluisq/rust-linux-darwin-builder:1.86.0 \
-        sh -c 'CC=aarch64-apple-darwin22.4-clang CXX=aarch64-apple-darwin22.4-clang++ TARGET_CC=aarch64-apple-darwin22.4-clang TARGET_AR=aarch64-apple-darwin22.4-ar cargo build --release --target aarch64-apple-darwin'
+        --volume ${PWD}:/io \
+        --workdir /io \
+        ghcr.io/rust-cross/cargo-zigbuild:latest \
+        sh -c 'rustup update stable && rustup target add aarch64-apple-darwin && cargo zigbuild --release --target aarch64-apple-darwin'
     fi
+
+build-windows $RUSTFLAGS="-C target-feature=+crt-static":
+    docker run --rm \
+    --volume ${PWD}:/io \
+    --workdir /io \
+    ghcr.io/rust-cross/cargo-zigbuild:latest \
+    sh -c 'rustup update stable && rustup target add x86_64-pc-windows-gnu && cargo zigbuild --release --target x86_64-pc-windows-gnu'
 
 dev:
     #!/usr/bin/env sh

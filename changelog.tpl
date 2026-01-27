@@ -1,15 +1,38 @@
-{% for commit in commits if commit.subject|starts_with("feat") or commit.subject|starts_with("refactor") %}
-{%- if loop.first %}
+{% set features = commits | selectattr("type", "equalto", "feat") | list %}
+{% set fixes = commits | selectattr("type", "equalto", "fix") | list %}
+{% set chores = commits | selectattr("type", "equalto", "chore") | list %}
+
+{% if features | length > 0 %}
 ### Features:
-{%- endif %}
-{{ commit.hash }}: {{ commit.subject|trim("feat: ")|trim("refactor: ") }}
+{% for commit in features %}
+{{ commit.hash }}: {{ commit.subject }}{% if commit.handle %} (@{{ commit.handle }}){% endif %}
 {%- endfor %}
+{% endif %}
 
-{# Fixes Section: Render header only if fixes exist, using loop.first #}
-{% for commit in commits if commit.subject|starts_with("fix") %}
-{%- if loop.first %} {# Check if this is the first iteration of *this* loop #}
-
+{% if fixes | length > 0 %}
 ### Fixes:
-{%- endif %}
-{{ commit.hash }}: {{ commit.subject }}
+{% for commit in fixes %}
+{{ commit.hash }}: {{ commit.subject }}{% if commit.handle %} (@{{ commit.handle }}){% endif %}
 {%- endfor %}
+{% endif %}
+
+{% if chores | length > 0 %}
+### Chores:
+{% for commit in chores %}
+{{ commit.hash }}: {{ commit.subject }}{% if commit.handle %} (@{{ commit.handle }}){% endif %}
+{%- endfor %}
+{% endif %}
+
+{% set contributors = [] %}
+{% for commit in commits %}
+{% if commit.handle and commit.handle not in contributors %}
+{% set contributors = contributors + [commit.handle] %}
+{% endif %}
+{% endfor %}
+
+{% if contributors | length > 0 %}
+### Contributors:
+{% for handle in contributors %}
+- @{{ handle }}
+{%- endfor %}
+{% endif %}

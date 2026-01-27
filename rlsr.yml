@@ -1,5 +1,5 @@
 releases:
-  - name: "Release to GitHub"
+  - name: "Release to github"
     dist_folder: "./dist"
     targets:
       github:
@@ -13,13 +13,21 @@ releases:
     builds:
       - command: "just build-linux"
         artifact: "target/x86_64-unknown-linux-musl/release/hedwig"
+        bin_name: "hedwig"
         archive_name: "hedwig-{{ meta.tag }}-linux-x86_64"
         name: "Linux build"
+      - command: "just build-macos"
+        artifact: "target/aarch64-apple-darwin/release/hedwig"
+        bin_name: "hedwig"
+        archive_name: "hedwig-{{ meta.tag }}-macos-arm64"
+        name: "MacOS build"
+      - command: "just build-windows"
+        artifact: "target/x86_64-pc-windows-gnu/release/hedwig.exe"
+        bin_name: "hedwig.exe"
+        archive_name: "hedwig-{{ meta.tag }}-windows-x86_64"
+        name: "Windows build"
 changelog:
   format: "github"
-  exclude:
-    - "^chore"
-    - "^ci"
-    - "^docs"
-    - "^test"
   template: "changelog.tpl"
+  exclude:
+    - "^doc:"
