@@ -1,0 +1,25 @@
+---
+const { active } = Astro.props;
+const links = [
+  { href: "/introduction", label: "Docs" },
+  { href: "/configuration", label: "Configuration" },
+  { href: "/reference/architecture", label: "Reference" }
+];
+---
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="logo" href="/">
+      <img src="/logo.png" alt="Hedwig logo" />
+      <span>Hedwig</span>
+    </a>
+    <div class="nav-links">
+      {links.map((link) => (
+        <a class={active === link.href ? "active" : ""} href={link.href}>
+          {link.label}
+        </a>
+      ))}
+      <a class="cta" href="/quickstart">Quickstart</a>
+    </div>
+  </div>
+</nav>

@@ -1,0 +1,232 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+
+const features = [
+  {
+    title: "Fast and efficient",
+    body: "Optimized for high-speed email processing with a lean, async core."
+  },
+  {
+    title: "Minimalist design",
+    body: "Focuses on core SMTP relay flows without unnecessary complexity."
+  },
+  {
+    title: "Persistent queue",
+    body: "Emails are queued on the filesystem for durable processing."
+  },
+  {
+    title: "Forward-only",
+    body: "Specializes in receiving and forwarding, not full server semantics."
+  },
+  {
+    title: "Security features",
+    body: "Supports DKIM, TLS, and SMTP authentication with practical defaults."
+  },
+  {
+    title: "Rate limiting",
+    body: "Per-domain rate limiting keeps outbound delivery healthy."
+  }
+];
+
+const flow = [
+  {
+    tag: "Inbound",
+    title: "Listener intake",
+    body: "Plaintext or TLS listeners accept mail and negotiate SMTP."
+  },
+  {
+    tag: "Policy",
+    title: "Callbacks",
+    body: "Authentication, domain filtering, and rate limiting are enforced."
+  },
+  {
+    tag: "Storage",
+    title: "Queue",
+    body: "Messages land in a persistent on-disk queue for durability."
+  },
+  {
+    tag: "Workers",
+    title: "Processing",
+    body: "Workers parse, sign with DKIM, and resolve MX records."
+  },
+  {
+    tag: "Outbound",
+    title: "Delivery",
+    body: "Outbound pools relay to destination servers with retries."
+  }
+];
+---
+
+<BaseLayout
+  title="Hedwig - High-performance SMTP server"
+  description="Hedwig is a high-performance, minimalist SMTP server implemented in Rust."
+>
+  <section class="hero">
+    <div class="container hero-grid">
+      <div class="hero-copy">
+        <p class="kicker reveal" style="--delay: 0.05s;">Open-source SMTP relay</p>
+        <h1 class="reveal" style="--delay: 0.15s;">
+          A minimal SMTP server in Rust.
+        </h1>
+        <p class="lede reveal" style="--delay: 0.25s;">
+          Hedwig is a high-performance, minimalist SMTP server implemented in Rust.
+          It receives, queues, and forwards email to destination SMTP servers using a
+          durable on-disk queue and a straightforward configuration.
+        </p>
+        <div class="hero-actions reveal" style="--delay: 0.35s;">
+          <a class="btn primary" href="/introduction">Docs</a>
+          <a class="btn ghost" href="/configuration">Configuration</a>
+        </div>
+        <div class="hero-meta reveal" style="--delay: 0.45s;">
+          <span class="meta-item">DKIM + TLS</span>
+          <span class="meta-item">Filesystem queue</span>
+          <span class="meta-item">AGPL v3</span>
+        </div>
+      </div>
+      <div class="hero-art" aria-hidden="true">
+        <div class="mail-board">
+          <div class="board-header">
+            <span class="chip">Inbound</span>
+            <span class="chip">Queue</span>
+            <span class="chip">Outbound</span>
+          </div>
+          <div class="board-lines">
+            <span class="line"></span>
+            <span class="line"></span>
+            <span class="line"></span>
+            <span class="line"></span>
+          </div>
+          <div class="board-flow">Queue → Worker</div>
+          <div class="board-cards">
+            <div class="queue-card">
+              <div class="queue-title">Queue</div>
+              <div class="queue-item">mail-2026-02-01-0001</div>
+              <div class="queue-item">mail-2026-02-01-0002</div>
+              <div class="queue-item">mail-2026-02-01-0003</div>
+            </div>
+            <div class="log-card">
+              <div class="log-title">Worker</div>
+              <div class="log-row">parse ok</div>
+              <div class="log-row">dkim ok</div>
+              <div class="log-row">mx resolve</div>
+              <div class="log-row">send ok</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <p class="kicker">Core capabilities</p>
+      <h2 class="section-title">Focused on SMTP relay, nothing extra.</h2>
+      <div class="feature-grid">
+        {features.map((feature) => (
+          <article class="feature-card">
+            <h3>{feature.title}</h3>
+            <p>{feature.body}</p>
+          </article>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <p class="kicker">Architecture snapshot</p>
+      <h2 class="section-title">From inbound handshake to outbound delivery.</h2>
+      <div class="flow-grid">
+        {flow.map((step) => (
+          <div class="flow-step">
+            <span>{step.tag}</span>
+            <h4>{step.title}</h4>
+            <p>{step.body}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <p class="kicker">Quickstart</p>
+      <h2 class="section-title">Build and run locally.</h2>
+      <div class="feature-grid">
+        <div class="code-card">
+          <pre>
+<code>git clone https://github.com/iamd3vil/hedwig.git
+cd hedwig
+cargo build --release
+HEDWIG_LOG_LEVEL=info ./target/release/hedwig</code>
+          </pre>
+        </div>
+        <div class="callout">
+          <h3>Next: configure and run</h3>
+          <p>
+            Set up listeners, optional TLS, and storage paths in a single TOML file.
+          </p>
+          <a class="btn ghost" href="/overview#quickstart">Open the full guide</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <p class="kicker">Configuration</p>
+      <h2 class="section-title">Listeners, auth, DKIM, and storage.</h2>
+      <div class="feature-grid">
+        <div class="code-card">
+          <pre>
+<code>[server]
+workers = 4
+max_retries = 5
+pool_size = 100
+
+[[server.listeners]]
+addr = "0.0.0.0:25"
+
+[[server.listeners]]
+addr = "0.0.0.0:465"
+[server.listeners.tls]
+cert_path = "/path/to/cert.pem"
+key_path = "/path/to/key.pem"
+
+[storage]
+storage_type = "fs"
+base_path = "/var/lib/hedwig/mail"</code>
+          </pre>
+        </div>
+        <div class="callout">
+          <h3>Configuration guide</h3>
+          <p>
+            Optional auth, rate limiting, metrics, and health checks live here.
+          </p>
+          <a class="btn primary" href="/configuration">Open configuration docs</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <p class="kicker">Metrics (optional)</p>
+      <h2 class="section-title">Expose Prometheus metrics when enabled.</h2>
+      <div class="feature-grid">
+        <article class="feature-card">
+          <h3>Queue depth</h3>
+          <p>Track queued, deferred, bounced, and dropped messages.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Send attempts</h3>
+          <p>Monitor per-domain successes, failures, and latency.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Worker throughput</h3>
+          <p>Measure job processing time and DKIM signing latency.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

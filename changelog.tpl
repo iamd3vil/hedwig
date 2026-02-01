@@ -30,9 +30,17 @@
 {% endif %}
 {% endfor %}
 
-{% if contributors | length > 0 %}
-### Contributors:
+{% set contributor_counts = [] %}
 {% for handle in contributors %}
-- @{{ handle }}
+{% set count = commits | selectattr("handle", "equalto", handle) | list | length %}
+{% set contributor_counts = contributor_counts + [{"handle": handle, "count": count}] %}
+{% endfor %}
+{% set contributor_counts = contributor_counts | sort(attribute="handle") %}
+{% set contributor_counts = contributor_counts | sort(attribute="count", reverse=true) %}
+
+{% if contributor_counts | length > 0 %}
+### Contributors:
+{% for contributor in contributor_counts %}
+- @{{ contributor.handle }}
 {%- endfor %}
 {% endif %}

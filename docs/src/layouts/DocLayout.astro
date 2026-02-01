@@ -1,0 +1,63 @@
+---
+import BaseLayout from "./BaseLayout.astro";
+
+const {
+  title = "Docs",
+  description = "Hedwig documentation and reference guides."
+} = Astro.props;
+const pathname = Astro.url.pathname;
+const groups = [
+  {
+    title: "Docs",
+    items: [
+      { href: "/introduction", label: "Introduction" },
+      { href: "/installation", label: "Installation" },
+      { href: "/quickstart", label: "Quickstart" },
+      { href: "/configuration", label: "Configuration" },
+      { href: "/dkim", label: "DKIM" },
+      { href: "/rate-limiting", label: "Rate limiting" },
+      { href: "/metrics", label: "Metrics" },
+      { href: "/health-checks", label: "Health checks" },
+      { href: "/storage", label: "Storage" },
+      { href: "/domain-filtering", label: "Domain filtering" }
+    ]
+  },
+  {
+    title: "Reference",
+    items: [
+      { href: "/reference/architecture", label: "Architecture" },
+      { href: "/reference/environment-variables", label: "Environment variables" },
+      { href: "/reference/example-configuration", label: "Example configuration" },
+      { href: "/reference/huml-example", label: "HUML example" }
+    ]
+  }
+];
+---
+
+<BaseLayout title={title} description={description}>
+  <div class="container doc-shell">
+    <aside class="doc-aside">
+      <h3>Docs</h3>
+      {groups.map((group) => (
+        <div class="doc-group">
+          <div class="doc-group-title">{group.title}</div>
+          <div class="doc-group-links">
+            {group.items.map((item) => (
+              <a class={pathname === item.href ? "active" : ""} href={item.href}>
+                {item.label}
+              </a>
+            ))}
+          </div>
+        </div>
+      ))}
+      <div class="callout">
+        <strong>Need a fast start?</strong>
+        <p>Jump to the Quickstart and get a relay running in minutes.</p>
+        <a href="/quickstart">Open Quickstart</a>
+      </div>
+    </aside>
+    <article class="doc-content">
+      <slot />
+    </article>
+  </div>
+</BaseLayout>

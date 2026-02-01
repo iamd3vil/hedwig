@@ -10,307 +10,39 @@
 </div>
 
 <p align="center">
-   Hedwig - A high-performance, minimalist SMTP server implemented in Rust.
+  Hedwig - A high-performance, minimalist SMTP server implemented in Rust.
 </p>
 
 ---
 
-## Overview
+## Docs
 
-This SMTP server is designed with a focus on speed and simplicity. It provides a streamlined solution for receiving, queuing, and forwarding emails to destination SMTP servers.
+Documentation lives at https://hedwig.sarat.dev
 
-For detailed technical information about the server's architecture and design, see the [Architecture Documentation](smtp-server/ARCHITECTURE.md).
+## Install (recommended)
 
-## Key Features
-
-- **Fast and Efficient**: Optimized for high-speed email processing.
-- **Minimalist Design**: Focuses on core SMTP functionality without unnecessary complexities.
-- **Persistent Queue**: Emails are queued on the filesystem, ensuring durability across server restarts.
-- **Forward-Only**: Specializes in receiving and forwarding emails, not full SMTP functionality.
-- **Security Features**: Supports DKIM, TLS, and SMTP authentication.
-- **Rate Limiting**: Per-domain rate limiting to prevent overwhelming destination servers and maintain sender reputation.
-
-## Getting Started
-
-### Prerequisites
-
-- Rust toolchain (1.70 or later)
-- A domain name (for DKIM setup)
-
-### Installation
-
-1. Clone the repository:
-
-   ```bash
-   git clone https://github.com/iamd3vil/hedwig.git
-   cd hedwig
-   ```
-
-2. Build the project:
-
-   ```bash
-   cargo build --release
-   ```
-
-3. Create a configuration file (config.toml):
-
-   ```toml
-   [server]
-   workers = 4          # Number of worker threads
-   pool_size = 100      # Outbund Connection pool size
-   max_retries = 5      # Maximum number of retries for deferred emails (Default is 5)
-
-   # Configure multiple listeners - each can be plaintext or TLS
-   [[server.listeners]]
-   addr = "0.0.0.0:25"  # Plaintext SMTP listener
-
-   [[server.listeners]]
-   addr = "0.0.0.0:465" # TLS SMTP listener
-   [server.listeners.tls]
-   cert_path = "/path/to/cert.pem"
-   key_path = "/path/to/key.pem"
-
-   # Optional SMTP authentication
-   [[server.auth]]
-   username = "your_username"
-   password = "your_password"
-
-   # Optional DKIM configuration
-   [server.dkim]
-   domain = "yourdomain.com"
-   selector = "default"
-   private_key = "/path/to/dkim/private.key"
-
-   # Optional rate limiting configuration
-   [server.rate_limits]
-   enabled = true
-   default_limit = 60  # emails per minute
-
-   # Domain-specific rate limits
-   [server.rate_limits.domain_limits]
-   "gmail.com" = 30
-   "outlook.com" = 25
-
-   [storage]
-   storage_type = "fs"
-   base_path = "/var/lib/hedwig/mail"
-
-   # Optional spool retention policy
-   [storage.cleanup]
-   bounced_retention = "7d"
-   deferred_retention = "2d"
-   interval = "1h"
-   ```
-
-4. Run the server:
-   ```bash
-   HEDWIG_LOG_LEVEL=info ./target/release/hedwig
-   ```
-
-## Configuration
-
-For detailed configuration information, see:
-- [Configuration Guide](docs/CONFIGURATION.md) - Complete configuration reference
-
-### Server Configuration
-
-- `workers`: Number of worker threads (optional)
-- `pool_size`: Maximum number of concurrent connections (optional)  
-- `disable_outbound`: Disable outbound email delivery (optional)
-- `outbound_local`: Only allow local outbound delivery (optional)
-
-### Listeners Configuration
-
-You can configure multiple listeners, each with their own address and optional TLS configuration:
-
-```toml
-# Plaintext listener on port 25
-[[server.listeners]]
-addr = "0.0.0.0:25"
-
-# TLS listener on port 465
-[[server.listeners]]
-addr = "0.0.0.0:465"
-[server.listeners.tls]
-cert_path = "/path/to/cert.pem"
-key_path = "/path/to/key.pem"
-
-# Another plaintext listener on a different port
-[[server.listeners]]
-addr = "127.0.0.1:2525"
-```
-
-Each listener can be configured independently:
-- `addr`: Server address and port for this listener
-- `tls`: Optional TLS configuration for this specific listener
-
-### Authentication (Optional)
-
-Multiple users can be configured for SMTP authentication. Just add multiple `[[server.auth]]` sections to the configuration file.
-
-```toml
-[[server.auth]]
-username = "your_username"
-password = "your_password"
-```
-
-### Storage Configuration
-
-```toml
-[storage]
-storage_type = "filesystem"  # Currently only filesystem storage is supported
-base_path = "/var/lib/hedwig/mail"
-
-# Optional retention policy for local spool cleanup
-[storage.cleanup]
-bounced_retention = "7d"      # Remove bounced messages after 7 days
-deferred_retention = "2d"     # Remove deferred entries after 2 days
-interval = "1h"               # Run cleanup task hourly
-```
-
-- `storage.cleanup` is optional; omit keys you do not want enforced
-- `bounced_retention` controls how long bounced messages remain on disk
-- `deferred_retention` sets retention for deferred queue entries and metadata
-- `interval` dictates how often the cleanup task runs (default: 1h)
-
-## DKIM Setup
-
-DKIM (DomainKeys Identified Mail) allows receiving mail servers to verify that emails were sent by an authorized sender.
-
-### Generating DKIM Keys
-
-1. Configure DKIM in config.toml:
-   ```toml
-   [server.dkim]
-   domain = "yourdomain.com"
-   selector = "default"
-   private_key = "/path/to/dkim/private.key"
-   ```
-
-2. Generate DKIM keys using the built-in command:
-
-   ```bash
-   ./target/release/hedwig dkim-generate
-   ```
-
-   Or use command line flags to override config settings:
-
-   ```bash
-   ./target/release/hedwig dkim-generate --domain yourdomain.com --selector default --private-key /path/to/dkim/private.key --key-type rsa
-   ```
-
-   Available flags:
-   - `--domain`: Domain for DKIM signature
-   - `--selector`: DKIM selector  
-   - `--private-key`: Path to save the private key
-   - `--key-type`: Key type (rsa or ed25519, default: rsa)
-
-   This will:
-   - Generate a new key pair (RSA 2048-bit by default, or Ed25519 if specified)
-   - Save the private key to the configured or specified path
-   - Output the DNS TXT record you need to add
-
-3. Add the DNS TXT record to your domain:
-
-   The command will output a record like:
-   ```
-   default._domainkey.yourdomain.com. IN TXT "v=DKIM1; k=rsa; p=[public_key]"
-   ```
-
-   Add this record to your DNS configuration. Replace the `[public_key]` placeholder with the actual base64-encoded public key shown in the output.
-
-## Rate Limiting
-
-Hedwig supports per-domain rate limiting to prevent overwhelming destination SMTP servers and maintain good sender reputation. This feature uses a token bucket algorithm for smooth rate control.
-
-### Basic Rate Limiting
-
-Enable rate limiting with default settings:
-
-```toml
-[server.rate_limits]
-enabled = true
-default_limit = 60  # 60 emails per minute for all domains
-```
-
-### Domain-Specific Limits
-
-Configure different limits for specific domains:
-
-```toml
-[server.rate_limits]
-enabled = true
-default_limit = 60
-
-[server.rate_limits.domain_limits]
-"gmail.com" = 30        # Limit Gmail to 30 emails/minute
-"outlook.com" = 25      # Limit Outlook to 25 emails/minute
-"internal.com" = 200    # Higher limit for internal domains
-```
-
-### Rate Limiting Benefits
-
-- **Prevents Blocks**: Avoids being rate-limited by destination servers
-- **Maintains Reputation**: Helps maintain good sender reputation
-- **Configurable**: Fine-tune limits for different providers
-- **Non-Blocking**: Workers handle other emails while rate-limited emails wait
-
-For detailed rate limiting configuration and examples, see the [Configuration Guide](docs/CONFIGURATION.md) and [Example Configurations](examples/).
-
-## Metrics
-
-Hedwig exposes Prometheus-compatible metrics over HTTP when configured.
-
-### Enable Metrics
-
-```toml
-[server.metrics]
-bind = "0.0.0.0:9090"  # HTTP listener for /metrics
-```
-
-- Endpoint: `GET /metrics` on the configured `bind` address
-- Protocol: plain HTTP (place behind a firewall or reverse proxy if exposed)
-- Disable by omission: remove `[server.metrics]` to turn it off
-
-### Quick Check
+Download the latest release binary from GitHub Releases:
 
 ```bash
-curl -s http://localhost:9090/metrics | head
+curl -L -o hedwig.zip https://github.com/iamd3vil/hedwig/releases/download/v0.5.2/hedwig-v0.5.2-linux-x86_64.zip
+unzip hedwig.zip
+chmod +x hedwig
 ```
 
-### Prometheus Scrape
+Checksums:
 
-```yaml
-scrape_configs:
-  - job_name: "hedwig"
-    static_configs:
-      - targets: ["hedwig-host:9090"]
+```
+https://github.com/iamd3vil/hedwig/releases/download/v0.5.2/checksums.txt
 ```
 
-### Exported Metrics
+## Build from source
 
-- `hedwig_queue_depth`: number of emails currently queued
-- `hedwig_retry_attempts_total`: total retry attempts scheduled
-- `hedwig_connection_pool_entries`: cached SMTP transports in pool
-- `hedwig_dkim_signing_latency_seconds`: DKIM signing latency histogram
-- `hedwig_emails_received_total`: emails accepted by the server
-- `hedwig_emails_sent_total`: emails successfully delivered upstream
-- `hedwig_emails_deferred_total`: emails deferred for retry
-- `hedwig_emails_bounced_total`: emails permanently bounced
-- `hedwig_emails_dropped_total`: emails dropped without delivery attempt
-- `hedwig_worker_jobs_processed_total`: worker jobs processed
-- `hedwig_worker_job_duration_seconds`: job processing time histogram
-- `hedwig_send_latency_seconds{domain}`: upstream handoff latency by domain
-- `hedwig_send_attempts_total{domain,status}`: send attempts by domain and outcome (`success|failure`)
-
-## Environment Variables
-
-- `HEDWIG_LOG_LEVEL`: Set logging level (error, warn, info, debug, trace)
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+```bash
+git clone https://github.com/iamd3vil/hedwig.git
+cd hedwig
+cargo build --release
+```
 
 ## License
 
-This project is licensed under the AGPL v3 License - see the LICENSE file for details.
+AGPL v3. See `LICENSE`.
