@@ -1,6 +1,6 @@
 use crate::config::DkimKeyType;
 use async_channel::Receiver;
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use email_address_parser::EmailAddress;
 use hickory_resolver::{
     lookup::MxLookup,
@@ -59,6 +59,23 @@ fn fmt_option<T: std::fmt::Display>(opt: Option<T>) -> String {
         Some(v) => v.to_string(),
         None => String::new(),
     }
+}
+
+fn fmt_rfc3339(ts: DateTime<Utc>) -> String {
+    ts.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn fmt_option_rfc3339(opt: Option<DateTime<Utc>>) -> String {
+    opt.map(fmt_rfc3339).unwrap_or_default()
+}
+
+fn calc_delay_ms(queued_at: Option<DateTime<Utc>>, logged_at: DateTime<Utc>) -> Option<i64> {
+    queued_at.map(|queued| {
+        logged_at
+            .signed_duration_since(queued)
+            .num_milliseconds()
+            .max(0)
+    })
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -231,6 +248,8 @@ impl Worker {
         let subject = msg.subject().map(|s| s.to_string());
 
         if self.disable_outbound {
+            let logged_at = Utc::now();
+            let delay_ms = calc_delay_ms(email.queued_at, logged_at);
             info!(
                 job_id = %job.job_id,
                 from_email = %strip_brackets(&email.from),
@@ -238,8 +257,9 @@ impl Worker {
                 subject = %fmt_option(subject.as_deref()),
                 status = "dropped",
                 smtp_response = "outbound disabled",
-                queued_at = %fmt_option(email.queued_at),
-                logged_at = %Utc::now(),
+                queued_at = %fmt_option_rfc3339(email.queued_at),
+                logged_at = %fmt_rfc3339(logged_at),
+                delay_ms = %fmt_option(delay_ms),
                 attempt = %job.attempts,
                 "email delivery"
             );
@@ -271,6 +291,8 @@ impl Worker {
                 Some(Error::UnexpectedReply(resp)) => {
                     if Self::is_retryable(resp.code()) {
                         let smtp_response = format!("{} {}", resp.code(), resp.message());
+                        let logged_at = Utc::now();
+                        let delay_ms = calc_delay_ms(email.queued_at, logged_at);
                         info!(
                             job_id = %job.job_id,
                             from_email = %strip_brackets(&email.from),
@@ -278,8 +300,9 @@ impl Worker {
                             subject = %fmt_option(subject.as_deref()),
                             status = "deferred",
                             smtp_response = %smtp_response,
-                            queued_at = %fmt_option(email.queued_at),
-                            logged_at = %Utc::now(),
+                            queued_at = %fmt_option_rfc3339(email.queued_at),
+                            logged_at = %fmt_rfc3339(logged_at),
+                            delay_ms = %fmt_option(delay_ms),
                             attempt = %(job.attempts + 1),
                             "email delivery"
                         );
@@ -288,6 +311,8 @@ impl Worker {
                     Ok(())
                 }
                 _ => {
+                    let logged_at = Utc::now();
+                    let delay_ms = calc_delay_ms(email.queued_at, logged_at);
                     info!(
                         job_id = %job.job_id,
                         from_email = %strip_brackets(&email.from),
@@ -295,8 +320,9 @@ impl Worker {
                         subject = %fmt_option(subject.as_deref()),
                         status = "bounced",
                         smtp_response = %format!("{:#}", e),
-                        queued_at = %fmt_option(email.queued_at),
-                        logged_at = %Utc::now(),
+                        queued_at = %fmt_option_rfc3339(email.queued_at),
+                        logged_at = %fmt_rfc3339(logged_at),
+                        delay_ms = %fmt_option(delay_ms),
                         attempt = %job.attempts,
                         "email delivery"
                     );
@@ -543,6 +569,8 @@ impl Worker {
                             send_start.elapsed(),
                         );
                         let smtp_response = response.message().collect::<Vec<_>>().join(" ");
+                        let logged_at = Utc::now();
+                        let delay_ms = calc_delay_ms(ctx.stored_email.queued_at, logged_at);
                         info!(
                             job_id = %ctx.job_id,
                             from_email = %strip_brackets(&ctx.stored_email.from),
@@ -551,8 +579,9 @@ impl Worker {
                             status = "delivered",
                             smtp_response = %format!("{} {}", response.code(), smtp_response),
                             dest_ip = %exchange,
-                            queued_at = %fmt_option(ctx.stored_email.queued_at),
-                            logged_at = %Utc::now(),
+                            queued_at = %fmt_option_rfc3339(ctx.stored_email.queued_at),
+                            logged_at = %fmt_rfc3339(logged_at),
+                            delay_ms = %fmt_option(delay_ms),
                             attempt = %ctx.attempt,
                             "email delivery"
                         );
