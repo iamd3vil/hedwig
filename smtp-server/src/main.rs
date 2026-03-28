@@ -21,6 +21,7 @@ mod config;
 mod dkim;
 mod health;
 mod metrics;
+mod mta_sts;
 mod storage;
 mod worker;
 
