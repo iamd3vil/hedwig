@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use moka::future::Cache;
+use moka::{future::Cache, Expiry};
 use tracing::{debug, info, warn};
 
 use super::fetcher::MtaStsFetcher;
@@ -10,6 +10,20 @@ use crate::metrics;
 const CACHE_CAPACITY: u64 = 10_000;
 const FETCH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
+/// Moka expiry that uses each policy's `max_age` as the TTL.
+struct PolicyExpiry;
+
+impl Expiry<String, CachedPolicy> for PolicyExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &CachedPolicy,
+        _created_at: Instant,
+    ) -> Option<Duration> {
+        Some(Duration::from_secs(value.policy.max_age))
+    }
+}
+
 pub struct MtaStsResolver {
     fetcher: MtaStsFetcher,
     cache: Cache<String, CachedPolicy>,
@@ -18,7 +32,10 @@ pub struct MtaStsResolver {
 
 impl MtaStsResolver {
     pub fn new(fetcher: MtaStsFetcher) -> Self {
-        let cache = Cache::builder().max_capacity(CACHE_CAPACITY).build();
+        let cache = Cache::builder()
+            .max_capacity(CACHE_CAPACITY)
+            .expire_after(PolicyExpiry)
+            .build();
         let failure_cooldowns = Cache::builder()
             .max_capacity(CACHE_CAPACITY)
             .time_to_live(FETCH_FAILURE_COOLDOWN)

@@ -126,6 +126,10 @@ pub fn parse_policy(policy_body: &str) -> Result<MtaStsPolicy, PolicyParseError>
                 let parsed_max_age = value
                     .parse::<u64>()
                     .map_err(|_| PolicyParseError::InvalidMaxAge(value.to_string()))?;
+                // RFC 8461 §3.2: maximum value of 31557600 (~1 year).
+                if parsed_max_age > 31_557_600 {
+                    return Err(PolicyParseError::InvalidMaxAge(value.to_string()));
+                }
                 max_age = Some(parsed_max_age);
             }
             "mx" => {
@@ -306,6 +310,25 @@ mod tests {
                 .unwrap_err();
 
         assert_eq!(err, PolicyParseError::InvalidMaxAge("soon".into()));
+    }
+
+    #[test]
+    fn parse_policy_rejects_max_age_exceeding_limit() {
+        // RFC 8461 §3.2: max value is 31557600 (~1 year)
+        let err = parse_policy(
+            "version: STSv1\nmode: enforce\nmx: mail.example.com\nmax_age: 31557601",
+        )
+        .unwrap_err();
+        assert_eq!(err, PolicyParseError::InvalidMaxAge("31557601".into()));
+    }
+
+    #[test]
+    fn parse_policy_accepts_max_age_at_limit() {
+        let policy = parse_policy(
+            "version: STSv1\nmode: enforce\nmx: mail.example.com\nmax_age: 31557600",
+        )
+        .unwrap();
+        assert_eq!(policy.max_age, 31_557_600);
     }
 
     #[test]

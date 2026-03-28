@@ -145,6 +145,20 @@ impl MtaStsFetcher {
             }
         }
 
+        // Pre-check Content-Length to avoid downloading oversized responses.
+        if let Some(content_length) = response.content_length() {
+            if content_length as usize > MAX_POLICY_SIZE_BYTES {
+                warn!(
+                    domain = %domain,
+                    url = %url,
+                    content_length,
+                    max_size = MAX_POLICY_SIZE_BYTES,
+                    "MTA-STS policy Content-Length exceeds size limit, skipping download"
+                );
+                return Ok(None);
+            }
+        }
+
         let body = match response.bytes().await {
             Ok(body) => body,
             Err(error) => {
@@ -153,6 +167,7 @@ impl MtaStsFetcher {
             }
         };
 
+        // Also check actual body size (Content-Length may be absent or wrong).
         if body.len() > MAX_POLICY_SIZE_BYTES {
             warn!(
                 domain = %domain,

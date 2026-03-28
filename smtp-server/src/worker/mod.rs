@@ -667,10 +667,13 @@ impl Worker {
             }
 
             if !success {
-                // If MTA-STS enforce mode caused all MXes to be skipped,
-                // return a specific error so process_job defers instead of bouncing.
+                // If MTA-STS enforce mode caused all MXes to be skipped by policy
+                // (no transport-level errors), return a specific error so process_job
+                // defers instead of bouncing. If there was a transport error (last_error
+                // is Some), that means at least one MX passed policy validation but
+                // failed at SMTP level — use the normal error path.
                 if let Some(ref policy) = mta_sts_policy {
-                    if policy.mode == PolicyMode::Enforce {
+                    if policy.mode == PolicyMode::Enforce && last_error.is_none() {
                         error!(to = ?to, "MTA-STS enforce: all MX hosts failed policy validation");
                         metrics::record_send_failure(parsed_email_id.get_domain());
                         return Err(MtaStsEnforcementError {
