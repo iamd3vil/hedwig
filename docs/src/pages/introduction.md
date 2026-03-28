@@ -26,7 +26,7 @@ Configuration is supported in TOML (default) and HUML formats.
 - Fast and efficient processing with an async core.
 - Persistent queue for reliability across restarts.
 - Forward-only behavior focused on delivery.
-- DKIM, TLS, and SMTP authentication support.
+- DKIM, TLS, MTA-STS (RFC 8461), and SMTP authentication support.
 - Per-domain rate limiting to protect sender reputation.
 
 ## Where to go next

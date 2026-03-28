@@ -31,3 +31,6 @@ curl -s http://localhost:9090/metrics | head
 - `hedwig_emails_sent_total`
 - `hedwig_worker_jobs_processed_total`
 - `hedwig_send_attempts_total{domain,status}`
+- `hedwig_mta_sts_policy_fetch_total{result}`
+- `hedwig_mta_sts_enforcement_total{mode,result}`
+- `hedwig_mta_sts_cache_size`

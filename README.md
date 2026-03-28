@@ -15,6 +15,17 @@
 
 ---
 
+## Features
+
+- Async SMTP relay with persistent filesystem queue
+- DKIM signing (RSA and Ed25519)
+- MTA-STS (RFC 8461) — automatic TLS policy enforcement for outbound delivery
+- SMTP authentication (multiple users)
+- TLS/STARTTLS support with multiple listeners
+- Per-domain rate limiting
+- Prometheus metrics and health checks
+- Domain-based sender/recipient filtering
+
 ## Docs
 
 Documentation lives at https://hedwig.sarat.dev

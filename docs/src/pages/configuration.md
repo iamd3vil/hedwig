@@ -57,6 +57,6 @@ username = "user2"
 password = "password2"
 ```
 
-For advanced sections, see [DKIM](/dkim), [Rate limiting](/rate-limiting), [Metrics](/metrics), [Health checks](/health-checks), [Storage](/storage), and [Domain filtering](/domain-filtering).
+For advanced sections, see [DKIM](/dkim), [MTA-STS](/mta-sts), [Rate limiting](/rate-limiting), [Metrics](/metrics), [Health checks](/health-checks), [Storage](/storage), and [Domain filtering](/domain-filtering).
 
 For a full HUML example, see [HUML configuration example](/reference/huml-example).
