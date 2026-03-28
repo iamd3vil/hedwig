@@ -228,8 +228,18 @@ async fn run_server(config_path: &str) -> Result<()> {
     );
 
     let max_message_size = cfg.server.max_message_size.unwrap_or(25 * 1024 * 1024);
+    let cmd_timeout = cfg
+        .server
+        .cmd_timeout
+        .unwrap_or(std::time::Duration::from_secs(5 * 60));
+    let data_timeout = cfg
+        .server
+        .data_timeout
+        .unwrap_or(std::time::Duration::from_secs(10 * 60));
     let smtp_server = SmtpServer::new(callbacks, auth_enabled)
-        .with_max_message_size(max_message_size);
+        .with_max_message_size(max_message_size)
+        .with_cmd_timeout(cmd_timeout)
+        .with_data_timeout(data_timeout);
 
     // Replay any queued emails so workers process them immediately.
     if !queued_jobs.is_empty() {

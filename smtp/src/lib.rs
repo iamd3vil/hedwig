@@ -8,6 +8,7 @@ use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
 use std::os::unix::io::AsRawFd; // or windows equivalent
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -143,6 +144,10 @@ pub trait SmtpCallbacks: Send + Sync {
 
 /// Default maximum message size: 25 MiB.
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 25 * 1024 * 1024;
+/// Default idle timeout between commands: 5 minutes (RFC 5321).
+const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Default timeout during DATA transfer: 10 minutes.
+const DEFAULT_DATA_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Represents an SMTP server instance.
 #[derive(Clone)]
@@ -157,6 +162,11 @@ pub struct SmtpServer {
 
     // Maximum message size in bytes. Enforced during DATA and advertised via SIZE in EHLO.
     max_message_size: usize,
+
+    // Idle timeout between commands.
+    cmd_timeout: Duration,
+    // Timeout during DATA transfer reads.
+    data_timeout: Duration,
 }
 
 impl SmtpServer {
@@ -176,11 +186,23 @@ impl SmtpServer {
             auth_enabled,
             tls_acceptor: None,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            cmd_timeout: DEFAULT_CMD_TIMEOUT,
+            data_timeout: DEFAULT_DATA_TIMEOUT,
         }
     }
 
     pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
+        self
+    }
+
+    pub fn with_cmd_timeout(mut self, timeout: Duration) -> Self {
+        self.cmd_timeout = timeout;
+        self
+    }
+
+    pub fn with_data_timeout(mut self, timeout: Duration) -> Self {
+        self.data_timeout = timeout;
         self
     }
 
@@ -265,7 +287,20 @@ impl SmtpServer {
         let mut data_buffer = BytesMut::new();
 
         loop {
-            let n = stream.read_buf(&mut buf).await.into_diagnostic()?;
+            let timeout = if session.state == SessionState::ReceivingData {
+                self.data_timeout
+            } else {
+                self.cmd_timeout
+            };
+            let n = match tokio::time::timeout(timeout, stream.read_buf(&mut buf)).await {
+                Ok(result) => result.into_diagnostic()?,
+                Err(_) => {
+                    let _ = stream
+                        .write_line(b"421 4.4.2 Connection timed out\r\n")
+                        .await;
+                    return Ok(());
+                }
+            };
             if n == 0 {
                 return Ok(());
             }
