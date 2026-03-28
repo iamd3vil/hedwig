@@ -72,7 +72,10 @@ async fn refresh_all_policies(resolver: &MtaStsResolver) {
                 ..cached
             };
 
-            resolver.cache().insert(domain.clone(), refreshed_policy).await;
+            resolver
+                .cache()
+                .insert(domain.clone(), refreshed_policy)
+                .await;
             refreshed += 1;
             debug!(%domain, txt_id = %txt_record.id, "MTA-STS TXT id unchanged, extended cache freshness");
             continue;
@@ -96,7 +99,10 @@ async fn refresh_all_policies(resolver: &MtaStsResolver) {
                     fetched_at: Instant::now(),
                 };
 
-                resolver.cache().insert(domain.clone(), refreshed_policy).await;
+                resolver
+                    .cache()
+                    .insert(domain.clone(), refreshed_policy)
+                    .await;
                 refreshed += 1;
                 info!(%domain, %mode, max_age, "refreshed cached MTA-STS policy after TXT id update");
             }
@@ -111,5 +117,8 @@ async fn refresh_all_policies(resolver: &MtaStsResolver) {
         }
     }
 
-    info!(total, refreshed, failures, skipped, "completed MTA-STS policy refresh scan");
+    info!(
+        total,
+        refreshed, failures, skipped, "completed MTA-STS policy refresh scan"
+    );
 }

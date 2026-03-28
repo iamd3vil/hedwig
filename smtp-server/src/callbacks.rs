@@ -8,7 +8,7 @@ use mailparse::MailAddr;
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use hickory_resolver::lookup::MxLookup;
+use hickory_resolver::{lookup::MxLookup, TokioAsyncResolver};
 use moka::{future::Cache, Expiry};
 use smtp::{Email, SmtpCallbacks, SmtpError};
 use tokio::sync::Mutex;
@@ -18,6 +18,7 @@ use ulid::Ulid;
 use crate::{
     config::{Cfg, FilterAction, FilterType},
     constant_time_eq, metrics,
+    mta_sts::{cache::MtaStsResolver, fetcher::MtaStsFetcher},
     storage::{Status, Storage, StoredEmail},
     worker::{self, Job, Worker},
 };
@@ -78,12 +79,20 @@ impl Callbacks {
         sender_channel: async_channel::Sender<Job>,
         receiver_channel: async_channel::Receiver<Job>,
         cfg: Cfg,
-    ) -> (Self, Vec<JoinHandle<()>>) {
+    ) -> (Self, Vec<JoinHandle<()>>, Arc<MtaStsResolver>) {
         let expiry = MXExpiry;
         let mx_cache: Cache<_, _> = Cache::builder()
             .max_capacity(10000)
             .expire_after(expiry)
             .build();
+
+        // Create a shared DNS resolver for workers and MTA-STS.
+        let resolver =
+            TokioAsyncResolver::tokio_from_system_conf().expect("failed to create DNS resolver");
+
+        // Create the shared MTA-STS resolver.
+        let mta_sts_fetcher = MtaStsFetcher::new(resolver.clone());
+        let mta_sts_resolver = Arc::new(MtaStsResolver::new(mta_sts_fetcher));
 
         // Start workers.
         let worker_count = cfg.server.workers.unwrap_or(1).max(1);
@@ -101,6 +110,8 @@ impl Callbacks {
             let dkim = cfg.server.dkim.clone();
             let mx_cache = mx_cache.clone();
             let rate_limit_config = rate_limit_config.clone();
+            let resolver = resolver.clone();
+            let mta_sts = mta_sts_resolver.clone();
             let handle = tokio::spawn(async move {
                 let worker_config = worker::WorkerConfig {
                     disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
@@ -114,6 +125,8 @@ impl Callbacks {
                     &dkim,
                     mx_cache,
                     worker_config,
+                    resolver,
+                    mta_sts,
                 )
                 .await
                 .expect("Failed to create worker");
@@ -138,7 +151,7 @@ impl Callbacks {
             auth_mapping: Mutex::new(auth_mapping),
         };
 
-        (callbacks, worker_handles)
+        (callbacks, worker_handles, mta_sts_resolver)
     }
 
     /// Processes an email by parsing it, storing it, and sending it to a worker.
@@ -456,7 +469,7 @@ mod tests {
         let (sender_channel, receiver_channel) = async_channel::unbounded::<worker::Job>();
         let storage: Arc<dyn Storage> = Arc::new(MockStorage);
 
-        let (callbacks, worker_handles) =
+        let (callbacks, worker_handles, _mta_sts_resolver) =
             Callbacks::new(storage, sender_channel, receiver_channel, cfg);
         for handle in worker_handles {
             // These handles outlive the test scope; aborting avoids leaking tasks into
@@ -885,7 +898,8 @@ mod tests {
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
 
-        let (_callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
+        let (_callbacks, worker_handles, _mta_sts_resolver) =
+            Callbacks::new(storage, sender, receiver, cfg);
         for handle in worker_handles {
             // Abort so the spawned worker does not keep running past the test lifetime.
             handle.abort();
@@ -911,7 +925,8 @@ mod tests {
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
 
-        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles, _mta_sts_resolver) =
+            Callbacks::new(storage, sender, receiver, cfg);
         let auth_mapping = callbacks.auth_mapping.lock().await;
         assert_eq!(auth_mapping.get("user1"), Some(&"pass1".to_string()));
         assert_eq!(auth_mapping.get("user2"), Some(&"pass2".to_string()));
@@ -942,7 +957,8 @@ mod tests {
         let cfg = create_test_config();
         let storage = Arc::new(MockStorageWithError {});
         let (sender, receiver) = async_channel::bounded(100);
-        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles, _mta_sts_resolver) =
+            Callbacks::new(storage, sender, receiver, cfg);
 
         let email = Email {
             from: "sender@example.com".to_string(),
@@ -986,7 +1002,8 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles, _mta_sts_resolver) =
+            Callbacks::new(storage, sender, receiver, cfg);
 
         let result = callbacks.on_auth("testuser", "testpass").await;
         assert!(result.is_ok());
@@ -1009,7 +1026,8 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles, _mta_sts_resolver) =
+            Callbacks::new(storage, sender, receiver, cfg);
 
         let result = callbacks.on_auth("wronguser", "testpass").await;
         assert!(result.is_ok());
@@ -1028,7 +1046,8 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles, _mta_sts_resolver) =
+            Callbacks::new(storage, sender, receiver, cfg);
 
         let mail_cmd = create_mail_from_command("sender@example.com");
         let result = callbacks.on_mail_from(&mail_cmd).await;
@@ -1051,7 +1070,8 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles, _mta_sts_resolver) =
+            Callbacks::new(storage, sender, receiver, cfg);
 
         let mail_cmd = create_mail_from_command("invalidpath");
         let result = callbacks.on_mail_from(&mail_cmd).await;
@@ -1070,7 +1090,8 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles, _mta_sts_resolver) =
+            Callbacks::new(storage, sender, receiver, cfg);
 
         let result = callbacks.on_rcpt_to("recipient@example.com").await;
         assert!(result.is_ok());
@@ -1092,7 +1113,8 @@ mod tests {
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
-        let (callbacks, worker_handles) = Callbacks::new(storage, sender, receiver, cfg);
+        let (callbacks, worker_handles, _mta_sts_resolver) =
+            Callbacks::new(storage, sender, receiver, cfg);
 
         let result = callbacks.on_rcpt_to("invalidpath").await;
         assert!(result.is_err());

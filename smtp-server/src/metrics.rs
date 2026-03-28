@@ -263,22 +263,34 @@ pub fn record_send_failure(domain: &str) {
 
 /// Records a successful MTA-STS policy fetch.
 pub fn mta_sts_policy_fetch_success() {
-    METRICS.mta_sts_policy_fetch.with_label_values(&["success"]).inc();
+    METRICS
+        .mta_sts_policy_fetch
+        .with_label_values(&["success"])
+        .inc();
 }
 
 /// Records a failed MTA-STS policy fetch.
 pub fn mta_sts_policy_fetch_failure() {
-    METRICS.mta_sts_policy_fetch.with_label_values(&["failure"]).inc();
+    METRICS
+        .mta_sts_policy_fetch
+        .with_label_values(&["failure"])
+        .inc();
 }
 
 /// Records an MTA-STS policy served from cache.
 pub fn mta_sts_policy_fetch_cached() {
-    METRICS.mta_sts_policy_fetch.with_label_values(&["cached"]).inc();
+    METRICS
+        .mta_sts_policy_fetch
+        .with_label_values(&["cached"])
+        .inc();
 }
 
 /// Records an MTA-STS enforcement decision.
 pub fn mta_sts_enforcement(mode: &str, result: &str) {
-    METRICS.mta_sts_enforcement.with_label_values(&[mode, result]).inc();
+    METRICS
+        .mta_sts_enforcement
+        .with_label_values(&[mode, result])
+        .inc();
 }
 
 /// Updates the MTA-STS cache size gauge.

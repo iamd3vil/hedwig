@@ -6,7 +6,7 @@ use hickory_resolver::{
     lookup::MxLookup,
     name_server::{GenericConnector, TokioRuntimeProvider},
     proto::rr::rdata::MX,
-    AsyncResolver, TokioAsyncResolver,
+    AsyncResolver,
 };
 use lettre::{address::Envelope, Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use mail_auth::{
@@ -27,6 +27,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::fs;
 use tracing::{debug, error, info, warn};
 
+use crate::mta_sts::cache::MtaStsResolver;
+use crate::mta_sts::policy::{self as mta_sts_policy, MtaStsEnforcementError, PolicyMode};
 use crate::{
     config::CfgDKIM,
     metrics,
@@ -120,6 +122,9 @@ pub struct Worker {
 
     /// rate_limiter controls the rate of email sending per domain.
     rate_limiter: RateLimiter,
+
+    /// MTA-STS resolver for looking up and enforcing recipient domain policies.
+    mta_sts: Arc<MtaStsResolver>,
 }
 
 impl Worker {
@@ -129,11 +134,10 @@ impl Worker {
         dkim: &Option<CfgDKIM>,
         mx_cache: Cache<String, MxLookup>,
         config: WorkerConfig,
+        resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
+        mta_sts: Arc<MtaStsResolver>,
     ) -> Result<Self> {
         info!("Initializing SMTP worker");
-        let resolver = TokioAsyncResolver::tokio_from_system_conf()
-            .into_diagnostic()
-            .wrap_err("creating dns resolver")?;
         let pool = PoolManager::new(config.pool_size, config.outbound_local);
 
         // Create DKIM signer if dkim is enabled.
@@ -161,6 +165,7 @@ impl Worker {
             max_delay: Duration::from_secs(60 * 60 * 24),
             dkim_signer,
             rate_limiter: RateLimiter::new(config.rate_limit_config),
+            mta_sts,
         })
     }
 
@@ -287,30 +292,9 @@ impl Worker {
                     .wrap_err("deleting meta file")?;
                 Ok(())
             }
-            Err(e) => match e.downcast_ref::<Error>() {
-                Some(Error::UnexpectedReply(resp)) => {
-                    if Self::is_retryable(resp.code()) {
-                        let smtp_response = format!("{} {}", resp.code(), resp.message());
-                        let logged_at = Utc::now();
-                        let delay_ms = calc_delay_ms(email.queued_at, logged_at);
-                        info!(
-                            job_id = %job.job_id,
-                            from_email = %strip_brackets(&email.from),
-                            recipient = %email.to.iter().map(|s| strip_brackets(s)).collect::<Vec<_>>().join(","),
-                            subject = %fmt_option(subject.as_deref()),
-                            status = "deferred",
-                            smtp_response = %smtp_response,
-                            queued_at = %fmt_option_rfc3339(email.queued_at),
-                            logged_at = %fmt_rfc3339(logged_at),
-                            delay_ms = %fmt_option(delay_ms),
-                            attempt = %(job.attempts + 1),
-                            "email delivery"
-                        );
-                        self.defer_email(job).await?;
-                    }
-                    Ok(())
-                }
-                _ => {
+            Err(e) => {
+                // MTA-STS enforcement failures are always deferred, never bounced.
+                if e.downcast_ref::<MtaStsEnforcementError>().is_some() {
                     let logged_at = Utc::now();
                     let delay_ms = calc_delay_ms(email.queued_at, logged_at);
                     info!(
@@ -318,23 +302,67 @@ impl Worker {
                         from_email = %strip_brackets(&email.from),
                         recipient = %email.to.iter().map(|s| strip_brackets(s)).collect::<Vec<_>>().join(","),
                         subject = %fmt_option(subject.as_deref()),
-                        status = "bounced",
-                        smtp_response = %format!("{:#}", e),
+                        status = "deferred",
+                        smtp_response = "MTA-STS enforcement failure",
                         queued_at = %fmt_option_rfc3339(email.queued_at),
                         logged_at = %fmt_rfc3339(logged_at),
                         delay_ms = %fmt_option(delay_ms),
-                        attempt = %job.attempts,
+                        attempt = %(job.attempts + 1),
                         "email delivery"
                     );
-                    self.storage
-                        .mv(&job.job_id, &job.job_id, Status::Queued, Status::Bounced)
-                        .await
-                        .wrap_err("moving from queued to bounced")?;
-                    metrics::queue_depth_dec();
-                    metrics::email_bounced();
-                    Ok(())
+                    self.defer_email(job).await?;
+                    return Ok(());
                 }
-            },
+
+                match e.downcast_ref::<Error>() {
+                    Some(Error::UnexpectedReply(resp)) => {
+                        if Self::is_retryable(resp.code()) {
+                            let smtp_response = format!("{} {}", resp.code(), resp.message());
+                            let logged_at = Utc::now();
+                            let delay_ms = calc_delay_ms(email.queued_at, logged_at);
+                            info!(
+                                job_id = %job.job_id,
+                                from_email = %strip_brackets(&email.from),
+                                recipient = %email.to.iter().map(|s| strip_brackets(s)).collect::<Vec<_>>().join(","),
+                                subject = %fmt_option(subject.as_deref()),
+                                status = "deferred",
+                                smtp_response = %smtp_response,
+                                queued_at = %fmt_option_rfc3339(email.queued_at),
+                                logged_at = %fmt_rfc3339(logged_at),
+                                delay_ms = %fmt_option(delay_ms),
+                                attempt = %(job.attempts + 1),
+                                "email delivery"
+                            );
+                            self.defer_email(job).await?;
+                        }
+                        Ok(())
+                    }
+                    _ => {
+                        let logged_at = Utc::now();
+                        let delay_ms = calc_delay_ms(email.queued_at, logged_at);
+                        info!(
+                            job_id = %job.job_id,
+                            from_email = %strip_brackets(&email.from),
+                            recipient = %email.to.iter().map(|s| strip_brackets(s)).collect::<Vec<_>>().join(","),
+                            subject = %fmt_option(subject.as_deref()),
+                            status = "bounced",
+                            smtp_response = %format!("{:#}", e),
+                            queued_at = %fmt_option_rfc3339(email.queued_at),
+                            logged_at = %fmt_rfc3339(logged_at),
+                            delay_ms = %fmt_option(delay_ms),
+                            attempt = %job.attempts,
+                            "email delivery"
+                        );
+                        self.storage
+                            .mv(&job.job_id, &job.job_id, Status::Queued, Status::Bounced)
+                            .await
+                            .wrap_err("moving from queued to bounced")?;
+                        metrics::queue_depth_dec();
+                        metrics::email_bounced();
+                        Ok(())
+                    }
+                }
+            }
         }
     }
 
@@ -536,6 +564,12 @@ impl Worker {
             // Sort in place using Rust's standard sort
             mx.sort_by_key(|a| a.preference());
 
+            // Look up MTA-STS policy for the recipient domain.
+            let mta_sts_policy = self.mta_sts.get_policy(domain).await;
+            if let Some(ref policy) = mta_sts_policy {
+                debug!(domain = ?domain, mode = %policy.mode, "MTA-STS policy found");
+            }
+
             let from: String = email
                 .from()
                 .unwrap()
@@ -558,6 +592,39 @@ impl Worker {
                 debug!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
 
                 let exchange = mx_record.exchange().to_string();
+
+                // MTA-STS: validate MX hostname against policy.
+                if let Some(ref policy) = mta_sts_policy {
+                    let mx_valid = mta_sts_policy::mx_matches_policy(&exchange, policy);
+
+                    match policy.mode {
+                        PolicyMode::Enforce => {
+                            if !mx_valid {
+                                warn!(
+                                    domain = ?domain,
+                                    mx = %exchange,
+                                    "MTA-STS enforce: MX host does not match policy, skipping"
+                                );
+                                metrics::mta_sts_enforcement("enforce", "fail");
+                                continue;
+                            }
+                            metrics::mta_sts_enforcement("enforce", "pass");
+                        }
+                        PolicyMode::Testing => {
+                            if !mx_valid {
+                                warn!(
+                                    domain = ?domain,
+                                    mx = %exchange,
+                                    "MTA-STS testing: MX host does not match policy (would be rejected in enforce mode)"
+                                );
+                                metrics::mta_sts_enforcement("testing", "fail");
+                            } else {
+                                metrics::mta_sts_enforcement("testing", "pass");
+                            }
+                        }
+                        PolicyMode::None => {}
+                    }
+                }
                 let transport: AsyncSmtpTransport<Tokio1Executor> =
                     self.pool.get(&exchange).await?;
 
@@ -600,6 +667,19 @@ impl Worker {
             }
 
             if !success {
+                // If MTA-STS enforce mode caused all MXes to be skipped,
+                // return a specific error so process_job defers instead of bouncing.
+                if let Some(ref policy) = mta_sts_policy {
+                    if policy.mode == PolicyMode::Enforce {
+                        error!(to = ?to, "MTA-STS enforce: all MX hosts failed policy validation");
+                        metrics::record_send_failure(parsed_email_id.get_domain());
+                        return Err(MtaStsEnforcementError {
+                            domain: domain.to_string(),
+                        })
+                        .into_diagnostic()
+                        .wrap_err("MTA-STS enforcement failure");
+                    }
+                }
                 error!(to = ?to, "Failed to send email through any MX server");
                 if let Some(err) = last_error {
                     return Err(err);

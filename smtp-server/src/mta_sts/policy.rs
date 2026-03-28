@@ -406,7 +406,8 @@ mod tests {
 
     #[test]
     fn parse_policy_multiple_mx_lines_accumulate() {
-        let body = "version: STSv1\nmode: enforce\nmx: a.example.com\nmx: b.example.com\nmax_age: 100";
+        let body =
+            "version: STSv1\nmode: enforce\nmx: a.example.com\nmx: b.example.com\nmax_age: 100";
         let policy = parse_policy(body).unwrap();
         assert_eq!(policy.mx_patterns, vec!["a.example.com", "b.example.com"]);
     }

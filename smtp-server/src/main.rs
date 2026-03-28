@@ -2,6 +2,7 @@ use clap::Parser;
 use config::CfgStorage;
 use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
+use mta_sts::refresher;
 use rustls::pki_types::CertificateDer;
 use smtp::{SmtpServer, SmtpStream};
 use std::sync::Arc;
@@ -217,7 +218,7 @@ async fn run_server(config_path: &str) -> Result<()> {
 
     info!("Auth enabled: {}", auth_enabled);
 
-    let (callbacks, worker_handles) = callbacks::Callbacks::new(
+    let (callbacks, worker_handles, mta_sts_resolver) = callbacks::Callbacks::new(
         Arc::clone(&storage),
         sender_channel.clone(),
         receiver_channel.clone(),
@@ -256,6 +257,15 @@ async fn run_server(config_path: &str) -> Result<()> {
         }
     });
     background_tasks.push(deferred_handle);
+
+    // Start the MTA-STS background policy refresher.
+    let mta_sts_shutdown = shutdown_token.clone();
+    let mta_sts_for_refresh = Arc::clone(&mta_sts_resolver);
+    let mta_sts_handle = tokio::spawn(async move {
+        refresher::run_refresh_loop(mta_sts_for_refresh, mta_sts_shutdown).await;
+    });
+    background_tasks.push(mta_sts_handle);
+    info!("MTA-STS policy enforcement enabled");
 
     // Create listeners for each configured address
     let mut listeners = Vec::new();
