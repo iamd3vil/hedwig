@@ -5,6 +5,7 @@ use tracing::{debug, info, warn};
 
 use super::fetcher::MtaStsFetcher;
 use super::policy::{CachedPolicy, MtaStsPolicy};
+use crate::metrics;
 
 const CACHE_CAPACITY: u64 = 10_000;
 const FETCH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
@@ -45,6 +46,7 @@ impl MtaStsResolver {
         if let Some(cached) = self.cache.get(&domain).await {
             if cached.txt_id == txt_record.id {
                 debug!(%domain, txt_id = %txt_record.id, "MTA-STS cache hit with matching TXT id");
+                metrics::mta_sts_policy_fetch_cached();
                 return Some(cached.policy.clone());
             }
         }
@@ -64,9 +66,12 @@ impl MtaStsResolver {
 
                 info!(%domain, mode = %policy.mode, max_age = policy.max_age, "cached MTA-STS policy");
                 self.cache.insert(domain, cached_policy).await;
+                metrics::mta_sts_policy_fetch_success();
+                metrics::mta_sts_cache_size_set(self.cache.entry_count());
                 Some(policy)
             }
             Ok(None) => {
+                metrics::mta_sts_policy_fetch_failure();
                 self.failure_cooldowns
                     .insert(domain.clone(), Instant::now())
                     .await;
@@ -74,6 +79,7 @@ impl MtaStsResolver {
             }
             Err(error) => {
                 warn!(%domain, ?error, "failed to fetch MTA-STS policy");
+                metrics::mta_sts_policy_fetch_failure();
                 self.failure_cooldowns
                     .insert(domain.clone(), Instant::now())
                     .await;
