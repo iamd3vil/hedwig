@@ -1,8 +1,14 @@
-use std::{sync::Arc, time::SystemTime};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use async_channel::Sender;
 use futures::StreamExt;
 use miette::{Context, IntoDiagnostic, Result};
+use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
 use crate::{
     metrics,
@@ -12,6 +18,9 @@ use crate::{
 use super::{EmailMetadata, Job};
 
 const DEFAULT_MAX_RETRIES: u32 = 5;
+
+/// How often the deferred worker scans for jobs ready to retry.
+const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct DeferredWorker {
     storage: Arc<dyn Storage>,
@@ -31,8 +40,40 @@ impl DeferredWorker {
         }
     }
 
-    pub async fn process_deferred_jobs(&self) -> Result<()> {
-        println!("[*] Processing deferred jobs...");
+    /// Run the deferred worker loop, scanning for retryable jobs every 30 seconds.
+    ///
+    /// Runs until the `shutdown` token is cancelled.
+    pub async fn run(&self, shutdown: CancellationToken) {
+        info!("deferred worker started (scan interval: {}s)", SCAN_INTERVAL.as_secs());
+
+        // Run an initial scan immediately on startup.
+        if let Err(e) = self.process_deferred_jobs().await {
+            error!("error during initial deferred job scan: {:#}", e);
+        }
+
+        let mut interval = tokio::time::interval(SCAN_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Skip the first immediate tick since we already did an initial scan.
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("deferred worker shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    if let Err(e) = self.process_deferred_jobs().await {
+                        error!("error scanning deferred jobs: {:#}", e);
+                    }
+                }
+            }
+        }
+
+        info!("deferred worker stopped");
+    }
+
+    async fn process_deferred_jobs(&self) -> Result<()> {
         let mut stream = self.storage.list_meta();
 
         while let Some(entry) = stream.next().await {

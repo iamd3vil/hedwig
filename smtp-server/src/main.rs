@@ -246,15 +246,14 @@ async fn run_server(config_path: &str) -> Result<()> {
         info!("no queued jobs found on startup");
     }
 
-    // Start the deferred worker.
+    // Start the deferred worker (periodic retry loop).
     let deferred_storage = Arc::clone(&storage);
     let deferred_sender = sender_channel.clone();
     let max_retries = cfg.server.max_retries;
+    let deferred_shutdown = shutdown_token.clone();
     let deferred_handle = tokio::spawn(async move {
         let worker = DeferredWorker::new(deferred_storage, deferred_sender, max_retries);
-        if let Err(e) = worker.process_deferred_jobs().await {
-            error!("Error running deferred worker: {:#}", e);
-        }
+        worker.run(deferred_shutdown).await;
     });
     background_tasks.push(deferred_handle);
 
