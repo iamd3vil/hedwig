@@ -45,6 +45,13 @@ pub struct CfgServer {
     pub rate_limits: Option<CfgRateLimits>,
     pub metrics: Option<CfgMetrics>,
     pub health: Option<CfgHealth>,
+    pub queue_buffer: Option<usize>,
+    pub max_connections: Option<usize>,
+    pub max_message_size: Option<usize>,
+    #[serde(default, with = "humantime_serde::option")]
+    pub cmd_timeout: Option<Duration>,
+    #[serde(default, with = "humantime_serde::option")]
+    pub data_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
