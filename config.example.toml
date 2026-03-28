@@ -11,6 +11,10 @@ max_retries = 5          # Maximum number of retries for deferred emails (option
 disable_outbound = false # Disable outbound email delivery (optional)
 outbound_local = false   # Only allow local outbound delivery (optional)
 
+# MTA-STS (RFC 8461) is always active for outbound delivery.
+# Hedwig automatically looks up and enforces recipient domain TLS policies.
+# No configuration needed — it degrades gracefully if recipients don't publish policies.
+
 # Optional Prometheus metrics endpoint
 [server.metrics]
 bind = "0.0.0.0:9090"
