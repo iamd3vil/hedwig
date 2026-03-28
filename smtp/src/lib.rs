@@ -141,6 +141,9 @@ pub trait SmtpCallbacks: Send + Sync {
     async fn on_data(&self, email: &Email) -> Result<(), SmtpError>;
 }
 
+/// Default maximum message size: 25 MiB.
+const DEFAULT_MAX_MESSAGE_SIZE: usize = 25 * 1024 * 1024;
+
 /// Represents an SMTP server instance.
 #[derive(Clone)]
 pub struct SmtpServer {
@@ -151,6 +154,9 @@ pub struct SmtpServer {
 
     // TLS acceptor for handling encrypted connections.
     tls_acceptor: Option<TlsAcceptor>,
+
+    // Maximum message size in bytes. Enforced during DATA and advertised via SIZE in EHLO.
+    max_message_size: usize,
 }
 
 impl SmtpServer {
@@ -169,7 +175,13 @@ impl SmtpServer {
             callbacks: Arc::new(callbacks),
             auth_enabled,
             tls_acceptor: None,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         }
+    }
+
+    pub fn with_max_message_size(mut self, size: usize) -> Self {
+        self.max_message_size = size;
+        self
     }
 
     pub fn with_tls(
@@ -263,6 +275,16 @@ impl SmtpServer {
                 data_buffer.extend_from_slice(&buf[..]);
                 buf.clear();
 
+                // Enforce message size limit.
+                if data_buffer.len() > self.max_message_size {
+                    stream
+                        .write_line(b"552 5.3.4 Message too big\r\n")
+                        .await?;
+                    data_buffer.clear();
+                    session.state = SessionState::Authenticated;
+                    continue;
+                }
+
                 let mut termination_found = false;
                 for pos in memchr::memchr_iter(b'\r', &data_buffer) {
                     if pos + 5 <= data_buffer.len() && &data_buffer[pos..pos + 5] == b"\r\n.\r\n" {
@@ -337,6 +359,7 @@ impl SmtpServer {
             (SessionState::Connected, SmtpCommand::Ehlo(domain)) => {
                 self.callbacks.on_ehlo(&domain).await?;
                 let mut response = String::from("250-localhost\r\n");
+                response.push_str(&format!("250-SIZE {}\r\n", self.max_message_size));
                 if self.tls_acceptor.is_some() {
                     response.push_str("250-STARTTLS\r\n");
                 }

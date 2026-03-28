@@ -227,7 +227,9 @@ async fn run_server(config_path: &str) -> Result<()> {
         cfg.clone(),
     );
 
-    let smtp_server = SmtpServer::new(callbacks, auth_enabled);
+    let max_message_size = cfg.server.max_message_size.unwrap_or(25 * 1024 * 1024);
+    let smtp_server = SmtpServer::new(callbacks, auth_enabled)
+        .with_max_message_size(max_message_size);
 
     // Replay any queued emails so workers process them immediately.
     if !queued_jobs.is_empty() {
