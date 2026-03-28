@@ -28,6 +28,9 @@ struct MetricsHandles {
     worker_job_duration: Histogram,
     send_latency: HistogramVec,
     send_outcomes: IntCounterVec,
+    mta_sts_policy_fetch: IntCounterVec,
+    mta_sts_enforcement: IntCounterVec,
+    mta_sts_cache_size: IntGauge,
 }
 
 /// Global registry for all metrics exposed by the server.
@@ -102,6 +105,23 @@ static METRICS: Lazy<MetricsHandles> = Lazy::new(|| MetricsHandles {
         &["domain", "status"]
     )
     .expect("register hedwig_send_attempts_total counter vec"),
+    mta_sts_policy_fetch: register_int_counter_vec!(
+        "hedwig_mta_sts_policy_fetch_total",
+        "Total MTA-STS policy fetch attempts by result.",
+        &["result"]
+    )
+    .expect("register hedwig_mta_sts_policy_fetch_total counter vec"),
+    mta_sts_enforcement: register_int_counter_vec!(
+        "hedwig_mta_sts_enforcement_total",
+        "Total MTA-STS enforcement decisions by mode and result.",
+        &["mode", "result"]
+    )
+    .expect("register hedwig_mta_sts_enforcement_total counter vec"),
+    mta_sts_cache_size: register_int_gauge!(
+        "hedwig_mta_sts_cache_size",
+        "Number of MTA-STS policies currently cached."
+    )
+    .expect("register hedwig_mta_sts_cache_size gauge"),
 });
 
 const STATUS_SUCCESS: &str = "success";
@@ -239,6 +259,31 @@ pub fn record_send_failure(domain: &str) {
         .send_outcomes
         .with_label_values(&[normalized.as_str(), STATUS_FAILURE])
         .inc();
+}
+
+/// Records a successful MTA-STS policy fetch.
+pub fn mta_sts_policy_fetch_success() {
+    METRICS.mta_sts_policy_fetch.with_label_values(&["success"]).inc();
+}
+
+/// Records a failed MTA-STS policy fetch.
+pub fn mta_sts_policy_fetch_failure() {
+    METRICS.mta_sts_policy_fetch.with_label_values(&["failure"]).inc();
+}
+
+/// Records an MTA-STS policy served from cache.
+pub fn mta_sts_policy_fetch_cached() {
+    METRICS.mta_sts_policy_fetch.with_label_values(&["cached"]).inc();
+}
+
+/// Records an MTA-STS enforcement decision.
+pub fn mta_sts_enforcement(mode: &str, result: &str) {
+    METRICS.mta_sts_enforcement.with_label_values(&[mode, result]).inc();
+}
+
+/// Updates the MTA-STS cache size gauge.
+pub fn mta_sts_cache_size_set(size: u64) {
+    METRICS.mta_sts_cache_size.set(size as i64);
 }
 
 /// Spawns the HTTP server that exposes Prometheus-compatible metrics.
