@@ -25,6 +25,7 @@ futures = "0.3.30"
 async-stream = "0.3.6"
 email-address-parser = "2.0.0"
 hickory-resolver = "0.24.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 mail-send = "0.4.9"
 tokio-rustls = { version = "0.26.0", features = [
     "ring",
