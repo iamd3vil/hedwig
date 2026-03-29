@@ -34,14 +34,5 @@ username = "test"
 password = "test"
 
 [storage]
-storage_type = "sqlite"
+storage_type = "fs"
 base_path = "/tmp/hedwig-dev/"
-num_shards = 16
-batch_size = 100
-batch_timeout_ms = 5
-
-[storage.sqlite]
-synchronous = "NORMAL"
-cache_size_mb = 1600
-busy_timeout_ms = 5000
-pool_max_connections = 4
