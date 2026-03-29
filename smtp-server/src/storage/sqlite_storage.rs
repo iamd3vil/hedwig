@@ -273,6 +273,7 @@ async fn process_write_batch(
                     if !batch_failed {
                         batch_failed = true;
                         batch_error = Some(format!("Put failed: {}", e));
+                        break;
                     }
                 }
             }
@@ -303,6 +304,7 @@ async fn process_write_batch(
                     if !batch_failed {
                         batch_failed = true;
                         batch_error = Some(format!("PutMeta failed: {}", e));
+                        break;
                     }
                 }
             }
@@ -320,6 +322,7 @@ async fn process_write_batch(
                     if !batch_failed {
                         batch_failed = true;
                         batch_error = Some(format!("Delete failed: {}", e));
+                        break;
                     }
                 }
             }
@@ -337,6 +340,7 @@ async fn process_write_batch(
                     if !batch_failed {
                         batch_failed = true;
                         batch_error = Some(format!("DeleteMeta failed: {}", e));
+                        break;
                     }
                 }
             }
@@ -357,6 +361,7 @@ async fn process_write_batch(
                     if !batch_failed {
                         batch_failed = true;
                         batch_error = Some(format!("Mv failed: {}", e));
+                        break;
                     }
                 }
             }
@@ -376,6 +381,7 @@ async fn process_write_batch(
                         if !batch_failed {
                             batch_failed = true;
                             batch_error = Some(format!("Cleanup bounced failed: {}", e));
+                            break;
                         }
                     }
                 }
@@ -393,6 +399,7 @@ async fn process_write_batch(
                         if !batch_failed {
                             batch_failed = true;
                             batch_error = Some(format!("Cleanup deferred failed: {}", e));
+                            break;
                         }
                     }
                 }
@@ -555,13 +562,16 @@ impl Storage for SqliteStorage {
         let shard = self.shard_for(src_key);
         // If dest_key hashes to a different shard, the row becomes unreachable.
         // All current callers pass src_key == dest_key, so this is a safety net.
-        debug_assert_eq!(
-            shard,
-            self.shard_for(dest_key),
-            "mv across shards is not supported: src_key={} dest_key={}",
-            src_key,
-            dest_key
-        );
+        let dest_shard = self.shard_for(dest_key);
+        if shard != dest_shard {
+            return Err(miette::miette!(
+                "mv across shards is not supported: src_key={} (shard {}) dest_key={} (shard {})",
+                src_key,
+                shard,
+                dest_key,
+                dest_shard
+            ));
+        }
         let (tx, rx) = oneshot::channel();
         self.shard_senders[shard]
             .send(ShardWriteOp::Mv {

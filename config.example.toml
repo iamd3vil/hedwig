@@ -66,8 +66,22 @@ key_type = "rsa"                             # "rsa" or "ed25519"
 
 # Storage configuration
 [storage]
-storage_type = "fs"
+storage_type = "fs"         # "fs" for filesystem, "sqlite" for SQLite-backed storage
 base_path = "/var/lib/hedwig/mail"
+
+# SQLite storage example (num_shards/batch_* live under [storage], tuning under [storage.sqlite]):
+# [storage]
+# storage_type = "sqlite"
+# base_path = "/var/lib/hedwig/mail"
+# num_shards = 16           # Number of database shards (default: 16)
+# batch_size = 100          # Write-batch size (default: 100)
+# batch_timeout_ms = 5      # Max time (ms) to wait before flushing a batch (default: 5)
+#
+# [storage.sqlite]
+# synchronous = "NORMAL"    # SQLite synchronous setting: OFF | NORMAL | FULL (default: NORMAL)
+# cache_size_mb = 1600      # Page-cache size per shard in MiB (default: 1600)
+# busy_timeout_ms = 5000    # SQLite busy-timeout in ms (default: 5000)
+# pool_max_connections = 10 # sqlx pool max connections per shard (default: 10)
 
 # Optional retention policy for local spool cleanup
 [storage.cleanup]
