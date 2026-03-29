@@ -8,6 +8,7 @@ use std::{pin::Pin, time::Duration};
 use crate::worker::EmailMetadata;
 
 pub mod fs_storage;
+pub mod sqlite_storage;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct StoredEmail {
