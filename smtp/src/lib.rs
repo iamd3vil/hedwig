@@ -311,12 +311,27 @@ impl SmtpServer {
                 buf.clear();
 
                 // Enforce message size limit.
+                // After rejecting, keep discarding until the DATA terminator
+                // (<CRLF>.<CRLF>) so the remaining body bytes aren't
+                // misparsed as SMTP commands on this connection.
                 if data_buffer.len() > self.max_message_size {
-                    stream
-                        .write_line(b"552 5.3.4 Message too big\r\n")
-                        .await?;
-                    data_buffer.clear();
-                    session.state = SessionState::Authenticated;
+                    // Check if the terminator is already in the buffer.
+                    if memchr::memmem::find(&data_buffer, b"\r\n.\r\n").is_some() {
+                        stream
+                            .write_line(b"552 5.3.4 Message too big\r\n")
+                            .await?;
+                        data_buffer.clear();
+                        session.state = SessionState::Authenticated;
+                    }
+                    // Otherwise keep accumulating until terminator arrives,
+                    // but shed already-scanned bytes to bound memory usage.
+                    // We only need to keep the last 4 bytes for a split terminator.
+                    else if data_buffer.len() > self.max_message_size + 4096 {
+                        let keep_from = data_buffer.len() - 4;
+                        let tail: Vec<u8> = data_buffer[keep_from..].to_vec();
+                        data_buffer.clear();
+                        data_buffer.extend_from_slice(&tail);
+                    }
                     continue;
                 }
 

@@ -74,6 +74,10 @@ impl SqliteStorage {
         batch_timeout_ms: u64,
         sqlite_cfg: &CfgSqlite,
     ) -> Result<Self> {
+        if num_shards == 0 {
+            miette::bail!("num_shards must be >= 1, got 0");
+        }
+
         tokio::fs::create_dir_all(base_path)
             .await
             .into_diagnostic()
@@ -346,7 +350,7 @@ async fn process_write_batch(
             }
             ShardWriteOp::Mv { src_key, dest_key, src_status, dest_status, responder } => {
                 responders.push(responder);
-                if let Err(e) = sqlx::query(
+                match sqlx::query(
                     "UPDATE emails SET message_id = ?, status = ?, updated_at = ? WHERE message_id = ? AND status = ?",
                 )
                 .bind(&dest_key)
@@ -357,12 +361,23 @@ async fn process_write_batch(
                 .execute(&mut *tx)
                 .await
                 {
-                    tracing::error!(shard_id, error = %e, src_key = %src_key, "Mv failed");
-                    if !batch_failed {
-                        batch_failed = true;
-                        batch_error = Some(format!("Mv failed: {}", e));
-                        break;
+                    Ok(result) if result.rows_affected() == 0 => {
+                        tracing::error!(shard_id, src_key = %src_key, src_status, "Mv matched no rows");
+                        if !batch_failed {
+                            batch_failed = true;
+                            batch_error = Some(format!("Mv matched no rows for key={} status={}", src_key, src_status));
+                            break;
+                        }
                     }
+                    Err(e) => {
+                        tracing::error!(shard_id, error = %e, src_key = %src_key, "Mv failed");
+                        if !batch_failed {
+                            batch_failed = true;
+                            batch_error = Some(format!("Mv failed: {}", e));
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
                 }
             }
             ShardWriteOp::Cleanup { config, responder } => {
