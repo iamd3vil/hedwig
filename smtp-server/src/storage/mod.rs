@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
 use futures::Stream;
 use miette::Result;
@@ -55,9 +54,9 @@ impl Default for CleanupConfig {
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn get(&self, key: &str, status: Status) -> Result<Option<StoredEmail>>;
-    async fn put(&self, email: StoredEmail, status: Status) -> Result<Utf8PathBuf>;
+    async fn put(&self, email: StoredEmail, status: Status) -> Result<()>;
     async fn get_meta(&self, key: &str) -> Result<Option<EmailMetadata>>;
-    async fn put_meta(&self, key: &str, meta: &EmailMetadata) -> Result<Utf8PathBuf>;
+    async fn put_meta(&self, key: &str, meta: &EmailMetadata) -> Result<()>;
     async fn delete_meta(&self, key: &str) -> Result<()>;
     async fn delete(&self, key: &str, status: Status) -> Result<()>;
     async fn mv(

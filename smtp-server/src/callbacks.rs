@@ -380,7 +380,6 @@ mod tests {
     use super::*;
     use crate::config::{CfgAuth, CfgDKIM, CfgFilter, CfgListener, CfgLog, CfgServer, CfgStorage};
     use crate::worker::EmailMetadata;
-    use camino::Utf8PathBuf;
     use futures::{stream, Stream};
     use miette::Result;
     use std::pin::Pin;
@@ -395,17 +394,16 @@ mod tests {
             Ok(None)
         }
 
-        async fn put(&self, _email: StoredEmail, _status: Status) -> Result<Utf8PathBuf> {
-            // The actual path doesn't matter for current tests, but it must be a Utf8PathBuf
-            Ok(Utf8PathBuf::from("mock/path/to/email"))
+        async fn put(&self, _email: StoredEmail, _status: Status) -> Result<()> {
+            Ok(())
         }
 
         async fn get_meta(&self, _key: &str) -> Result<Option<EmailMetadata>> {
             Ok(None)
         }
 
-        async fn put_meta(&self, _key: &str, _meta: &EmailMetadata) -> Result<Utf8PathBuf> {
-            Ok(Utf8PathBuf::from("mock/path/to/meta"))
+        async fn put_meta(&self, _key: &str, _meta: &EmailMetadata) -> Result<()> {
+            Ok(())
         }
 
         async fn delete_meta(&self, _key: &str) -> Result<()> {
@@ -1155,7 +1153,7 @@ mod tests {
             &self,
             _email: StoredEmail,
             _status: Status,
-        ) -> Result<camino::Utf8PathBuf, miette::Report> {
+        ) -> Result<(), miette::Report> {
             Err(miette::Report::msg("Storage error"))
         }
 
@@ -1170,8 +1168,8 @@ mod tests {
             &self,
             _key: &str,
             _meta: &crate::worker::EmailMetadata,
-        ) -> Result<camino::Utf8PathBuf, miette::Report> {
-            Ok(camino::Utf8PathBuf::from("/tmp/test"))
+        ) -> Result<(), miette::Report> {
+            Ok(())
         }
 
         async fn delete_meta(&self, _key: &str) -> Result<(), miette::Report> {
