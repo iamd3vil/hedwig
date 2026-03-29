@@ -6,7 +6,7 @@ use mta_sts::refresher;
 use rustls::pki_types::CertificateDer;
 use smtp::{SmtpServer, SmtpStream};
 use std::sync::Arc;
-use storage::{fs_storage::FileSystemStorage, Status, Storage};
+use storage::{fs_storage::FileSystemStorage, sqlite_storage::SqliteStorage, Status, Storage};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -451,6 +451,21 @@ async fn get_storage_type(cfg: &CfgStorage) -> Result<Arc<dyn Storage>> {
     match cfg.storage_type.as_ref() {
         "fs" => {
             let st = FileSystemStorage::new(cfg.base_path.clone()).await?;
+            Ok(Arc::new(st))
+        }
+        "sqlite" => {
+            let num_shards = cfg.num_shards.unwrap_or(16);
+            let batch_size = cfg.batch_size.unwrap_or(100);
+            let batch_timeout_ms = cfg.batch_timeout_ms.unwrap_or(5);
+            let sqlite_cfg = cfg.sqlite.clone().unwrap_or_default();
+            let st = SqliteStorage::new(
+                &cfg.base_path,
+                num_shards,
+                batch_size,
+                batch_timeout_ms,
+                &sqlite_cfg,
+            )
+            .await?;
             Ok(Arc::new(st))
         }
         _ => bail!("Unknown storage type: {}", cfg.storage_type),

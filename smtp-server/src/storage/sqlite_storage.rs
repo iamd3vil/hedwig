@@ -750,7 +750,10 @@ impl Storage for SqliteStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+    use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
+    use crate::storage::CleanupConfig;
 
     fn default_sqlite_cfg() -> CfgSqlite {
         CfgSqlite {
@@ -758,6 +761,26 @@ mod tests {
             cache_size_mb: None,
             busy_timeout_ms: None,
             pool_max_connections: Some(2),
+        }
+    }
+
+    async fn create_test_storage() -> SqliteStorage {
+        let temp_dir = tempdir().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap().to_string();
+        let cfg = default_sqlite_cfg();
+        let storage = SqliteStorage::new(&base_path, 2, 10, 5, &cfg).await.unwrap();
+        // Leak temp_dir so it's not deleted while storage is alive.
+        std::mem::forget(temp_dir);
+        storage
+    }
+
+    fn create_test_email(id: &str) -> StoredEmail {
+        StoredEmail {
+            message_id: id.to_string(),
+            from: "sender@example.com".to_string(),
+            to: vec!["recipient@example.com".to_string()],
+            body: "Test email body".to_string(),
+            queued_at: None,
         }
     }
 
@@ -804,5 +827,244 @@ mod tests {
             let shard = storage.shard_for(&key);
             assert!(shard < 4, "shard {} out of range for key {}", shard, key);
         }
+    }
+
+    #[tokio::test]
+    async fn test_put_and_get() {
+        let storage = create_test_storage().await;
+        let email = create_test_email("msg_001");
+
+        storage.put(email.clone(), Status::Queued).await.unwrap();
+
+        // Correct status → Some with all fields matching
+        let result = storage.get("msg_001", Status::Queued).await.unwrap();
+        assert!(result.is_some());
+        let retrieved = result.unwrap();
+        assert_eq!(retrieved.message_id, "msg_001");
+        assert_eq!(retrieved.from, "sender@example.com");
+        assert_eq!(retrieved.to, vec!["recipient@example.com"]);
+        assert_eq!(retrieved.body, "Test email body");
+
+        // Wrong status → None
+        let result = storage.get("msg_001", Status::Bounced).await.unwrap();
+        assert!(result.is_none());
+
+        // Nonexistent key → None
+        let result = storage.get("nonexistent", Status::Queued).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        let storage = create_test_storage().await;
+        let email = create_test_email("msg_del");
+
+        storage.put(email, Status::Queued).await.unwrap();
+        storage.delete("msg_del", Status::Queued).await.unwrap();
+
+        let result = storage.get("msg_del", Status::Queued).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mv() {
+        let storage = create_test_storage().await;
+        let email = create_test_email("msg_mv");
+
+        storage.put(email, Status::Queued).await.unwrap();
+        storage
+            .mv("msg_mv", "msg_mv", Status::Queued, Status::Bounced)
+            .await
+            .unwrap();
+
+        // Get as old status → None
+        let result = storage.get("msg_mv", Status::Queued).await.unwrap();
+        assert!(result.is_none());
+
+        // Get as new status → Some
+        let result = storage.get("msg_mv", Status::Bounced).await.unwrap();
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_put_and_get_meta() {
+        let storage = create_test_storage().await;
+        let email = create_test_email("msg_meta");
+
+        // Row must exist before put_meta (which does an UPDATE)
+        storage.put(email, Status::Deferred).await.unwrap();
+
+        let now = SystemTime::now();
+        let meta = crate::worker::EmailMetadata {
+            msg_id: "msg_meta".to_string(),
+            attempts: 3,
+            last_attempt: now,
+            next_attempt: now + Duration::from_secs(300),
+        };
+        storage.put_meta("msg_meta", &meta).await.unwrap();
+
+        let result = storage.get_meta("msg_meta").await.unwrap();
+        assert!(result.is_some());
+        let retrieved = result.unwrap();
+        assert_eq!(retrieved.msg_id, "msg_meta");
+        assert_eq!(retrieved.attempts, 3);
+
+        // Nonexistent key → None
+        let result = storage.get_meta("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_meta() {
+        let storage = create_test_storage().await;
+        let email = create_test_email("msg_delmeta");
+
+        storage.put(email, Status::Deferred).await.unwrap();
+
+        let now = SystemTime::now();
+        let meta = crate::worker::EmailMetadata {
+            msg_id: "msg_delmeta".to_string(),
+            attempts: 2,
+            last_attempt: now,
+            next_attempt: now + Duration::from_secs(60),
+        };
+        storage.put_meta("msg_delmeta", &meta).await.unwrap();
+
+        // Verify meta is set
+        let before = storage.get_meta("msg_delmeta").await.unwrap();
+        assert_eq!(before.unwrap().attempts, 2);
+
+        storage.delete_meta("msg_delmeta").await.unwrap();
+
+        // delete_meta resets attempts to 0 (row stays, metadata is cleared)
+        let after = storage.get_meta("msg_delmeta").await.unwrap();
+        assert!(after.is_some());
+        assert_eq!(after.unwrap().attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list() {
+        let storage = create_test_storage().await;
+
+        storage
+            .put(create_test_email("msg_list_q1"), Status::Queued)
+            .await
+            .unwrap();
+        storage
+            .put(create_test_email("msg_list_q2"), Status::Queued)
+            .await
+            .unwrap();
+        storage
+            .put(create_test_email("msg_list_d1"), Status::Deferred)
+            .await
+            .unwrap();
+
+        let queued: Vec<_> = storage.list(Status::Queued).collect().await;
+        assert_eq!(queued.len(), 2, "expected 2 queued emails");
+
+        let deferred: Vec<_> = storage.list(Status::Deferred).collect().await;
+        assert_eq!(deferred.len(), 1, "expected 1 deferred email");
+
+        let bounced: Vec<_> = storage.list(Status::Bounced).collect().await;
+        assert_eq!(bounced.len(), 0, "expected 0 bounced emails");
+    }
+
+    #[tokio::test]
+    async fn test_list_meta() {
+        let storage = create_test_storage().await;
+
+        storage
+            .put(create_test_email("msg_lm1"), Status::Deferred)
+            .await
+            .unwrap();
+        storage
+            .put(create_test_email("msg_lm2"), Status::Deferred)
+            .await
+            .unwrap();
+
+        let now = SystemTime::now();
+        let meta1 = crate::worker::EmailMetadata {
+            msg_id: "msg_lm1".to_string(),
+            attempts: 1,
+            last_attempt: now,
+            next_attempt: now + Duration::from_secs(60),
+        };
+        let meta2 = crate::worker::EmailMetadata {
+            msg_id: "msg_lm2".to_string(),
+            attempts: 2,
+            last_attempt: now,
+            next_attempt: now + Duration::from_secs(120),
+        };
+        storage.put_meta("msg_lm1", &meta1).await.unwrap();
+        storage.put_meta("msg_lm2", &meta2).await.unwrap();
+
+        let metas: Vec<_> = storage.list_meta().collect().await;
+        assert_eq!(metas.len(), 2, "expected 2 metadata entries");
+
+        let ids: Vec<String> = metas.into_iter().map(|r| r.unwrap().msg_id).collect();
+        assert!(ids.contains(&"msg_lm1".to_string()));
+        assert!(ids.contains(&"msg_lm2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_bounced_removes_old_messages() {
+        let storage = create_test_storage().await;
+        let email = create_test_email("msg_cleanup_b");
+
+        storage.put(email, Status::Bounced).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let config = CleanupConfig {
+            bounced_retention: Some(Duration::from_millis(1)),
+            deferred_retention: None,
+            interval: Duration::from_secs(3600),
+        };
+        storage.cleanup(&config).await.unwrap();
+
+        let result = storage.get("msg_cleanup_b", Status::Bounced).await.unwrap();
+        assert!(result.is_none(), "old bounced email should have been removed");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_deferred_removes_old_messages() {
+        let storage = create_test_storage().await;
+        let email = create_test_email("msg_cleanup_d");
+
+        storage.put(email, Status::Deferred).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let config = CleanupConfig {
+            bounced_retention: None,
+            deferred_retention: Some(Duration::from_millis(1)),
+            interval: Duration::from_secs(3600),
+        };
+        storage.cleanup(&config).await.unwrap();
+
+        let result = storage
+            .get("msg_cleanup_d", Status::Deferred)
+            .await
+            .unwrap();
+        assert!(result.is_none(), "old deferred email should have been removed");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_does_not_remove_recent_messages() {
+        let storage = create_test_storage().await;
+        let email = create_test_email("msg_cleanup_recent");
+
+        storage.put(email, Status::Bounced).await.unwrap();
+
+        let config = CleanupConfig {
+            bounced_retention: Some(Duration::from_secs(3600)),
+            deferred_retention: None,
+            interval: Duration::from_secs(3600),
+        };
+        storage.cleanup(&config).await.unwrap();
+
+        let result = storage
+            .get("msg_cleanup_recent", Status::Bounced)
+            .await
+            .unwrap();
+        assert!(result.is_some(), "recent bounced email should not have been removed");
     }
 }

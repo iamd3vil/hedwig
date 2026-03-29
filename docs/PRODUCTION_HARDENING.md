@@ -42,7 +42,9 @@ Configurable via `server.max_connections` (default: 1000). Uses `tokio::sync::Se
 
 ## 🟡 Important
 
-### 5. Filesystem storage lacks durability guarantees
+### 5. ~~Filesystem storage lacks durability guarantees~~ → Addressed (SQLite backend)
+
+**Status:** Addressed via `SqliteStorage` backend (`storage_type = "sqlite"`). SQLite transactions provide atomic writes — no partial writes, no fsync gaps. See `docs/specs/2026-03-29-sqlite-storage-design.md`.
 
 **Problem:** `fs_storage.rs` uses `tokio::fs::write()` directly — no temp-file + rename, no fsync. On crash or power loss:
 - Partially written files can corrupt the queue
@@ -60,7 +62,9 @@ Configurable via `server.max_connections` (default: 1000). Uses `tokio::sync::Se
 
 ---
 
-### 6. Filesystem storage doesn't scale to millions of files
+### 6. ~~Filesystem storage doesn't scale to millions of files~~ → Addressed (SQLite backend)
+
+**Status:** Addressed via `SqliteStorage` backend. Sharded SQLite databases with indexed queries replace flat directory walks. See `docs/specs/2026-03-29-sqlite-storage-design.md`.
 
 **Problem:** Flat directories (`queued/`, `deferred/`, `bounced/`) with millions of files means very slow `readdir()` calls. Startup replay and cleanup become directory-walk bound. ext4 performance degrades significantly past ~100K files per directory.
 
