@@ -1,0 +1,32 @@
+# Development configuration for Hedwig SMTP Server (SQLite storage)
+# Used by `just run-sqlite` - runs locally
+
+[server]
+workers = 4
+disable_outbound = true
+
+# Plaintext listener on port 2526
+[[server.listeners]]
+addr = "0.0.0.0:2526"
+
+[log]
+level = "debug"
+format = "fmt"
+
+# Test credentials
+[[server.auth]]
+username = "test"
+password = "test"
+
+[storage]
+storage_type = "sqlite"
+base_path = "/tmp/hedwig-dev-sqlite/"
+num_shards = 16
+batch_size = 100
+batch_timeout_ms = 5
+
+[storage.sqlite]
+synchronous = "NORMAL"
+cache_size_mb = 1600
+busy_timeout_ms = 5000
+pool_max_connections = 10

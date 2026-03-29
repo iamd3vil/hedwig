@@ -45,6 +45,13 @@ pub struct CfgServer {
     pub rate_limits: Option<CfgRateLimits>,
     pub metrics: Option<CfgMetrics>,
     pub health: Option<CfgHealth>,
+    pub queue_buffer: Option<usize>,
+    pub max_connections: Option<usize>,
+    pub max_message_size: Option<usize>,
+    #[serde(default, with = "humantime_serde::option")]
+    pub cmd_timeout: Option<Duration>,
+    #[serde(default, with = "humantime_serde::option")]
+    pub data_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -62,6 +69,14 @@ pub struct CfgStorage {
     pub base_path: String,
     #[serde(default)]
     pub cleanup: Option<CfgCleanup>,
+    /// Number of SQLite shards (default: 16). Only used when storage_type = "sqlite".
+    pub num_shards: Option<usize>,
+    /// Max writes per batch (default: 100). Only used when storage_type = "sqlite".
+    pub batch_size: Option<usize>,
+    /// Max wait to fill a batch in ms (default: 5). Only used when storage_type = "sqlite".
+    pub batch_timeout_ms: Option<u64>,
+    /// SQLite-specific tuning. Only used when storage_type = "sqlite".
+    pub sqlite: Option<CfgSqlite>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -131,6 +146,18 @@ pub struct CfgRateLimits {
     pub enabled: bool,
     pub default_limit: Option<u32>,
     pub domain_limits: Option<HashMap<String, u32>>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct CfgSqlite {
+    /// SQLite synchronous mode: OFF | NORMAL | FULL (default: NORMAL)
+    pub synchronous: Option<String>,
+    /// Total cache size in MB across all shards (default: 1600)
+    pub cache_size_mb: Option<i32>,
+    /// SQLite busy timeout in ms (default: 5000)
+    pub busy_timeout_ms: Option<u64>,
+    /// Read connections per shard (default: 10)
+    pub pool_max_connections: Option<u32>,
 }
 
 /// Configuration for on-disk spool cleanup.

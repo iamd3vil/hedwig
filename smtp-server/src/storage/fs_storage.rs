@@ -258,11 +258,11 @@ impl Storage for FileSystemStorage {
     ///
     /// # Returns
     /// * `Result<Utf8PathBuf>` - The path where the email was stored
-    async fn put(&self, email: StoredEmail, status: Status) -> Result<Utf8PathBuf> {
+    async fn put(&self, email: StoredEmail, status: Status) -> Result<()> {
         let path = self.file_path(&email.message_id, &status);
         let serialized = serde_json::to_string(&email).into_diagnostic()?;
         fs::write(&path, &serialized).await.into_diagnostic()?;
-        Ok(path)
+        Ok(())
     }
 
     /// Deletes an email by its key and status.
@@ -304,11 +304,11 @@ impl Storage for FileSystemStorage {
     ///
     /// # Returns
     /// * `Result<Utf8PathBuf>` - The path where the metadata was stored
-    async fn put_meta(&self, key: &str, meta: &EmailMetadata) -> Result<Utf8PathBuf> {
+    async fn put_meta(&self, key: &str, meta: &EmailMetadata) -> Result<()> {
         let path = self.meta_file_path(key);
         let json = serde_json::to_string(meta).into_diagnostic()?;
         fs::write(&path, json).await.into_diagnostic()?;
-        Ok(path)
+        Ok(())
     }
 
     /// Deletes metadata for an email.
@@ -409,8 +409,7 @@ mod tests {
         let email = create_test_email("test1");
 
         // Test put
-        let path = storage.put(email.clone(), Status::Queued).await.unwrap();
-        assert!(path.exists());
+        storage.put(email.clone(), Status::Queued).await.unwrap();
 
         // Test get
         let retrieved = storage.get("test1", Status::Queued).await.unwrap();
@@ -467,8 +466,7 @@ mod tests {
         let meta = create_test_metadata("test_meta");
 
         // Test put_meta
-        let path = storage.put_meta("test_meta", &meta).await.unwrap();
-        assert!(path.exists());
+        storage.put_meta("test_meta", &meta).await.unwrap();
 
         // Test get_meta
         let retrieved = storage.get_meta("test_meta").await.unwrap();

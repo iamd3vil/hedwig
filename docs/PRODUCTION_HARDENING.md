@@ -6,59 +6,45 @@ Ordered by priority. Each item includes the problem, where it lives in the code,
 
 ---
 
-## 🔴 Critical
+## ~~🔴 Critical~~ ✅ Fixed
 
-### 1. Queue channel is `bounded(1)`
+### 1. ~~Queue channel is `bounded(1)`~~ → Fixed
 
-**Problem:** The work queue between inbound acceptance and outbound workers is `async_channel::bounded(1)`. Under load, `on_data` blocks waiting for a worker to drain, causing SMTP timeouts for sending clients.
+**Status:** Fixed in `74b8602`.
 
-**Location:** `smtp-server/src/main.rs:108`
-```rust
-let (sender_channel, receiver_channel) = async_channel::bounded(1);
-```
-
-**Fix:** Increase to `bounded(1000)` or make it configurable via `config.toml`. The filesystem storage already provides durability — the channel just needs enough buffer to decouple inbound acceptance from worker processing.
+Configurable via `server.queue_buffer` (default: 1000). The channel now has enough buffer to decouple inbound acceptance from worker processing.
 
 ---
 
-### 2. No inbound message size limit
+### 2. ~~No inbound message size limit~~ → Fixed
 
-**Problem:** The `smtp` crate accumulates the entire DATA body in memory with no cap. A malicious or misbehaving client can send an arbitrarily large message and OOM the server.
+**Status:** Fixed in `02b61c3`.
 
-**Location:** `smtp/src/lib.rs` — the `handle_data()` / DATA accumulation loop appends to an unbounded `String`.
-
-**Fix:** Add a configurable `max_message_size` (e.g. 25MB default). Reject with `552 5.3.4 Message too big` when exceeded. Advertise the limit via `SIZE` in the EHLO response.
+Configurable via `server.max_message_size` (default: 25 MiB). Rejects with `552 5.3.4 Message too big` when exceeded. Advertises the limit via `SIZE` in the EHLO response.
 
 ---
 
-### 3. No inbound connection/read timeouts
+### 3. ~~No inbound connection/read timeouts~~ → Fixed
 
-**Problem:** `handle_client()` reads from the socket with no timeout. Slowloris-style attacks can hold connections open indefinitely, exhausting file descriptors and memory.
+**Status:** Fixed in `d04c950`.
 
-**Location:** `smtp/src/lib.rs` — `handle_client()` reads in a loop with no `tokio::time::timeout` wrapper.
-
-**Fix:** Add configurable timeouts:
-- Idle timeout between commands: ~5 minutes (RFC 5321 recommends 5 min)
-- DATA transfer timeout: ~10 minutes
-- Total connection timeout: ~30 minutes
-
-Wrap each read with `tokio::time::timeout()`. On timeout, send `421 4.4.2 Connection timed out` and close.
+Configurable via `server.cmd_timeout` (default: `5m`) and `server.data_timeout` (default: `10m`). Each `read_buf` is wrapped with `tokio::time::timeout`. On timeout, sends `421 4.4.2 Connection timed out` and closes.
 
 ---
 
-### 4. No inbound connection limit
+### 4. ~~No inbound connection limit~~ → Fixed
 
-**Problem:** No cap on concurrent inbound connections. Under a spam flood or DDoS, the server will accept connections until it runs out of file descriptors or memory.
+**Status:** Fixed in `74b8602`.
 
-**Location:** `smtp-server/src/main.rs` — listener accept loop spawns a task per connection with no limit.
-
-**Fix:** Add a configurable `max_connections` (e.g. 1000 default). Use a `tokio::sync::Semaphore` in the accept loop. When full, either stop accepting or respond with `421 4.7.0 Too many connections` and close immediately.
+Configurable via `server.max_connections` (default: 1000). Uses `tokio::sync::Semaphore` in the accept loop. When at capacity, responds with `421 4.7.0 Too many connections, try again later` and closes immediately.
 
 ---
 
 ## 🟡 Important
 
-### 5. Filesystem storage lacks durability guarantees
+### 5. ~~Filesystem storage lacks durability guarantees~~ → Addressed (SQLite backend)
+
+**Status:** Addressed via `SqliteStorage` backend (`storage_type = "sqlite"`). SQLite transactions provide atomic writes — no partial writes, no fsync gaps. See `docs/specs/2026-03-29-sqlite-storage-design.md`.
 
 **Problem:** `fs_storage.rs` uses `tokio::fs::write()` directly — no temp-file + rename, no fsync. On crash or power loss:
 - Partially written files can corrupt the queue
@@ -76,7 +62,9 @@ Wrap each read with `tokio::time::timeout()`. On timeout, send `421 4.4.2 Connec
 
 ---
 
-### 6. Filesystem storage doesn't scale to millions of files
+### 6. ~~Filesystem storage doesn't scale to millions of files~~ → Addressed (SQLite backend)
+
+**Status:** Addressed via `SqliteStorage` backend. Sharded SQLite databases with indexed queries replace flat directory walks. See `docs/specs/2026-03-29-sqlite-storage-design.md`.
 
 **Problem:** Flat directories (`queued/`, `deferred/`, `bounced/`) with millions of files means very slow `readdir()` calls. Startup replay and cleanup become directory-walk bound. ext4 performance degrades significantly past ~100K files per directory.
 

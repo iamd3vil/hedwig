@@ -8,6 +8,7 @@ use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
 use std::os::unix::io::AsRawFd; // or windows equivalent
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -141,6 +142,13 @@ pub trait SmtpCallbacks: Send + Sync {
     async fn on_data(&self, email: &Email) -> Result<(), SmtpError>;
 }
 
+/// Default maximum message size: 25 MiB.
+const DEFAULT_MAX_MESSAGE_SIZE: usize = 25 * 1024 * 1024;
+/// Default idle timeout between commands: 5 minutes (RFC 5321).
+const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Default timeout during DATA transfer: 10 minutes.
+const DEFAULT_DATA_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// Represents an SMTP server instance.
 #[derive(Clone)]
 pub struct SmtpServer {
@@ -151,6 +159,14 @@ pub struct SmtpServer {
 
     // TLS acceptor for handling encrypted connections.
     tls_acceptor: Option<TlsAcceptor>,
+
+    // Maximum message size in bytes. Enforced during DATA and advertised via SIZE in EHLO.
+    max_message_size: usize,
+
+    // Idle timeout between commands.
+    cmd_timeout: Duration,
+    // Timeout during DATA transfer reads.
+    data_timeout: Duration,
 }
 
 impl SmtpServer {
@@ -169,7 +185,25 @@ impl SmtpServer {
             callbacks: Arc::new(callbacks),
             auth_enabled,
             tls_acceptor: None,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            cmd_timeout: DEFAULT_CMD_TIMEOUT,
+            data_timeout: DEFAULT_DATA_TIMEOUT,
         }
+    }
+
+    pub fn with_max_message_size(mut self, size: usize) -> Self {
+        self.max_message_size = size;
+        self
+    }
+
+    pub fn with_cmd_timeout(mut self, timeout: Duration) -> Self {
+        self.cmd_timeout = timeout;
+        self
+    }
+
+    pub fn with_data_timeout(mut self, timeout: Duration) -> Self {
+        self.data_timeout = timeout;
+        self
     }
 
     pub fn with_tls(
@@ -253,7 +287,20 @@ impl SmtpServer {
         let mut data_buffer = BytesMut::new();
 
         loop {
-            let n = stream.read_buf(&mut buf).await.into_diagnostic()?;
+            let timeout = if session.state == SessionState::ReceivingData {
+                self.data_timeout
+            } else {
+                self.cmd_timeout
+            };
+            let n = match tokio::time::timeout(timeout, stream.read_buf(&mut buf)).await {
+                Ok(result) => result.into_diagnostic()?,
+                Err(_) => {
+                    let _ = stream
+                        .write_line(b"421 4.4.2 Connection timed out\r\n")
+                        .await;
+                    return Ok(());
+                }
+            };
             if n == 0 {
                 return Ok(());
             }
@@ -262,6 +309,31 @@ impl SmtpServer {
                 // Accumulate the incoming bytes.
                 data_buffer.extend_from_slice(&buf[..]);
                 buf.clear();
+
+                // Enforce message size limit.
+                // After rejecting, keep discarding until the DATA terminator
+                // (<CRLF>.<CRLF>) so the remaining body bytes aren't
+                // misparsed as SMTP commands on this connection.
+                if data_buffer.len() > self.max_message_size {
+                    // Check if the terminator is already in the buffer.
+                    if memchr::memmem::find(&data_buffer, b"\r\n.\r\n").is_some() {
+                        stream
+                            .write_line(b"552 5.3.4 Message too big\r\n")
+                            .await?;
+                        data_buffer.clear();
+                        session.state = SessionState::Authenticated;
+                    }
+                    // Otherwise keep accumulating until terminator arrives,
+                    // but shed already-scanned bytes to bound memory usage.
+                    // We only need to keep the last 4 bytes for a split terminator.
+                    else if data_buffer.len() > self.max_message_size + 4096 {
+                        let keep_from = data_buffer.len() - 4;
+                        let tail: Vec<u8> = data_buffer[keep_from..].to_vec();
+                        data_buffer.clear();
+                        data_buffer.extend_from_slice(&tail);
+                    }
+                    continue;
+                }
 
                 let mut termination_found = false;
                 for pos in memchr::memchr_iter(b'\r', &data_buffer) {
@@ -337,6 +409,7 @@ impl SmtpServer {
             (SessionState::Connected, SmtpCommand::Ehlo(domain)) => {
                 self.callbacks.on_ehlo(&domain).await?;
                 let mut response = String::from("250-localhost\r\n");
+                response.push_str(&format!("250-SIZE {}\r\n", self.max_message_size));
                 if self.tls_acceptor.is_some() {
                     response.push_str("250-STARTTLS\r\n");
                 }

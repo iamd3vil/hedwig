@@ -6,9 +6,10 @@ use mta_sts::refresher;
 use rustls::pki_types::CertificateDer;
 use smtp::{SmtpServer, SmtpStream};
 use std::sync::Arc;
-use storage::{fs_storage::FileSystemStorage, Status, Storage};
+use storage::{fs_storage::FileSystemStorage, sqlite_storage::SqliteStorage, Status, Storage};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_rustls::rustls::{self, ServerConfig};
@@ -105,7 +106,8 @@ async fn run_server(config_path: &str) -> Result<()> {
     }
     // Initialize the work queue that powers outbound processing. Closing these channels
     // later is the cue for workers to stop draining jobs.
-    let (sender_channel, receiver_channel) = async_channel::bounded(1);
+    let queue_buffer = cfg.server.queue_buffer.unwrap_or(1000);
+    let (sender_channel, receiver_channel) = async_channel::bounded(queue_buffer);
     // Shared cancellation token used to broadcast a shutdown request to every task we spawn.
     let shutdown_token = CancellationToken::new();
     if let Some(health_cfg) = &cfg.server.health {
@@ -225,7 +227,19 @@ async fn run_server(config_path: &str) -> Result<()> {
         cfg.clone(),
     );
 
-    let smtp_server = SmtpServer::new(callbacks, auth_enabled);
+    let max_message_size = cfg.server.max_message_size.unwrap_or(25 * 1024 * 1024);
+    let cmd_timeout = cfg
+        .server
+        .cmd_timeout
+        .unwrap_or(std::time::Duration::from_secs(5 * 60));
+    let data_timeout = cfg
+        .server
+        .data_timeout
+        .unwrap_or(std::time::Duration::from_secs(10 * 60));
+    let smtp_server = SmtpServer::new(callbacks, auth_enabled)
+        .with_max_message_size(max_message_size)
+        .with_cmd_timeout(cmd_timeout)
+        .with_data_timeout(data_timeout);
 
     // Replay any queued emails so workers process them immediately.
     if !queued_jobs.is_empty() {
@@ -266,6 +280,10 @@ async fn run_server(config_path: &str) -> Result<()> {
     background_tasks.push(mta_sts_handle);
     info!("MTA-STS policy enforcement enabled");
 
+    // Limit concurrent inbound connections to prevent resource exhaustion.
+    let max_connections = cfg.server.max_connections.unwrap_or(1000);
+    let conn_semaphore = Arc::new(Semaphore::new(max_connections));
+
     // Create listeners for each configured address
     let mut listeners = Vec::new();
     for (i, listener_config) in cfg.server.listeners.iter().enumerate() {
@@ -292,6 +310,7 @@ async fn run_server(config_path: &str) -> Result<()> {
         let tls_acceptor = tls_acceptors[acceptor_index].clone();
         let shutdown = shutdown_token.clone();
         let listener_addr = cfg.server.listeners[acceptor_index].addr.clone();
+        let conn_semaphore = Arc::clone(&conn_semaphore);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -309,11 +328,25 @@ async fn run_server(config_path: &str) -> Result<()> {
                             }
                         };
 
+                        // Enforce the connection limit. If we're at capacity, reject immediately.
+                        let permit = match conn_semaphore.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                warn!(%listener_addr, "max connections reached, rejecting");
+                                let mut sock: Box<dyn SmtpStream> = Box::new(socket);
+                                let _ = sock.write_line(b"421 4.7.0 Too many connections, try again later\r\n").await;
+                                continue;
+                            }
+                        };
+
                         debug!("Accepted connection");
                         let server_clone = server_clone.clone();
                         let tls_acceptor = tls_acceptor.clone();
 
                         tokio::spawn(async move {
+                            // Hold the permit for the lifetime of this connection.
+                            let _permit = permit;
+
                             let mut boxed_socket: Box<dyn SmtpStream> =
                                 if let Some(acceptor) = tls_acceptor {
                                     match acceptor.accept(socket).await {
@@ -418,6 +451,21 @@ async fn get_storage_type(cfg: &CfgStorage) -> Result<Arc<dyn Storage>> {
     match cfg.storage_type.as_ref() {
         "fs" => {
             let st = FileSystemStorage::new(cfg.base_path.clone()).await?;
+            Ok(Arc::new(st))
+        }
+        "sqlite" => {
+            let num_shards = cfg.num_shards.unwrap_or(16);
+            let batch_size = cfg.batch_size.unwrap_or(100);
+            let batch_timeout_ms = cfg.batch_timeout_ms.unwrap_or(5);
+            let sqlite_cfg = cfg.sqlite.clone().unwrap_or_default();
+            let st = SqliteStorage::new(
+                &cfg.base_path,
+                num_shards,
+                batch_size,
+                batch_timeout_ms,
+                &sqlite_cfg,
+            )
+            .await?;
             Ok(Arc::new(st))
         }
         _ => bail!("Unknown storage type: {}", cfg.storage_type),

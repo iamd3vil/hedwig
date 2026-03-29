@@ -10,6 +10,11 @@ pool_size = 100          # Outbound connection pool size (optional)
 max_retries = 5          # Maximum number of retries for deferred emails (optional, default: 5)
 disable_outbound = false # Disable outbound email delivery (optional)
 outbound_local = false   # Only allow local outbound delivery (optional)
+queue_buffer = 1000      # Inbound work queue buffer size (optional, default: 1000)
+max_connections = 1000   # Max concurrent inbound connections (optional, default: 1000)
+max_message_size = 26214400  # Max message size in bytes (optional, default: 25 MiB)
+cmd_timeout = "5m"       # Idle timeout between SMTP commands (optional, default: 5m)
+data_timeout = "10m"     # Timeout during DATA transfer (optional, default: 10m)
 
 # MTA-STS (RFC 8461) is always active for outbound delivery.
 # Hedwig automatically looks up and enforces recipient domain TLS policies.
@@ -61,8 +66,22 @@ key_type = "rsa"                             # "rsa" or "ed25519"
 
 # Storage configuration
 [storage]
-storage_type = "fs"
+storage_type = "fs"         # "fs" for filesystem, "sqlite" for SQLite-backed storage
 base_path = "/var/lib/hedwig/mail"
+
+# SQLite storage example (num_shards/batch_* live under [storage], tuning under [storage.sqlite]):
+# [storage]
+# storage_type = "sqlite"
+# base_path = "/var/lib/hedwig/mail"
+# num_shards = 16           # Number of database shards (default: 16)
+# batch_size = 100          # Write-batch size (default: 100)
+# batch_timeout_ms = 5      # Max time (ms) to wait before flushing a batch (default: 5)
+#
+# [storage.sqlite]
+# synchronous = "NORMAL"    # SQLite synchronous setting: OFF | NORMAL | FULL (default: NORMAL)
+# cache_size_mb = 1600      # Page-cache size per shard in MiB (default: 1600)
+# busy_timeout_ms = 5000    # SQLite busy-timeout in ms (default: 5000)
+# pool_max_connections = 10 # sqlx pool max connections per shard (default: 10)
 
 # Optional retention policy for local spool cleanup
 [storage.cleanup]

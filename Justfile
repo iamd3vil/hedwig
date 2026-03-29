@@ -33,6 +33,12 @@ build-windows $RUSTFLAGS="-C target-feature=+crt-static":
     ghcr.io/rust-cross/cargo-zigbuild:latest \
     sh -c 'rustup update stable && rustup target add x86_64-pc-windows-gnu && cargo zigbuild --release --target x86_64-pc-windows-gnu'
 
+run-sqlite:
+    cargo run -- --config dev/config.sqlite.toml
+
+run-fs:
+    cargo run -- --config dev/config.fs.toml
+
 dev:
     #!/usr/bin/env sh
     cd dev && docker compose up
