@@ -12,4 +12,4 @@ COPY certs/rootCA.pem /usr/local/share/ca-certificates/rootCA.crt
 
 RUN update-ca-certificates
 
-CMD ["cargo", "watch", "-x", "run -- --config /app/dev/config.toml"]
+CMD ["cargo", "watch", "-x", "run --release -- --config /app/dev/config.toml"]

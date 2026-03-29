@@ -79,7 +79,7 @@ impl SqliteStorage {
             .into_diagnostic()
             .wrap_err("Failed to create storage base path")?;
 
-        let pool_max_connections = sqlite_cfg.pool_max_connections.unwrap_or(10);
+        let pool_max_connections = sqlite_cfg.pool_max_connections.unwrap_or(4);
         let busy_timeout_ms = sqlite_cfg.busy_timeout_ms.unwrap_or(5000);
         let cache_size_mb = sqlite_cfg.cache_size_mb.unwrap_or(1600);
         let synchronous = sqlite_cfg
@@ -474,8 +474,12 @@ async fn shard_writer_task(
         }
     }
 
-    // Drain remaining on shutdown
+    // Drain everything remaining in the channel on shutdown.
+    while let Ok(op) = receiver.try_recv() {
+        batch.push_back(op);
+    }
     if !batch.is_empty() {
+        tracing::info!(shard_id, remaining = batch.len(), "flushing remaining ops before shutdown");
         process_write_batch(shard_id, &pool, &mut batch).await;
     }
 
@@ -499,6 +503,7 @@ impl Storage for SqliteStorage {
             })
             .await
             .map_err(|_| miette::miette!("shard writer channel closed"))?;
+
         rx.await
             .map_err(|_| miette::miette!("shard writer dropped responder"))?
     }
