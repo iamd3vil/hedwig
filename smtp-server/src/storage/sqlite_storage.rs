@@ -1,11 +1,14 @@
+use async_trait::async_trait;
 use crate::config::CfgSqlite;
-use crate::storage::{CleanupConfig, Status, StoredEmail};
+use crate::storage::{CleanupConfig, Status, Storage, StoredEmail};
 use crate::worker::EmailMetadata;
+use futures::Stream;
 use miette::{Context, IntoDiagnostic, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::collections::{hash_map::DefaultHasher, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::pin::Pin;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 
@@ -470,6 +473,278 @@ async fn shard_writer_task(
     }
 
     tracing::info!(shard_id, "shard writer task stopped");
+}
+
+#[async_trait]
+impl Storage for SqliteStorage {
+    // -------------------------------------------------------------------------
+    // Write methods — routed through the shard writer channel
+    // -------------------------------------------------------------------------
+
+    async fn put(&self, email: StoredEmail, status: Status) -> Result<()> {
+        let shard = self.shard_for(&email.message_id);
+        let (tx, rx) = oneshot::channel();
+        self.shard_senders[shard]
+            .send(ShardWriteOp::Put {
+                email,
+                status: status_to_int(&status),
+                responder: tx,
+            })
+            .await
+            .map_err(|_| miette::miette!("shard writer channel closed"))?;
+        rx.await
+            .map_err(|_| miette::miette!("shard writer dropped responder"))?
+    }
+
+    async fn put_meta(&self, key: &str, meta: &EmailMetadata) -> Result<()> {
+        let shard = self.shard_for(key);
+        let (tx, rx) = oneshot::channel();
+        self.shard_senders[shard]
+            .send(ShardWriteOp::PutMeta {
+                key: key.to_string(),
+                meta: EmailMetadata {
+                    msg_id: meta.msg_id.clone(),
+                    attempts: meta.attempts,
+                    last_attempt: meta.last_attempt,
+                    next_attempt: meta.next_attempt,
+                },
+                responder: tx,
+            })
+            .await
+            .map_err(|_| miette::miette!("shard writer channel closed"))?;
+        rx.await
+            .map_err(|_| miette::miette!("shard writer dropped responder"))?
+    }
+
+    async fn delete(&self, key: &str, status: Status) -> Result<()> {
+        let shard = self.shard_for(key);
+        let (tx, rx) = oneshot::channel();
+        self.shard_senders[shard]
+            .send(ShardWriteOp::Delete {
+                key: key.to_string(),
+                status: status_to_int(&status),
+                responder: tx,
+            })
+            .await
+            .map_err(|_| miette::miette!("shard writer channel closed"))?;
+        rx.await
+            .map_err(|_| miette::miette!("shard writer dropped responder"))?
+    }
+
+    async fn delete_meta(&self, key: &str) -> Result<()> {
+        let shard = self.shard_for(key);
+        let (tx, rx) = oneshot::channel();
+        self.shard_senders[shard]
+            .send(ShardWriteOp::DeleteMeta {
+                key: key.to_string(),
+                responder: tx,
+            })
+            .await
+            .map_err(|_| miette::miette!("shard writer channel closed"))?;
+        rx.await
+            .map_err(|_| miette::miette!("shard writer dropped responder"))?
+    }
+
+    async fn mv(
+        &self,
+        src_key: &str,
+        dest_key: &str,
+        src_status: Status,
+        dest_status: Status,
+    ) -> Result<()> {
+        let shard = self.shard_for(src_key);
+        // If dest_key hashes to a different shard, the row becomes unreachable.
+        // All current callers pass src_key == dest_key, so this is a safety net.
+        debug_assert_eq!(
+            shard,
+            self.shard_for(dest_key),
+            "mv across shards is not supported: src_key={} dest_key={}",
+            src_key,
+            dest_key
+        );
+        let (tx, rx) = oneshot::channel();
+        self.shard_senders[shard]
+            .send(ShardWriteOp::Mv {
+                src_key: src_key.to_string(),
+                dest_key: dest_key.to_string(),
+                src_status: status_to_int(&src_status),
+                dest_status: status_to_int(&dest_status),
+                responder: tx,
+            })
+            .await
+            .map_err(|_| miette::miette!("shard writer channel closed"))?;
+        rx.await
+            .map_err(|_| miette::miette!("shard writer dropped responder"))?
+    }
+
+    /// Sends `Cleanup` to every shard and awaits all responses.
+    async fn cleanup(&self, config: &CleanupConfig) -> Result<()> {
+        // Send to all shards first to allow concurrent processing.
+        let mut receivers = Vec::with_capacity(self.num_shards);
+        for sender in &self.shard_senders {
+            let (tx, rx) = oneshot::channel();
+            sender
+                .send(ShardWriteOp::Cleanup {
+                    config: config.clone(),
+                    responder: tx,
+                })
+                .await
+                .map_err(|_| miette::miette!("shard writer channel closed"))?;
+            receivers.push(rx);
+        }
+        for rx in receivers {
+            rx.await
+                .map_err(|_| miette::miette!("shard writer dropped responder"))??;
+        }
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Read methods — direct read pool queries
+    // -------------------------------------------------------------------------
+
+    async fn get(&self, key: &str, status: Status) -> Result<Option<StoredEmail>> {
+        let shard = self.shard_for(key);
+        let pool = &self.read_pools[shard];
+        let status_int = status_to_int(&status);
+
+        let row = sqlx::query_as::<_, (String, String, String, Vec<u8>, Option<i64>)>(
+            "SELECT message_id, from_addr, to_addrs, body, queued_at \
+             FROM emails WHERE message_id = ? AND status = ?",
+        )
+        .bind(key)
+        .bind(status_int)
+        .fetch_optional(pool)
+        .await
+        .into_diagnostic()?;
+
+        match row {
+            None => Ok(None),
+            Some((message_id, from_addr, to_json, body_bytes, queued_at)) => {
+                let to: Vec<String> = serde_json::from_str(&to_json)
+                    .into_diagnostic()
+                    .wrap_err("failed to deserialize to_addrs")?;
+                let body = String::from_utf8(body_bytes)
+                    .into_diagnostic()
+                    .wrap_err("email body is not valid UTF-8")?;
+                let queued_at =
+                    queued_at.and_then(|ms| chrono::DateTime::from_timestamp_millis(ms));
+                Ok(Some(StoredEmail {
+                    message_id,
+                    from: from_addr,
+                    to,
+                    body,
+                    queued_at,
+                }))
+            }
+        }
+    }
+
+    async fn get_meta(&self, key: &str) -> Result<Option<EmailMetadata>> {
+        let shard = self.shard_for(key);
+        let pool = &self.read_pools[shard];
+
+        let row = sqlx::query_as::<_, (String, i64, Option<i64>, Option<i64>)>(
+            "SELECT message_id, attempts, last_attempt, next_attempt \
+             FROM emails WHERE message_id = ?",
+        )
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .into_diagnostic()?;
+
+        match row {
+            None => Ok(None),
+            Some((msg_id, attempts, last_ms, next_ms)) => {
+                use std::time::{Duration as StdDuration, UNIX_EPOCH};
+                let last_attempt = last_ms
+                    .map(|ms| UNIX_EPOCH + StdDuration::from_millis(ms as u64))
+                    .unwrap_or(UNIX_EPOCH);
+                let next_attempt = next_ms
+                    .map(|ms| UNIX_EPOCH + StdDuration::from_millis(ms as u64))
+                    .unwrap_or(UNIX_EPOCH);
+                Ok(Some(EmailMetadata {
+                    msg_id,
+                    attempts: attempts as u32,
+                    last_attempt,
+                    next_attempt,
+                }))
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // List methods — fan out across all shards
+    // -------------------------------------------------------------------------
+
+    fn list(&self, status: Status) -> Pin<Box<dyn Stream<Item = Result<StoredEmail>> + Send>> {
+        let pools = self.read_pools.clone();
+        let status_int = status_to_int(&status);
+
+        Box::pin(async_stream::try_stream! {
+            for pool in &pools {
+                let rows = sqlx::query_as::<_, (String, String, String, Vec<u8>, Option<i64>)>(
+                    "SELECT message_id, from_addr, to_addrs, body, queued_at \
+                     FROM emails WHERE status = ?",
+                )
+                .bind(status_int)
+                .fetch_all(pool)
+                .await
+                .into_diagnostic()?;
+
+                for (message_id, from_addr, to_json, body_bytes, queued_at) in rows {
+                    let to: Vec<String> = serde_json::from_str(&to_json)
+                        .into_diagnostic()
+                        .wrap_err("failed to deserialize to_addrs")?;
+                    let body = String::from_utf8(body_bytes)
+                        .into_diagnostic()
+                        .wrap_err("email body is not valid UTF-8")?;
+                    let queued_at =
+                        queued_at.and_then(|ms| chrono::DateTime::from_timestamp_millis(ms));
+                    yield StoredEmail {
+                        message_id,
+                        from: from_addr,
+                        to,
+                        body,
+                        queued_at,
+                    };
+                }
+            }
+        })
+    }
+
+    fn list_meta(&self) -> Pin<Box<dyn Stream<Item = Result<EmailMetadata>> + Send>> {
+        let pools = self.read_pools.clone();
+
+        Box::pin(async_stream::try_stream! {
+            use std::time::{Duration as StdDuration, UNIX_EPOCH};
+
+            for pool in &pools {
+                let rows = sqlx::query_as::<_, (String, i64, Option<i64>, Option<i64>)>(
+                    "SELECT message_id, attempts, last_attempt, next_attempt \
+                     FROM emails WHERE status = 1",
+                )
+                .fetch_all(pool)
+                .await
+                .into_diagnostic()?;
+
+                for (msg_id, attempts, last_ms, next_ms) in rows {
+                    let last_attempt = last_ms
+                        .map(|ms| UNIX_EPOCH + StdDuration::from_millis(ms as u64))
+                        .unwrap_or(UNIX_EPOCH);
+                    let next_attempt = next_ms
+                        .map(|ms| UNIX_EPOCH + StdDuration::from_millis(ms as u64))
+                        .unwrap_or(UNIX_EPOCH);
+                    yield EmailMetadata {
+                        msg_id,
+                        attempts: attempts as u32,
+                        last_attempt,
+                        next_attempt,
+                    };
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
