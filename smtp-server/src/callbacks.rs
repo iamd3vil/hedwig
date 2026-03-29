@@ -155,15 +155,16 @@ impl Callbacks {
     }
 
     /// Processes an email by parsing it, storing it, and sending it to a worker.
-    async fn process_email(&self, email: &Email) -> Result<(), SmtpError> {
+    async fn process_email(&self, email: Email) -> Result<(), SmtpError> {
         let ulid = Ulid::new().to_string();
         // We are using ulid as the message id instead of message_id from the email.
         // The issue is we can't depend on the email client to provide a unique message id.
+        let body_len = email.body.len();
         let stored_email = StoredEmail {
             message_id: ulid.clone(),
-            from: email.from.clone(),
-            to: email.to.clone(),
-            body: email.body.clone(),
+            from: email.from,
+            to: email.to,
+            body: email.body,
             queued_at: Some(Utc::now()),
         };
         // Map any error into a SmtpError.
@@ -172,7 +173,7 @@ impl Callbacks {
             .await
             .map_err(|e| SmtpError::ParseError {
                 message: format!("Failed to store email: {}", e),
-                span: (0, email.body.len()).into(),
+                span: (0, body_len).into(),
             })?;
         metrics::email_received();
         metrics::queue_depth_inc();
@@ -184,7 +185,7 @@ impl Callbacks {
             .await
             .map_err(|e| SmtpError::ParseError {
                 message: format!("Failed to send email to worker: {}", e),
-                span: (0, email.body.len()).into(),
+                span: (0, body_len).into(),
             })?;
         Ok(())
     }
@@ -369,7 +370,7 @@ impl SmtpCallbacks for Callbacks {
     }
 
     // Handles the DATA command.
-    async fn on_data(&self, email: &Email) -> Result<(), SmtpError> {
+    async fn on_data(&self, email: Email) -> Result<(), SmtpError> {
         self.process_email(email).await?;
         Ok(())
     }
@@ -954,7 +955,7 @@ mod tests {
             body: "Test email body".to_string(),
         };
 
-        let result = callbacks.process_email(&email).await;
+        let result = callbacks.process_email(email).await;
         assert!(result.is_ok());
     }
 
@@ -973,7 +974,7 @@ mod tests {
             body: "Test email body".to_string(),
         };
 
-        let result = callbacks.process_email(&email).await;
+        let result = callbacks.process_email(email).await;
         assert!(result.is_err());
         for handle in worker_handles {
             // Prevent the worker task spawned during the test from leaking.
@@ -1141,7 +1142,7 @@ mod tests {
             body: "Test email body".to_string(),
         };
 
-        let result = callbacks.on_data(&email).await;
+        let result = callbacks.on_data(email).await;
         assert!(result.is_ok());
     }
 

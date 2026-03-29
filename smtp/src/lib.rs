@@ -79,7 +79,7 @@ pub enum SmtpError {
 }
 
 /// Represents an email message.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Email {
     /// The sender's email address.
     pub from: String,
@@ -139,7 +139,7 @@ pub trait SmtpCallbacks: Send + Sync {
     ///
     /// # Arguments
     /// * `email` - The `Email` struct containing the parsed email data.
-    async fn on_data(&self, email: &Email) -> Result<(), SmtpError>;
+    async fn on_data(&self, email: Email) -> Result<(), SmtpError>;
 }
 
 /// Default maximum message size: 25 MiB.
@@ -349,7 +349,7 @@ impl SmtpServer {
                                 span: (0, data_buffer.len()).into(),
                             }
                         })?;
-                        self.callbacks.on_data(&session.email).await?;
+                        self.callbacks.on_data(std::mem::take(&mut session.email)).await?;
                         stream.write_line(b"250 OK\r\n").await?;
                         session.state = SessionState::Authenticated;
                         data_buffer.clear();
