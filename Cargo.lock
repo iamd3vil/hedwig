@@ -1044,16 +1044,6 @@ dependencies = [
 
 [[package]]
 name = "gethostname"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0176e0459c2e4a1fe232f984bca6890e681076abb9934f6cea7c326f3fc47818"
-dependencies = [
- "libc",
- "windows-targets 0.48.5",
-]
-
-[[package]]
-name = "gethostname"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc3655aa6818d65bc620d6911f05aa7b6aeb596291e1e9f79e52df85583d1e30"
@@ -1187,9 +1177,8 @@ dependencies = [
  "huml-rs",
  "hyper 0.14.32",
  "lettre",
- "mail-auth 0.6.1",
+ "mail-auth",
  "mail-parser 0.9.4",
- "mail-send",
  "mailparse",
  "memchr",
  "miette",
@@ -1919,27 +1908,6 @@ dependencies = [
 
 [[package]]
 name = "mail-auth"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bd9d657de66a3d5ac360c3eab8c9f5cac2565f2b97cc032d5de4c900ef470de"
-dependencies = [
- "ahash",
- "flate2",
- "hickory-resolver",
- "lru-cache",
- "mail-builder 0.3.2",
- "mail-parser 0.9.4",
- "parking_lot",
- "quick-xml 0.32.0",
- "ring 0.17.8",
- "rustls-pemfile 2.2.0",
- "serde",
- "serde_json",
- "zip",
-]
-
-[[package]]
-name = "mail-auth"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "971b381e86bc19e81d7f4b5ffa3328a15fb7e2998fec82a82f4f144e65c73f5f"
@@ -1947,7 +1915,7 @@ dependencies = [
  "ahash",
  "flate2",
  "hickory-resolver",
- "mail-builder 0.4.0",
+ "mail-builder",
  "mail-parser 0.10.2",
  "quick-xml 0.37.2",
  "quick_cache",
@@ -1960,20 +1928,11 @@ dependencies = [
 
 [[package]]
 name = "mail-builder"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25f5871d5270ed80f2ee750b95600c8d69b05f8653ad3be913b2ad2e924fefcb"
-dependencies = [
- "gethostname 0.4.3",
-]
-
-[[package]]
-name = "mail-builder"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d75c72a0bf2070b4c2aa384f173439569a9e0e97293b90aad3469b6d9c183ec4"
 dependencies = [
- "gethostname 0.5.0",
+ "gethostname",
 ]
 
 [[package]]
@@ -1993,26 +1952,6 @@ checksum = "187a2b93c4c8c32f552ee06c2d99915e575de2fc7e04b07891c9edfee5b8edd6"
 dependencies = [
  "encoding_rs",
  "hashify",
-]
-
-[[package]]
-name = "mail-send"
-version = "0.4.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a575d25cf00ed68e5790b473b29242a47e991c6187785d47b45e31fc5816554"
-dependencies = [
- "base64 0.22.1",
- "gethostname 0.4.3",
- "mail-auth 0.4.3",
- "mail-builder 0.3.2",
- "md5",
- "rand 0.8.5",
- "rustls 0.23.22",
- "rustls-pki-types",
- "smtp-proto",
- "tokio",
- "tokio-rustls 0.26.1",
- "webpki-roots 0.26.8",
 ]
 
 [[package]]
@@ -2050,12 +1989,6 @@ dependencies = [
  "cfg-if",
  "digest",
 ]
-
-[[package]]
-name = "md5"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "memchr"
@@ -2502,15 +2435,6 @@ name = "quick-xml"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3cc440ee4802a86e357165021e3e255a9143724da31db1e2ea540214c96a0f82"
-dependencies = [
- "memchr",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d3a6e5838b60e0e8fa7a43f22ade549a37d61f8bdbe636d0d7816191de969c2"
 dependencies = [
  "memchr",
 ]
@@ -3136,12 +3060,6 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.1",
 ]
-
-[[package]]
-name = "smtp-proto"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51b8ad3dd187f0d4debab02ad65405a9919d6a4f7bce25bd64a258781063a53a"
 
 [[package]]
 name = "socket2"

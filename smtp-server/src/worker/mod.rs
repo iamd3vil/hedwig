@@ -15,7 +15,6 @@ use mail_auth::{
 };
 use mail_auth::{common::headers::HeaderWriter, dkim::Done};
 use mail_parser::{Message, MessageParser};
-use mail_send::Error;
 use miette::{bail, Context, IntoDiagnostic, Result};
 // use pool::SmtpClientPool;
 use memchr::memmem;
@@ -314,39 +313,46 @@ impl Worker {
                     return Ok(());
                 }
 
-                match e.downcast_ref::<Error>() {
-                    Some(Error::UnexpectedReply(resp)) => {
-                        if Self::is_retryable(resp.code()) {
-                            let smtp_response = format!("{} {}", resp.code(), resp.message());
-                            let logged_at = Utc::now();
-                            let delay_ms = calc_delay_ms(email.queued_at, logged_at);
-                            info!(
-                                job_id = %job.job_id,
-                                from_email = %strip_brackets(&email.from),
-                                recipient = %email.to.iter().map(|s| strip_brackets(s)).collect::<Vec<_>>().join(","),
-                                subject = %fmt_option(subject.as_deref()),
-                                status = "deferred",
-                                smtp_response = %smtp_response,
-                                queued_at = %fmt_option_rfc3339(email.queued_at),
-                                logged_at = %fmt_rfc3339(logged_at),
-                                delay_ms = %fmt_option(delay_ms),
-                                attempt = %(job.attempts + 1),
-                                "email delivery"
-                            );
-                            self.defer_email(job).await?;
-                        }
+                // SMTP failures are classified inside `send_email` (where the
+                // live `lettre::Error` is still typed) and carried up via a
+                // `ClassifiedSendError` typed error. If we can downcast to it,
+                // use its outcome and pre-formatted SMTP response. Otherwise
+                // (MX-lookup failure, body-parse error, etc.) bounce with the
+                // generic display — same as before for non-SMTP failures.
+                let (outcome, smtp_response) = match e.downcast_ref::<ClassifiedSendError>() {
+                    Some(c) => (c.outcome, c.smtp_response.clone()),
+                    None => (SendOutcome::Bounce, format!("{:#}", e)),
+                };
+
+                let logged_at = Utc::now();
+                let delay_ms = calc_delay_ms(email.queued_at, logged_at);
+
+                match outcome {
+                    SendOutcome::Defer => {
+                        info!(
+                            job_id = %job.job_id,
+                            from_email = %strip_brackets(&email.from),
+                            recipient = %email.to.iter().map(|s| strip_brackets(s)).collect::<Vec<_>>().join(","),
+                            subject = %fmt_option(subject.as_deref()),
+                            status = "deferred",
+                            smtp_response = %smtp_response,
+                            queued_at = %fmt_option_rfc3339(email.queued_at),
+                            logged_at = %fmt_rfc3339(logged_at),
+                            delay_ms = %fmt_option(delay_ms),
+                            attempt = %(job.attempts + 1),
+                            "email delivery"
+                        );
+                        self.defer_email(job).await?;
                         Ok(())
                     }
-                    _ => {
-                        let logged_at = Utc::now();
-                        let delay_ms = calc_delay_ms(email.queued_at, logged_at);
+                    SendOutcome::Bounce => {
                         info!(
                             job_id = %job.job_id,
                             from_email = %strip_brackets(&email.from),
                             recipient = %email.to.iter().map(|s| strip_brackets(s)).collect::<Vec<_>>().join(","),
                             subject = %fmt_option(subject.as_deref()),
                             status = "bounced",
-                            smtp_response = %format!("{:#}", e),
+                            smtp_response = %smtp_response,
                             queued_at = %fmt_option_rfc3339(email.queued_at),
                             logged_at = %fmt_rfc3339(logged_at),
                             delay_ms = %fmt_option(delay_ms),
@@ -587,7 +593,12 @@ impl Worker {
 
             // Try each MX record in order of preference
             let mut success = false;
-            let mut last_error: Option<miette::Report> = None;
+            // Track the most recent per-MX failure as a typed error. We classify
+            // here — while the live `lettre::transport::smtp::Error` is still
+            // accessible — rather than wrapping it in a `miette::Report` and
+            // trying to downcast later (which doesn't work; see the unit test
+            // `into_diagnostic_makes_original_error_unreachable`).
+            let mut last_error: Option<ClassifiedSendError> = None;
             for mx_record in mx.iter() {
                 debug!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
 
@@ -657,11 +668,25 @@ impl Worker {
                     }
                     Err(err) => {
                         metrics::record_send_failure(parsed_email_id.get_domain());
-                        let report = Err::<(), _>(err)
-                            .into_diagnostic()
-                            .wrap_err("sending raw message")
-                            .unwrap_err();
-                        last_error = Some(report);
+                        // Classify here, where `err` still has its concrete
+                        // lettre type. Build the response string up-front so
+                        // the wrapping for `Report` carries no live error.
+                        let outcome = classify_smtp_outcome(
+                            err.is_transient(),
+                            err.is_permanent(),
+                            err.status().map(u16::from),
+                        );
+                        let smtp_response = format!("sending raw message: {}", err);
+                        warn!(
+                            mx = %exchange,
+                            outcome = ?outcome,
+                            error = %smtp_response,
+                            "MX delivery attempt failed"
+                        );
+                        last_error = Some(ClassifiedSendError {
+                            outcome,
+                            smtp_response,
+                        });
                     }
                 }
             }
@@ -684,8 +709,10 @@ impl Worker {
                     }
                 }
                 error!(to = ?to, "Failed to send email through any MX server");
-                if let Some(err) = last_error {
-                    return Err(err);
+                if let Some(classified) = last_error {
+                    // Use `Report::new` (NOT `into_diagnostic`) so the typed
+                    // error survives downcast in `process_job`.
+                    return Err(miette::Report::new(classified));
                 }
                 metrics::record_send_failure(parsed_email_id.get_domain());
                 bail!("failed to send email through any MX server");
@@ -725,6 +752,70 @@ impl Worker {
 
         ((400..500).contains(&code)) || ADDITIONAL_RETRYABLE_CODES.contains(&code)
     }
+}
+
+/// What `process_job` should do with a failed delivery attempt.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SendOutcome {
+    /// Move the email to the deferred queue and retry later with backoff.
+    Defer,
+    /// Move the email to the bounced queue. Permanent failure.
+    Bounce,
+}
+
+/// An SMTP delivery failure that has already been classified into
+/// defer-vs-bounce by `send_email`, plus the SMTP response string for logging.
+///
+/// Why a typed error rather than `miette::Report`: `process_job` needs to read
+/// the outcome back out, and miette's `into_diagnostic` wraps the original
+/// error in a `pub(crate) DiagnosticError` whose inner type is unreachable
+/// from user code (`Report::downcast_ref` and `Report::chain().find_map` both
+/// fail to recover it — see the unit test
+/// `into_diagnostic_makes_original_error_unreachable`). So `send_email`
+/// classifies inside the per-MX loop, where it still has the live
+/// `lettre::transport::smtp::Error`, and returns a `Report` constructed
+/// directly from this typed error via `Report::new(...)`. That `Report` IS
+/// downcastable to `ClassifiedSendError`, so `process_job` reads `outcome`
+/// and `smtp_response` straight off it without any chain walking.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("{smtp_response}")]
+pub(crate) struct ClassifiedSendError {
+    pub(crate) outcome: SendOutcome,
+    pub(crate) smtp_response: String,
+}
+
+/// Classify an SMTP delivery failure into defer-vs-bounce.
+///
+/// Inputs are *facts* extracted from the underlying `lettre::transport::smtp::Error`
+/// (transient/permanent flags + status code) rather than the error itself,
+/// because lettre's `Kind` enum and `Error` constructors are crate-private.
+/// This keeps the policy a pure function we can exhaustively unit-test.
+///
+/// Policy:
+/// - Transient (4xx) → defer (RFC 5321: try again later).
+/// - Permanent (5xx) → defer if the code is in `Worker::is_retryable`'s list,
+///   otherwise bounce.
+/// - Anything else (network / TLS / timeout / connection / parse) → defer,
+///   because those are transient infrastructure failures and bouncing them
+///   silently loses mail on momentary blips.
+pub(crate) fn classify_smtp_outcome(
+    is_transient: bool,
+    is_permanent: bool,
+    status: Option<u16>,
+) -> SendOutcome {
+    if is_transient {
+        return SendOutcome::Defer;
+    }
+    if is_permanent {
+        return match status {
+            Some(code) if Worker::is_retryable(code) => SendOutcome::Defer,
+            _ => SendOutcome::Bounce,
+        };
+    }
+    SendOutcome::Defer
+}
+
+impl Worker {
 
     /// Inserts a DKIM signature into a raw email body.
     /// The signature should be inserted after the last existing header but before the message body.
@@ -927,5 +1018,109 @@ mod tests {
             result.is_err(),
             "Expected an error when there is no header-body separator"
         );
+    }
+
+    // --- classify_smtp_outcome ---
+    //
+    // These tests pin the policy used to decide whether a failed delivery should
+    // be deferred (retried later) or permanently bounced. The classifier takes
+    // *facts* extracted from the underlying error rather than the lettre Error
+    // itself, because lettre's Kind enum and Error constructors are crate-private
+    // — this lets us exhaustively unit-test the policy without smuggling in
+    // crate-private types.
+
+    #[test]
+    fn classify_transient_4xx_defers() {
+        // A 421 from Yahoo (TSS04 reputation throttle) must defer, not bounce.
+        let outcome = classify_smtp_outcome(true, false, Some(421));
+        assert_eq!(outcome, SendOutcome::Defer);
+    }
+
+    #[test]
+    fn classify_transient_no_status_defers() {
+        // Defensive: lettre's Kind::Transient always carries a code today, but
+        // if status() ever returns None, we still defer (transient = retry).
+        let outcome = classify_smtp_outcome(true, false, None);
+        assert_eq!(outcome, SendOutcome::Defer);
+    }
+
+    #[test]
+    fn classify_permanent_550_defers_per_policy() {
+        // 550 is in is_retryable()'s additional-codes list; classifier honors it.
+        let outcome = classify_smtp_outcome(false, true, Some(550));
+        assert_eq!(outcome, SendOutcome::Defer);
+    }
+
+    #[test]
+    fn classify_permanent_521_defers_per_policy() {
+        let outcome = classify_smtp_outcome(false, true, Some(521));
+        assert_eq!(outcome, SendOutcome::Defer);
+    }
+
+    #[test]
+    fn classify_permanent_555_bounces() {
+        // 555 (Mail/Rcpt parameters not implemented) is not in the retryable list.
+        let outcome = classify_smtp_outcome(false, true, Some(555));
+        assert_eq!(outcome, SendOutcome::Bounce);
+    }
+
+    #[test]
+    fn classify_permanent_no_status_bounces() {
+        // Defensive: a permanent error without a status is treated as bounce.
+        let outcome = classify_smtp_outcome(false, true, None);
+        assert_eq!(outcome, SendOutcome::Bounce);
+    }
+
+    /// Pins the trap that ate the first version of this fix:
+    /// `into_diagnostic()` wraps the original error in miette's `pub(crate)`
+    /// `DiagnosticError(Box<dyn Error>)` with `#[error(transparent)]`. That
+    /// renders the original error type **unreachable from user code** —
+    /// `Report::downcast_ref` and `Report::chain().find_map` both fail to
+    /// recover it. The only working pattern is to construct the `Report`
+    /// directly from a type we own (via `Report::new(typed_err)`), which is
+    /// what `send_email` now does for SMTP failures.
+    #[test]
+    fn into_diagnostic_makes_original_error_unreachable() {
+        use miette::{IntoDiagnostic, WrapErr};
+        let err: Result<(), std::io::Error> =
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+        let report = err
+            .into_diagnostic()
+            .wrap_err("sending raw message")
+            .unwrap_err();
+
+        // Both fail because miette's DiagnosticError swallows the inner type.
+        assert!(report.downcast_ref::<std::io::Error>().is_none());
+        assert!(report
+            .chain()
+            .find_map(|e| e.downcast_ref::<std::io::Error>())
+            .is_none());
+    }
+
+    /// Counter-test: a `Report` built directly from our own typed error
+    /// IS downcastable. This is the pattern `send_email` uses for the
+    /// pre-classified `ClassifiedSendError`, so `process_job` can read
+    /// the outcome back out.
+    #[test]
+    fn report_built_from_owned_type_is_downcastable() {
+        let classified = ClassifiedSendError {
+            outcome: SendOutcome::Defer,
+            smtp_response: "transient error (421): TSS04".to_string(),
+        };
+        let report = miette::Report::new(classified);
+
+        let recovered = report.downcast_ref::<ClassifiedSendError>();
+        assert!(recovered.is_some());
+        assert_eq!(recovered.unwrap().outcome, SendOutcome::Defer);
+    }
+
+    #[test]
+    fn classify_non_response_error_defers() {
+        // Network / TLS / Timeout / Connection errors aren't transient or
+        // permanent SMTP responses. They're transient infrastructure issues
+        // and must be deferred — bouncing them silently loses mail when a
+        // single TLS handshake hiccups.
+        let outcome = classify_smtp_outcome(false, false, None);
+        assert_eq!(outcome, SendOutcome::Defer);
     }
 }
