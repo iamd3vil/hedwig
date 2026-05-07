@@ -13,6 +13,7 @@ use moka::{future::Cache, Expiry};
 use smtp::{Email, SmtpCallbacks, SmtpError};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
@@ -104,18 +105,30 @@ impl Callbacks {
             .unwrap_or_default();
 
         let mut worker_handles = Vec::new();
+        let helo_hostname = cfg.server.helo_hostname.clone();
+        if let Some(name) = helo_hostname.as_deref() {
+            if !name.contains('.') {
+                warn!(
+                    helo_hostname = %name,
+                    "configured HELO/EHLO hostname does not look like a public FQDN"
+                );
+            }
+        }
+
         for _ in 0..worker_count {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
             let dkim = cfg.server.dkim.clone();
             let mx_cache = mx_cache.clone();
             let rate_limit_config = rate_limit_config.clone();
+            let helo_hostname = helo_hostname.clone();
             let resolver = resolver.clone();
             let mta_sts = mta_sts_resolver.clone();
             let handle = tokio::spawn(async move {
                 let worker_config = worker::WorkerConfig {
                     disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
                     outbound_local: cfg.server.outbound_local.unwrap_or(false),
+                    helo_hostname,
                     pool_size: cfg.server.pool_size.unwrap_or(100),
                     rate_limit_config,
                 };
@@ -452,6 +465,7 @@ mod tests {
                 dkim: None,
                 disable_outbound: Some(false),
                 outbound_local: Some(false),
+                helo_hostname: None,
                 pool_size: Some(10),
                 rate_limits: None,
                 metrics: None,
@@ -1159,11 +1173,7 @@ mod tests {
             Ok(None)
         }
 
-        async fn put(
-            &self,
-            _email: StoredEmail,
-            _status: Status,
-        ) -> Result<(), miette::Report> {
+        async fn put(&self, _email: StoredEmail, _status: Status) -> Result<(), miette::Report> {
             Err(miette::Report::msg("Storage error"))
         }
 
@@ -1236,6 +1246,7 @@ mod tests {
                 auth: None,
                 disable_outbound: None,
                 outbound_local: None,
+                helo_hostname: None,
                 pool_size: None,
                 rate_limits: None,
                 metrics: None,

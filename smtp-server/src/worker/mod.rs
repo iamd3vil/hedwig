@@ -95,6 +95,7 @@ pub enum DkimSignerType {
 pub struct WorkerConfig {
     pub disable_outbound: bool,
     pub outbound_local: bool,
+    pub helo_hostname: Option<String>,
     pub pool_size: u64,
     pub rate_limit_config: RateLimitConfig,
 }
@@ -137,7 +138,11 @@ impl Worker {
         mta_sts: Arc<MtaStsResolver>,
     ) -> Result<Self> {
         info!("Initializing SMTP worker");
-        let pool = PoolManager::new(config.pool_size, config.outbound_local);
+        let pool = PoolManager::new(
+            config.pool_size,
+            config.outbound_local,
+            config.helo_hostname.clone(),
+        );
 
         // Create DKIM signer if dkim is enabled.
         let dkim_signer = match dkim {
@@ -821,7 +826,6 @@ pub(crate) fn classify_smtp_outcome(
 }
 
 impl Worker {
-
     /// Inserts a DKIM signature into a raw email body.
     /// The signature should be inserted after the last existing header but before the message body.
     pub fn insert_dkim_signature(raw_email: &[u8], dkim_signature: &str) -> Result<Vec<u8>> {

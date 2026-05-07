@@ -29,7 +29,10 @@ max_retries = 5               # Maximum retry attempts for failed emails (defaul
 disable_outbound = false      # Disable outbound email delivery for testing
 outbound_local = false        # Use local/insecure connections for outbound delivery
 pool_size = 100              # SMTP connection pool size per domain (default: 100)
+helo_hostname = "mail.example.com" # Public FQDN advertised in outbound HELO/EHLO
 ```
+
+Set `helo_hostname` in production to the public hostname for the sending IP. Many receivers expect the outbound EHLO name to be a public FQDN with matching reverse DNS. If omitted, Hedwig keeps lettre's default behavior, which uses the machine hostname.
 
 ## Listeners (`[[server.listeners]]`)
 

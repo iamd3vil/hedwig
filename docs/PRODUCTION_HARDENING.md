@@ -40,9 +40,17 @@ Configurable via `server.max_connections` (default: 1000). Uses `tokio::sync::Se
 
 ---
 
+### 5. ~~Outbound HELO/EHLO used container hostname~~ → Fixed
+
+**Status:** Fixed via `server.helo_hostname`.
+
+Production deployments should set `server.helo_hostname` to the public FQDN for the sending IP. Strict receivers commonly expect the EHLO name to align with forward-confirmed reverse DNS for the connecting IP.
+
+---
+
 ## 🟡 Important
 
-### 5. ~~Filesystem storage lacks durability guarantees~~ → Addressed (SQLite backend)
+### 6. ~~Filesystem storage lacks durability guarantees~~ → Addressed (SQLite backend)
 
 **Status:** Addressed via `SqliteStorage` backend (`storage_type = "sqlite"`). SQLite transactions provide atomic writes — no partial writes, no fsync gaps. See `docs/specs/2026-03-29-sqlite-storage-design.md`.
 
@@ -62,7 +70,7 @@ Configurable via `server.max_connections` (default: 1000). Uses `tokio::sync::Se
 
 ---
 
-### 6. ~~Filesystem storage doesn't scale to millions of files~~ → Addressed (SQLite backend)
+### 7. ~~Filesystem storage doesn't scale to millions of files~~ → Addressed (SQLite backend)
 
 **Status:** Addressed via `SqliteStorage` backend. Sharded SQLite databases with indexed queries replace flat directory walks. See `docs/specs/2026-03-29-sqlite-storage-design.md`.
 
@@ -74,7 +82,7 @@ Configurable via `server.max_connections` (default: 1000). Uses `tokio::sync::Se
 
 ---
 
-### 7. STARTTLS is broken on plaintext listeners
+### 8. STARTTLS is broken on plaintext listeners
 
 **Problem:** Two issues:
 1. `main.rs` never calls `SmtpServer::with_tls()`, so the SMTP session never has a `tls_acceptor` and STARTTLS is never advertised on plaintext listeners.
@@ -92,7 +100,7 @@ Implicit TLS (port 465) works fine via the TLS acceptor in the listener. But STA
 
 ---
 
-### 8. Retry backoff has no jitter
+### 9. Retry backoff has no jitter
 
 **Problem:** `defer_email()` uses `initial_delay * 2^attempts` with no randomization. All deferred emails retry at the same wallclock times, creating "thundering herd" retry storms against the same MX servers.
 
@@ -112,7 +120,7 @@ let delay = Duration::from_secs(delay_secs);
 
 ---
 
-### 9. Rate limiter blocks worker threads
+### 10. Rate limiter blocks worker threads
 
 **Problem:** When a domain is rate-limited, the worker sleeps inline with `tokio::time::sleep(retry_after)`. With 4 workers all sending to the same popular domain (e.g. gmail.com), all 4 can sleep simultaneously, halting all outbound delivery.
 
@@ -127,7 +135,7 @@ RateLimitResult::RateLimited { retry_after } => {
 
 ---
 
-### 10. `is_retryable()` treats permanent 5xx errors as retryable
+### 11. `is_retryable()` treats permanent 5xx errors as retryable
 
 **Problem:** The retry logic retries SMTP codes like 550 (mailbox not found), 551 (user not local), 553 (bad address syntax), and 554 (transaction failed). These are permanent errors per RFC 5321 — retrying them wastes resources, delays bounce notification, and can harm sender reputation.
 
@@ -150,7 +158,7 @@ Bounce immediately on 5xx — these are permanent failures.
 
 ---
 
-### 11. AUTH advertised without TLS
+### 12. AUTH advertised without TLS
 
 **Problem:** When auth is enabled, `AUTH PLAIN LOGIN` is advertised even on plaintext listeners. Clients may send credentials in cleartext over the wire.
 
@@ -163,25 +171,25 @@ Bounce immediately on 5xx — these are permanent failures.
 
 ## 🟢 Nice to Have
 
-### 12. No bounce/DSN generation
+### 13. No bounce/DSN generation
 
 When delivery permanently fails, the original sender is never notified. Real MTAs generate a Delivery Status Notification (RFC 3461/3464) bounce message back to the envelope sender. Without this, senders have no way to know their email was lost.
 
 ---
 
-### 13. No recipient grouping per domain
+### 14. No recipient grouping per domain
 
 Emails to multiple recipients at the same domain are sent as separate SMTP transactions (one per recipient). Grouping them into a single transaction with multiple `RCPT TO` would reduce connection overhead and be more MX-friendly.
 
 ---
 
-### 14. No queue prioritization
+### 15. No queue prioritization
 
 All emails are treated equally. No way to prioritize transactional email (password resets, receipts) over bulk/marketing email. A large bulk send can delay time-sensitive transactional mail.
 
 ---
 
-### 15. Rate limiter buckets are never evicted
+### 16. Rate limiter buckets are never evicted
 
 `rate_limiter.rs` creates a `TokenBucket` per domain in a `HashMap` behind a `RwLock`. Buckets are never removed, so memory grows with every unique domain ever seen. At millions of emails across diverse domains, this becomes significant.
 
@@ -189,13 +197,13 @@ All emails are treated equally. No way to prioritize transactional email (passwo
 
 ---
 
-### 16. Hardcoded outbound transport parameters
+### 17. Hardcoded outbound transport parameters
 
 `pool.rs` hardcodes connection pool settings (`min_idle(10)`, `max_size(100)`), SMTP port (25), and timeout (10s). These should be configurable for different deployment environments.
 
 ---
 
-### 17. `process_job` uses `println!` instead of tracing
+### 18. `process_job` uses `println!` instead of tracing
 
 `DeferredWorker::process_deferred_jobs()` uses `println!` for its startup message instead of structured `tracing::info!`. Minor but inconsistent with the rest of the codebase.
 

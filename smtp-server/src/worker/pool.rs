@@ -1,6 +1,6 @@
 use crate::metrics;
 use lettre::{
-    transport::smtp::{client::TlsParameters, PoolConfig},
+    transport::smtp::{client::TlsParameters, extension::ClientId, PoolConfig},
     AsyncSmtpTransport, Tokio1Executor,
 };
 use miette::{Context, IntoDiagnostic, Result};
@@ -10,6 +10,8 @@ use moka::future::Cache;
 pub struct PoolManager {
     /// Indicates if the outbound connection is to a local server.
     outbound_local: bool,
+    /// Optional public FQDN to use for HELO/EHLO.
+    helo_hostname: Option<String>,
     /// A cache of SMTP transports, keyed by domain.
     pools: Cache<String, AsyncSmtpTransport<Tokio1Executor>>,
 }
@@ -21,10 +23,12 @@ impl PoolManager {
     ///
     /// * `pool_size` - The maximum number of SMTP transports to cache.
     /// * `outbound_local` - If true, the manager will create a client without TLS.
-    pub fn new(pool_size: u64, outbound_local: bool) -> Self {
+    /// * `helo_hostname` - Optional public FQDN to advertise in HELO/EHLO.
+    pub fn new(pool_size: u64, outbound_local: bool, helo_hostname: Option<String>) -> Self {
         let cache: Cache<String, AsyncSmtpTransport<Tokio1Executor>> = Cache::new(pool_size);
         PoolManager {
             outbound_local,
+            helo_hostname,
             pools: cache,
         }
     }
@@ -61,19 +65,25 @@ impl PoolManager {
     ) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
         // If outbound_local is set, use builder_dangerous to create a client.
         if self.outbound_local {
-            return Ok(AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(domain).build());
+            let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(domain);
+            if let Some(name) = self.helo_hostname.as_deref() {
+                builder = builder.hello_name(ClientId::Domain(name.to_string()));
+            }
+            return Ok(builder.build());
         }
 
         let pool_cfg = PoolConfig::new().min_idle(10).max_size(100);
         let tls_params = TlsParameters::new(domain.into())
             .into_diagnostic()
             .wrap_err("tls params")?;
-        let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(domain)
+        let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(domain)
             .port(25)
             .tls(lettre::transport::smtp::client::Tls::Required(tls_params))
             .timeout(Some(std::time::Duration::from_secs(10)))
-            .pool_config(pool_cfg)
-            .build();
-        Ok(transport)
+            .pool_config(pool_cfg);
+        if let Some(name) = self.helo_hostname.as_deref() {
+            builder = builder.hello_name(ClientId::Domain(name.to_string()));
+        }
+        Ok(builder.build())
     }
 }

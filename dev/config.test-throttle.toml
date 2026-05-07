@@ -17,6 +17,7 @@ disable_outbound = false
 # matches our fake-throttle and mailpit setups (mailpit advertises STARTTLS
 # but the fake-throttle doesn't).
 outbound_local = true
+helo_hostname = "hedwig.local"
 
 [[server.listeners]]
 addr = "0.0.0.0:2525"
