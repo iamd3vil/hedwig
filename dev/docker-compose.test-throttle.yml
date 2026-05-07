@@ -1,0 +1,11 @@
+# Compose override for the transient-error end-to-end test.
+# Pairs with dev/config.test-throttle.toml.
+#
+# Usage from the repo root:
+#   cd dev && docker compose -f docker-compose.yml -f docker-compose.test-throttle.yml up
+
+services:
+  smtp:
+    image: dev-smtp:latest
+    build: !reset null
+    command: ["cargo", "watch", "-x", "run --release -- --config /app/dev/config.test-throttle.toml"]

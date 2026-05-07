@@ -1,0 +1,46 @@
+# Dev config used to verify transient-error handling end-to-end.
+#
+# Differs from config.toml in one place: `disable_outbound = false`, so
+# Hedwig actually attempts delivery and exercises the per-MX error path.
+# Pair with the `fake-throttle` service in docker-compose.yml — any mail to
+# *.throttle.test will be sent to a fake MTA that returns 421 4.7.0 [TSS04],
+# letting us assert Hedwig defers (rather than bounces) the message.
+#
+# Run with:
+#   docker compose run --rm -p 2525:2525 -p 2526:2526 smtp \
+#     cargo run --release -- --config /app/dev/config.test-throttle.toml
+
+[server]
+workers = 1
+disable_outbound = false
+# outbound_local = true makes the SMTP transport plaintext (no TLS), which
+# matches our fake-throttle and mailpit setups (mailpit advertises STARTTLS
+# but the fake-throttle doesn't).
+outbound_local = true
+
+[[server.listeners]]
+addr = "0.0.0.0:2525"
+[server.listeners.tls]
+cert_path = "/app/dev/certs/server.pem"
+key_path = "/app/dev/certs/server-key.pem"
+
+[[server.listeners]]
+addr = "0.0.0.0:2526"
+
+[log]
+level = "debug"
+format = "json"
+
+[server.dkim]
+domain = "example.com"
+selector = "default"
+private_key = "/app/dev/certs/dkim-private.pem"
+key_type = "rsa"
+
+[[server.auth]]
+username = "test"
+password = "test"
+
+[storage]
+storage_type = "fs"
+base_path = "/tmp/hedwig-dev-throttle/"

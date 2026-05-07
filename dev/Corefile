@@ -1,8 +1,38 @@
 . {
-    forward . 1.1.1.1 8.8.8.8
     errors
     log
-    template IN MX {
-        answer "{{ .Name }} 3600 IN MX 10 mailpit"
+
+    # Specific zone: any *.throttle.test (and throttle.test itself) resolves
+    # to the fake-throttle MTA, used to test transient-error defer behavior.
+    # `fallthrough` so non-matching queries pass to the next plugin.
+    template IN MX . {
+        match "throttle\.test\.$"
+        answer "{{ .Name }} 3600 IN MX 10 fake-throttle.test."
+        fallthrough
     }
+
+    # A-record overrides so MX targets and aliases actually resolve. Without
+    # these, `forward .` would NXDOMAIN on the Docker container short-names.
+    # `fallthrough` keeps unrelated A queries (e.g. github.com for cargo deps)
+    # flowing to the upstream resolver.
+    template IN A . {
+        match "^fake-throttle\.test\.$"
+        answer "{{ .Name }} 3600 IN A 172.30.0.4"
+        fallthrough
+    }
+    template IN A . {
+        match "^mailpit\.$"
+        answer "{{ .Name }} 3600 IN A 172.30.0.3"
+        fallthrough
+    }
+
+    # Default: every other domain's MX points at mailpit (existing behavior).
+    # No `fallthrough` here — this is the catch-all answer for MX queries.
+    template IN MX . {
+        match "."
+        answer "{{ .Name }} 3600 IN MX 10 mailpit."
+    }
+
+    # Anything else (A/AAAA for non-overridden hosts) goes upstream.
+    forward . 1.1.1.1 8.8.8.8
 }

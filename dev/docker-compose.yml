@@ -27,6 +27,20 @@ services:
         aliases:
           - mailpit
 
+  # Fake destination MTA that always answers MAIL FROM with
+  # `421 4.7.0 [TSS04] ...` — used to verify Hedwig defers (rather than
+  # bounces) transient SMTP errors. See dev/fake-mta/throttle.py.
+  fake-throttle:
+    image: python:3.12-alpine
+    command: ["python", "/app/throttle.py"]
+    volumes:
+      - ./fake-mta:/app:ro
+    networks:
+      smtp_test:
+        ipv4_address: 172.30.0.4
+        aliases:
+          - fake-throttle
+
   smtp:
     build:
       context: .
@@ -49,6 +63,7 @@ services:
     depends_on:
       - dns
       - mailpit
+      - fake-throttle
 
 volumes:
   target:
