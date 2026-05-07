@@ -701,11 +701,16 @@ impl Worker {
                     if policy.mode == PolicyMode::Enforce && last_error.is_none() {
                         error!(to = ?to, "MTA-STS enforce: all MX hosts failed policy validation");
                         metrics::record_send_failure(parsed_email_id.get_domain());
-                        return Err(MtaStsEnforcementError {
+                        // Use `Report::new` (NOT `into_diagnostic`) so the typed
+                        // error survives downcast in `process_job`. Going through
+                        // `into_diagnostic` wraps it in miette's pub(crate)
+                        // DiagnosticError, making the type unreachable from the
+                        // caller — which would silently fall through to the
+                        // bounce arm, defeating the always-defer policy. See
+                        // `mta_sts_error_via_into_diagnostic_is_unreachable`.
+                        return Err(miette::Report::new(MtaStsEnforcementError {
                             domain: domain.to_string(),
-                        })
-                        .into_diagnostic()
-                        .wrap_err("MTA-STS enforcement failure");
+                        }));
                     }
                 }
                 error!(to = ?to, "Failed to send email through any MX server");
@@ -1112,6 +1117,42 @@ mod tests {
         let recovered = report.downcast_ref::<ClassifiedSendError>();
         assert!(recovered.is_some());
         assert_eq!(recovered.unwrap().outcome, SendOutcome::Defer);
+    }
+
+    /// Same trap as `into_diagnostic_makes_original_error_unreachable`,
+    /// but specifically for `MtaStsEnforcementError`. Pins the bug that
+    /// previously made `process_job`'s "MTA-STS enforcement failures are
+    /// always deferred" comment a lie: the downcast on line 296 always
+    /// returned None because the error was wrapped via `into_diagnostic`
+    /// at the originating `Err(...)` site, making the typed error
+    /// unreachable. Enforce failures silently fell through to the bounce
+    /// path.
+    #[test]
+    fn mta_sts_error_via_into_diagnostic_is_unreachable() {
+        use miette::{IntoDiagnostic, WrapErr};
+        let report = Err::<(), _>(MtaStsEnforcementError {
+            domain: "example.com".to_string(),
+        })
+        .into_diagnostic()
+        .wrap_err("MTA-STS enforcement failure")
+        .unwrap_err();
+
+        assert!(report.downcast_ref::<MtaStsEnforcementError>().is_none());
+    }
+
+    /// Counter-test: `Report::new(MtaStsEnforcementError { ... })` IS
+    /// downcastable, which is the pattern `send_email` must use so
+    /// `process_job` can recognize MTA-STS enforce failures and defer.
+    #[test]
+    fn mta_sts_error_via_report_new_is_downcastable() {
+        let err = MtaStsEnforcementError {
+            domain: "example.com".to_string(),
+        };
+        let report = miette::Report::new(err);
+
+        let recovered = report.downcast_ref::<MtaStsEnforcementError>();
+        assert!(recovered.is_some());
+        assert_eq!(recovered.unwrap().domain, "example.com");
     }
 
     #[test]

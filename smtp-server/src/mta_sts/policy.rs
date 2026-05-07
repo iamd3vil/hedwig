@@ -48,7 +48,7 @@ pub enum PolicyParseError {
     InvalidMaxAge(String),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 #[error("MTA-STS enforce: all MX hosts failed policy validation for domain {domain}")]
 pub struct MtaStsEnforcementError {
     pub domain: String,
