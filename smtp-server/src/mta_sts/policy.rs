@@ -315,19 +315,17 @@ mod tests {
     #[test]
     fn parse_policy_rejects_max_age_exceeding_limit() {
         // RFC 8461 §3.2: max value is 31557600 (~1 year)
-        let err = parse_policy(
-            "version: STSv1\nmode: enforce\nmx: mail.example.com\nmax_age: 31557601",
-        )
-        .unwrap_err();
+        let err =
+            parse_policy("version: STSv1\nmode: enforce\nmx: mail.example.com\nmax_age: 31557601")
+                .unwrap_err();
         assert_eq!(err, PolicyParseError::InvalidMaxAge("31557601".into()));
     }
 
     #[test]
     fn parse_policy_accepts_max_age_at_limit() {
-        let policy = parse_policy(
-            "version: STSv1\nmode: enforce\nmx: mail.example.com\nmax_age: 31557600",
-        )
-        .unwrap();
+        let policy =
+            parse_policy("version: STSv1\nmode: enforce\nmx: mail.example.com\nmax_age: 31557600")
+                .unwrap();
         assert_eq!(policy.max_age, 31_557_600);
     }
 

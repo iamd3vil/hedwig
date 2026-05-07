@@ -1,7 +1,7 @@
-use async_trait::async_trait;
 use crate::config::CfgSqlite;
 use crate::storage::{CleanupConfig, Status, Storage, StoredEmail};
 use crate::worker::EmailMetadata;
+use async_trait::async_trait;
 use futures::Stream;
 use miette::{Context, IntoDiagnostic, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -247,11 +247,16 @@ async fn process_write_batch(
 
     for op in ops {
         match op {
-            ShardWriteOp::Put { email, status, responder } => {
+            ShardWriteOp::Put {
+                email,
+                status,
+                responder,
+            } => {
                 let to_addrs = match serde_json::to_string(&email.to) {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = responder.send(Err(miette::miette!("failed to serialize to_addrs: {}", e)));
+                        let _ = responder
+                            .send(Err(miette::miette!("failed to serialize to_addrs: {}", e)));
                         continue;
                     }
                 };
@@ -281,7 +286,11 @@ async fn process_write_batch(
                     }
                 }
             }
-            ShardWriteOp::PutMeta { key, meta, responder } => {
+            ShardWriteOp::PutMeta {
+                key,
+                meta,
+                responder,
+            } => {
                 responders.push(responder);
                 let last_attempt = meta
                     .last_attempt
@@ -312,15 +321,18 @@ async fn process_write_batch(
                     }
                 }
             }
-            ShardWriteOp::Delete { key, status, responder } => {
+            ShardWriteOp::Delete {
+                key,
+                status,
+                responder,
+            } => {
                 responders.push(responder);
-                if let Err(e) = sqlx::query(
-                    "DELETE FROM emails WHERE message_id = ? AND status = ?",
-                )
-                .bind(&key)
-                .bind(status)
-                .execute(&mut *tx)
-                .await
+                if let Err(e) =
+                    sqlx::query("DELETE FROM emails WHERE message_id = ? AND status = ?")
+                        .bind(&key)
+                        .bind(status)
+                        .execute(&mut *tx)
+                        .await
                 {
                     tracing::error!(shard_id, error = %e, key = %key, "Delete failed");
                     if !batch_failed {
@@ -348,7 +360,13 @@ async fn process_write_batch(
                     }
                 }
             }
-            ShardWriteOp::Mv { src_key, dest_key, src_status, dest_status, responder } => {
+            ShardWriteOp::Mv {
+                src_key,
+                dest_key,
+                src_status,
+                dest_status,
+                responder,
+            } => {
                 responders.push(responder);
                 match sqlx::query(
                     "UPDATE emails SET message_id = ?, status = ?, updated_at = ? WHERE message_id = ? AND status = ?",
@@ -384,13 +402,12 @@ async fn process_write_batch(
                 responders.push(responder);
                 if let Some(bounced_retention) = config.bounced_retention {
                     let cutoff = now - bounced_retention.as_millis() as i64;
-                    if let Err(e) = sqlx::query(
-                        "DELETE FROM emails WHERE status = ? AND updated_at < ?",
-                    )
-                    .bind(status_to_int(&Status::Bounced))
-                    .bind(cutoff)
-                    .execute(&mut *tx)
-                    .await
+                    if let Err(e) =
+                        sqlx::query("DELETE FROM emails WHERE status = ? AND updated_at < ?")
+                            .bind(status_to_int(&Status::Bounced))
+                            .bind(cutoff)
+                            .execute(&mut *tx)
+                            .await
                     {
                         tracing::error!(shard_id, error = %e, "Cleanup bounced failed");
                         if !batch_failed {
@@ -402,13 +419,12 @@ async fn process_write_batch(
                 }
                 if let Some(deferred_retention) = config.deferred_retention {
                     let cutoff = now - deferred_retention.as_millis() as i64;
-                    if let Err(e) = sqlx::query(
-                        "DELETE FROM emails WHERE status = ? AND updated_at < ?",
-                    )
-                    .bind(status_to_int(&Status::Deferred))
-                    .bind(cutoff)
-                    .execute(&mut *tx)
-                    .await
+                    if let Err(e) =
+                        sqlx::query("DELETE FROM emails WHERE status = ? AND updated_at < ?")
+                            .bind(status_to_int(&Status::Deferred))
+                            .bind(cutoff)
+                            .execute(&mut *tx)
+                            .await
                     {
                         tracing::error!(shard_id, error = %e, "Cleanup deferred failed");
                         if !batch_failed {
@@ -454,7 +470,12 @@ async fn shard_writer_task(
     batch_timeout_ms: u64,
 ) {
     let batch_timeout = Duration::from_millis(batch_timeout_ms);
-    tracing::info!(shard_id, batch_size, batch_timeout_ms, "shard writer task started");
+    tracing::info!(
+        shard_id,
+        batch_size,
+        batch_timeout_ms,
+        "shard writer task started"
+    );
 
     let mut batch: VecDeque<ShardWriteOp> = VecDeque::with_capacity(batch_size);
 
@@ -494,7 +515,11 @@ async fn shard_writer_task(
         batch.push_back(op);
     }
     if !batch.is_empty() {
-        tracing::info!(shard_id, remaining = batch.len(), "flushing remaining ops before shutdown");
+        tracing::info!(
+            shard_id,
+            remaining = batch.len(),
+            "flushing remaining ops before shutdown"
+        );
         process_write_batch(shard_id, &pool, &mut batch).await;
     }
 
@@ -780,10 +805,10 @@ impl Storage for SqliteStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::CleanupConfig;
     use futures::StreamExt;
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
-    use crate::storage::CleanupConfig;
 
     fn default_sqlite_cfg() -> CfgSqlite {
         CfgSqlite {
@@ -798,7 +823,9 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
         let cfg = default_sqlite_cfg();
-        let storage = SqliteStorage::new(&base_path, 2, 10, 5, &cfg).await.unwrap();
+        let storage = SqliteStorage::new(&base_path, 2, 10, 5, &cfg)
+            .await
+            .unwrap();
         // Leak temp_dir so it's not deleted while storage is alive.
         std::mem::forget(temp_dir);
         storage
@@ -1052,7 +1079,10 @@ mod tests {
         storage.cleanup(&config).await.unwrap();
 
         let result = storage.get("msg_cleanup_b", Status::Bounced).await.unwrap();
-        assert!(result.is_none(), "old bounced email should have been removed");
+        assert!(
+            result.is_none(),
+            "old bounced email should have been removed"
+        );
     }
 
     #[tokio::test]
@@ -1074,7 +1104,10 @@ mod tests {
             .get("msg_cleanup_d", Status::Deferred)
             .await
             .unwrap();
-        assert!(result.is_none(), "old deferred email should have been removed");
+        assert!(
+            result.is_none(),
+            "old deferred email should have been removed"
+        );
     }
 
     #[tokio::test]
@@ -1095,6 +1128,9 @@ mod tests {
             .get("msg_cleanup_recent", Status::Bounced)
             .await
             .unwrap();
-        assert!(result.is_some(), "recent bounced email should not have been removed");
+        assert!(
+            result.is_some(),
+            "recent bounced email should not have been removed"
+        );
     }
 }

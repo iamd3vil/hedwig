@@ -317,9 +317,7 @@ impl SmtpServer {
                 if data_buffer.len() > self.max_message_size {
                     // Check if the terminator is already in the buffer.
                     if memchr::memmem::find(&data_buffer, b"\r\n.\r\n").is_some() {
-                        stream
-                            .write_line(b"552 5.3.4 Message too big\r\n")
-                            .await?;
+                        stream.write_line(b"552 5.3.4 Message too big\r\n").await?;
                         data_buffer.clear();
                         session.state = SessionState::Authenticated;
                     }
@@ -349,7 +347,9 @@ impl SmtpServer {
                                 span: (0, data_buffer.len()).into(),
                             }
                         })?;
-                        self.callbacks.on_data(std::mem::take(&mut session.email)).await?;
+                        self.callbacks
+                            .on_data(std::mem::take(&mut session.email))
+                            .await?;
                         stream.write_line(b"250 OK\r\n").await?;
                         session.state = SessionState::Authenticated;
                         data_buffer.clear();

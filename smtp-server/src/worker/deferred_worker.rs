@@ -44,7 +44,10 @@ impl DeferredWorker {
     ///
     /// Runs until the `shutdown` token is cancelled.
     pub async fn run(&self, shutdown: CancellationToken) {
-        info!("deferred worker started (scan interval: {}s)", SCAN_INTERVAL.as_secs());
+        info!(
+            "deferred worker started (scan interval: {}s)",
+            SCAN_INTERVAL.as_secs()
+        );
 
         // Run an initial scan immediately on startup.
         if let Err(e) = self.process_deferred_jobs().await {
