@@ -20,6 +20,7 @@ use miette::{bail, Context, IntoDiagnostic, Result};
 use memchr::memmem;
 use moka::future::Cache;
 use pool::PoolManager;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -572,7 +573,8 @@ impl Worker {
             // Sort mx according to preference in ascending order.
             let mut mx = mx_lookup.iter().collect::<Vec<&MX>>();
 
-            // Sort in place using Rust's standard sort
+            // Shuffle first so the stable sort randomizes equal-preference MXes.
+            mx.shuffle(&mut rand::thread_rng());
             mx.sort_by_key(|a| a.preference());
 
             // Look up MTA-STS policy for the recipient domain.
