@@ -16,8 +16,12 @@ format = "fmt"
 [server]
 workers = 4
 max_retries = 3
-pool_size = 50
 helo_hostname = "mail.example.com"
+
+[server.smtp]
+cache_size = 100
+min_idle = 2
+max_size = 10
 
 # Multiple listeners
 [[server.listeners]]

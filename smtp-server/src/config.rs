@@ -42,6 +42,8 @@ pub struct CfgServer {
     pub disable_outbound: Option<bool>,
     pub outbound_local: Option<bool>,
     pub helo_hostname: Option<String>,
+    pub smtp: Option<CfgSmtp>,
+    /// Deprecated: use server.smtp.cache_size instead.
     pub pool_size: Option<u64>,
     pub rate_limits: Option<CfgRateLimits>,
     pub metrics: Option<CfgMetrics>,
@@ -117,6 +119,16 @@ pub struct CfgDKIM {
 pub struct CfgAuth {
     pub username: String,
     pub password: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct CfgSmtp {
+    /// Number of per-domain SMTP transports to keep in the outer cache.
+    pub cache_size: Option<u64>,
+    /// Minimum number of idle connections per destination SMTP transport.
+    pub min_idle: Option<u32>,
+    /// Maximum number of pooled connections per destination SMTP transport.
+    pub max_size: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

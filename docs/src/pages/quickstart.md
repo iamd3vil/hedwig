@@ -15,8 +15,11 @@ Create a `config.toml` (or a HUML config if you prefer that format):
 ```toml
 [server]
 workers = 4
-pool_size = 100
 max_retries = 5
+
+[server.smtp]
+min_idle = 2
+max_size = 10
 
 [[server.listeners]]
 addr = "0.0.0.0:25"

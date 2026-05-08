@@ -42,7 +42,10 @@ server::
     bind: "0.0.0.0:8080"
   helo_hostname: "mail.example.com"
   outbound_local: false
-  pool_size: 100
+  smtp::
+    cache_size: 100
+    max_size: 10
+    min_idle: 2
   workers: 4
 
 storage::

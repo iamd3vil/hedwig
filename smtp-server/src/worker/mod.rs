@@ -20,6 +20,9 @@ use miette::{bail, Context, IntoDiagnostic, Result};
 use memchr::memmem;
 use moka::future::Cache;
 use pool::PoolManager;
+pub use pool::{
+    SmtpPoolConfig, DEFAULT_SMTP_CACHE_SIZE, DEFAULT_SMTP_POOL_MAX_SIZE, DEFAULT_SMTP_POOL_MIN_IDLE,
+};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -97,7 +100,7 @@ pub struct WorkerConfig {
     pub disable_outbound: bool,
     pub outbound_local: bool,
     pub helo_hostname: Option<String>,
-    pub pool_size: u64,
+    pub smtp_pool: SmtpPoolConfig,
     pub rate_limit_config: RateLimitConfig,
 }
 
@@ -140,7 +143,7 @@ impl Worker {
     ) -> Result<Self> {
         info!("Initializing SMTP worker");
         let pool = PoolManager::new(
-            config.pool_size,
+            config.smtp_pool.clone(),
             config.outbound_local,
             config.helo_hostname.clone(),
         );

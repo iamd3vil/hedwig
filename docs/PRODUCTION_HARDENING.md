@@ -197,9 +197,11 @@ All emails are treated equally. No way to prioritize transactional email (passwo
 
 ---
 
-### 17. Hardcoded outbound transport parameters
+### 17. Outbound transport parameters are partly configurable
 
-`pool.rs` hardcodes connection pool settings (`min_idle(10)`, `max_size(100)`), SMTP port (25), and timeout (10s). These should be configurable for different deployment environments.
+**Status:** Partially fixed via `[server.smtp]`.
+
+`pool.rs` now reads connection pool settings from `server.smtp.cache_size`, `server.smtp.min_idle`, and `server.smtp.max_size`. SMTP port (25) and timeout (10s) are still fixed and should be configurable for different deployment environments.
 
 ---
 

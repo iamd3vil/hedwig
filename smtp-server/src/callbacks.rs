@@ -13,7 +13,7 @@ use moka::{future::Cache, Expiry};
 use smtp::{Email, SmtpCallbacks, SmtpError};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::{
@@ -115,6 +115,14 @@ impl Callbacks {
             }
         }
 
+        let smtp_pool = build_smtp_pool_config(&cfg);
+        info!(
+            smtp_cache_size = smtp_pool.cache_size,
+            smtp_pool_min_idle = smtp_pool.min_idle,
+            smtp_pool_max_size = smtp_pool.max_size,
+            "configured outbound SMTP pool"
+        );
+
         for _ in 0..worker_count {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
@@ -122,6 +130,7 @@ impl Callbacks {
             let mx_cache = mx_cache.clone();
             let rate_limit_config = rate_limit_config.clone();
             let helo_hostname = helo_hostname.clone();
+            let smtp_pool = smtp_pool.clone();
             let resolver = resolver.clone();
             let mta_sts = mta_sts_resolver.clone();
             let handle = tokio::spawn(async move {
@@ -129,7 +138,7 @@ impl Callbacks {
                     disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
                     outbound_local: cfg.server.outbound_local.unwrap_or(false),
                     helo_hostname,
-                    pool_size: cfg.server.pool_size.unwrap_or(100),
+                    smtp_pool,
                     rate_limit_config,
                 };
                 let mut worker = Worker::new(
@@ -201,6 +210,35 @@ impl Callbacks {
                 span: (0, body_len).into(),
             })?;
         Ok(())
+    }
+}
+
+fn build_smtp_pool_config(cfg: &Cfg) -> worker::SmtpPoolConfig {
+    let smtp = cfg.server.smtp.as_ref();
+    let cache_size = smtp
+        .and_then(|smtp| smtp.cache_size)
+        .or(cfg.server.pool_size)
+        .unwrap_or(worker::DEFAULT_SMTP_CACHE_SIZE);
+    let min_idle = smtp
+        .and_then(|smtp| smtp.min_idle)
+        .unwrap_or(worker::DEFAULT_SMTP_POOL_MIN_IDLE);
+    let mut max_size = smtp
+        .and_then(|smtp| smtp.max_size)
+        .unwrap_or(worker::DEFAULT_SMTP_POOL_MAX_SIZE);
+
+    if max_size < min_idle {
+        warn!(
+            smtp_pool_min_idle = min_idle,
+            smtp_pool_max_size = max_size,
+            "server.smtp.max_size is lower than server.smtp.min_idle; raising max_size"
+        );
+        max_size = min_idle;
+    }
+
+    worker::SmtpPoolConfig {
+        cache_size,
+        min_idle,
+        max_size,
     }
 }
 
@@ -392,7 +430,9 @@ impl SmtpCallbacks for Callbacks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CfgAuth, CfgDKIM, CfgFilter, CfgListener, CfgLog, CfgServer, CfgStorage};
+    use crate::config::{
+        CfgAuth, CfgDKIM, CfgFilter, CfgListener, CfgLog, CfgServer, CfgSmtp, CfgStorage,
+    };
     use crate::worker::EmailMetadata;
     use futures::{stream, Stream};
     use miette::Result;
@@ -466,6 +506,7 @@ mod tests {
                 disable_outbound: Some(false),
                 outbound_local: Some(false),
                 helo_hostname: None,
+                smtp: None,
                 pool_size: Some(10),
                 rate_limits: None,
                 metrics: None,
@@ -1247,6 +1288,7 @@ mod tests {
                 disable_outbound: None,
                 outbound_local: None,
                 helo_hostname: None,
+                smtp: None,
                 pool_size: None,
                 rate_limits: None,
                 metrics: None,
@@ -1268,5 +1310,49 @@ mod tests {
             },
             filters: None,
         }
+    }
+
+    #[test]
+    fn smtp_pool_config_uses_new_server_smtp_values() {
+        let mut cfg = create_test_config();
+        cfg.server.smtp = Some(CfgSmtp {
+            cache_size: Some(12),
+            min_idle: Some(3),
+            max_size: Some(7),
+        });
+        cfg.server.pool_size = Some(99);
+
+        let smtp_pool = build_smtp_pool_config(&cfg);
+
+        assert_eq!(smtp_pool.cache_size, 12);
+        assert_eq!(smtp_pool.min_idle, 3);
+        assert_eq!(smtp_pool.max_size, 7);
+    }
+
+    #[test]
+    fn smtp_pool_config_keeps_legacy_pool_size_as_cache_fallback() {
+        let mut cfg = create_test_config();
+        cfg.server.pool_size = Some(9);
+
+        let smtp_pool = build_smtp_pool_config(&cfg);
+
+        assert_eq!(smtp_pool.cache_size, 9);
+        assert_eq!(smtp_pool.min_idle, worker::DEFAULT_SMTP_POOL_MIN_IDLE);
+        assert_eq!(smtp_pool.max_size, worker::DEFAULT_SMTP_POOL_MAX_SIZE);
+    }
+
+    #[test]
+    fn smtp_pool_config_raises_max_size_to_min_idle() {
+        let mut cfg = create_test_config();
+        cfg.server.smtp = Some(CfgSmtp {
+            cache_size: None,
+            min_idle: Some(6),
+            max_size: Some(2),
+        });
+
+        let smtp_pool = build_smtp_pool_config(&cfg);
+
+        assert_eq!(smtp_pool.min_idle, 6);
+        assert_eq!(smtp_pool.max_size, 6);
     }
 }

@@ -6,7 +6,6 @@ format = "fmt" # Log format: "fmt" or "json"
 
 [server]
 workers = 4              # Number of worker threads (optional)
-pool_size = 100          # Outbound connection pool size (optional)
 max_retries = 5          # Maximum number of retries for deferred emails (optional, default: 5)
 disable_outbound = false # Disable outbound email delivery (optional)
 outbound_local = false   # Only allow local outbound delivery (optional)
@@ -16,6 +15,11 @@ max_connections = 1000   # Max concurrent inbound connections (optional, default
 max_message_size = 26214400  # Max message size in bytes (optional, default: 25 MiB)
 cmd_timeout = "5m"       # Idle timeout between SMTP commands (optional, default: 5m)
 data_timeout = "10m"     # Timeout during DATA transfer (optional, default: 10m)
+
+[server.smtp]
+cache_size = 100         # Number of destination SMTP transports to cache (optional, default: 100)
+min_idle = 2             # Minimum idle connections per destination SMTP pool (optional, default: 2)
+max_size = 10            # Maximum connections per destination SMTP pool (optional, default: 10)
 
 # MTA-STS (RFC 8461) is always active for outbound delivery.
 # Hedwig automatically looks up and enforces recipient domain TLS policies.

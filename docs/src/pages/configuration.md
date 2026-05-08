@@ -28,11 +28,21 @@ workers = 4                    # Number of worker threads (default: 1)
 max_retries = 5               # Maximum retry attempts for failed emails (default: 5)
 disable_outbound = false      # Disable outbound email delivery for testing
 outbound_local = false        # Use local/insecure connections for outbound delivery
-pool_size = 100              # SMTP connection pool size per domain (default: 100)
 helo_hostname = "mail.example.com" # Public FQDN advertised in outbound HELO/EHLO
 ```
 
 Set `helo_hostname` in production to the public hostname for the sending IP. Many receivers expect the outbound EHLO name to be a public FQDN with matching reverse DNS. If omitted, Hedwig keeps lettre's default behavior, which uses the machine hostname.
+
+## Outbound SMTP pool (`[server.smtp]`)
+
+```toml
+[server.smtp]
+cache_size = 100  # Number of destination SMTP transports to cache (default: 100)
+min_idle = 2      # Minimum idle connections per destination SMTP pool (default: 2)
+max_size = 10     # Maximum connections per destination SMTP pool (default: 10)
+```
+
+For new or low-volume senders, keep `min_idle` and `max_size` small so strict receivers do not see unnecessary parallel connections. The legacy `server.pool_size` setting is still accepted as a fallback for `server.smtp.cache_size`.
 
 ## Listeners (`[[server.listeners]]`)
 

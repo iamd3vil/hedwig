@@ -182,7 +182,10 @@ HEDWIG_LOG_LEVEL=info ./target/release/hedwig</code>
 <code>[server]
 workers = 4
 max_retries = 5
-pool_size = 100
+
+[server.smtp]
+min_idle = 2
+max_size = 10
 
 [[server.listeners]]
 addr = "0.0.0.0:25"

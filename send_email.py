@@ -1,6 +1,7 @@
 import smtplib
 import argparse
 from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 import mimetypes
 import os
 
@@ -26,6 +27,8 @@ def send_email(
         print("recipients", recipient_emails)
         msg["To"] = recipient_emails  # Can be a list or comma-separated string
         msg["Subject"] = subject
+        msg["Date"] = formatdate(localtime=False, usegmt=True)
+        msg["Message-ID"] = make_msgid(domain=sender_email.rsplit("@", 1)[-1])
         msg.set_content(body)
 
         # Attach files with proper MIME types and filenames
