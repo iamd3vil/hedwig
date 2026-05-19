@@ -159,6 +159,30 @@ pre {
 .nav .cta:hover {
   background: #e3572e;
 }
+.nav .github-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  background: rgba(255, 248, 239, 0.55);
+}
+
+.nav .github-link svg {
+  width: 20px;
+  height: 20px;
+  fill: currentColor;
+}
+
+.nav .github-link:hover {
+  color: var(--paper);
+  background: var(--ink);
+  border-color: var(--ink);
+}
+
 
 .main {
   flex: 1;
