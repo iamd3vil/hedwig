@@ -85,9 +85,13 @@ impl DeferredWorker {
                 Err(_) => continue,
             };
 
-            let metadata = match self.storage.get_meta(&entry.msg_id).await? {
-                Some(metadata) => metadata,
-                None => continue,
+            let metadata = match self.storage.get_meta(&entry.msg_id).await {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => continue,
+                Err(e) => {
+                    error!(msg_id = %entry.msg_id, "error reading deferred metadata: {:#}", e);
+                    continue;
+                }
             };
 
             // Skip if it's not time to retry yet
@@ -95,14 +99,40 @@ impl DeferredWorker {
                 continue;
             }
 
-            // Handle permanent failure if max attempts reached
-            if metadata.attempts >= self.max_attempts {
-                self.handle_permanent_failure(&metadata.msg_id).await?;
-                continue;
+            let msg_id = metadata.msg_id.clone();
+
+            // An interrupted retry, a crash, or a lowered `max_retries` can
+            // leave metadata behind after the body is gone from `deferred/`.
+            // Such an orphan would make both the retry `mv` (Deferred->Queued)
+            // and the permanent-failure `mv` (Deferred->Bounced) fail with
+            // ENOENT on every scan. Detect it once, up front, and just drop the
+            // stray meta so neither branch keeps logging.
+            match self.storage.get(&msg_id, Status::Deferred).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if let Err(e) = self.storage.delete_meta(&msg_id).await {
+                        error!(msg_id = %msg_id, "error removing orphaned deferred metadata: {:#}", e);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    error!(msg_id = %msg_id, "error checking deferred body: {:#}", e);
+                    continue;
+                }
             }
 
-            // Process retry
-            self.process_retry(metadata).await?;
+            // A failure on a single entry must not abort the rest of the scan,
+            // otherwise one bad message blocks every later deferred job.
+            let result = if metadata.attempts >= self.max_attempts {
+                // Handle permanent failure if max attempts reached
+                self.handle_permanent_failure(&msg_id).await
+            } else {
+                self.process_retry(metadata).await
+            };
+
+            if let Err(e) = result {
+                error!(msg_id = %msg_id, "error processing deferred job: {:#}", e);
+            }
         }
         Ok(())
     }
@@ -126,6 +156,8 @@ impl DeferredWorker {
     }
 
     async fn process_retry(&self, metadata: EmailMetadata) -> Result<()> {
+        // Caller (`process_deferred_jobs`) has already verified the deferred
+        // body exists, so the `mv` below won't hit an orphaned-metadata ENOENT.
         self.storage
             .mv(
                 &metadata.msg_id,
@@ -135,6 +167,15 @@ impl DeferredWorker {
             )
             .await
             .wrap_err("moving from deferred to queued")?;
+
+        // Drop the metadata now that the body is back in the queue. The attempt
+        // count is carried forward on the Job; `defer_email` recreates the meta
+        // if delivery fails again. Done before enqueueing so a fast worker can't
+        // re-defer with fresh metadata that we'd then delete out from under it.
+        self.storage
+            .delete_meta(&metadata.msg_id)
+            .await
+            .wrap_err("removing deferred metadata after requeue")?;
 
         metrics::queue_depth_inc();
         metrics::retry_scheduled();
@@ -267,6 +308,82 @@ mod tests {
 
         assert!(deferred_email.is_some());
         assert!(queued_email.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_process_orphaned_metadata() {
+        let (worker, receiver, _temp) = setup_test_env().await;
+
+        // Metadata that is ready to retry, but with NO corresponding deferred
+        // body — simulating an earlier retry that moved the body to queued
+        // (or a crash) without removing the meta.
+        let meta = EmailMetadata {
+            msg_id: "orphan".to_string(),
+            attempts: 1,
+            last_attempt: SystemTime::now() - Duration::from_secs(3600),
+            next_attempt: SystemTime::now() - Duration::from_secs(1800),
+        };
+        worker.storage.put_meta("orphan", &meta).await.unwrap();
+
+        // Should not error, should not enqueue a job, and should clear the meta.
+        worker.process_deferred_jobs().await.unwrap();
+
+        assert!(receiver.try_recv().is_err());
+        assert!(worker.storage.get_meta("orphan").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_orphaned_metadata_at_max_attempts() {
+        let (worker, _receiver, _temp) = setup_test_env().await;
+
+        // Orphaned meta (no deferred body) that is also at max attempts. Must be
+        // dropped by the up-front orphan check, not routed to permanent failure
+        // where the Deferred->Bounced mv would fail with ENOENT forever.
+        let meta = EmailMetadata {
+            msg_id: "orphan_max".to_string(),
+            attempts: 5,
+            last_attempt: SystemTime::now() - Duration::from_secs(3600),
+            next_attempt: SystemTime::now() - Duration::from_secs(1800),
+        };
+        worker.storage.put_meta("orphan_max", &meta).await.unwrap();
+
+        worker.process_deferred_jobs().await.unwrap();
+
+        assert!(worker.storage.get_meta("orphan_max").await.unwrap().is_none());
+        assert!(worker
+            .storage
+            .get("orphan_max", Status::Bounced)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_retry_removes_metadata() {
+        let (worker, receiver, _temp) = setup_test_env().await;
+
+        let meta = EmailMetadata {
+            msg_id: "retry_meta".to_string(),
+            attempts: 1,
+            last_attempt: SystemTime::now() - Duration::from_secs(3600),
+            next_attempt: SystemTime::now() - Duration::from_secs(1800),
+        };
+        worker.storage.put_meta("retry_meta", &meta).await.unwrap();
+        let email = StoredEmail {
+            message_id: "retry_meta".to_string(),
+            from: "test@example.com".to_string(),
+            to: vec!["recipient@example.com".to_string()],
+            body: "Test email".to_string(),
+            queued_at: None,
+        };
+        worker.storage.put(email, Status::Deferred).await.unwrap();
+
+        worker.process_deferred_jobs().await.unwrap();
+
+        // Job enqueued and body moved to queued.
+        assert_eq!(receiver.recv().await.unwrap().job_id, "retry_meta");
+        // Metadata removed so the next scan won't re-process the moved body.
+        assert!(worker.storage.get_meta("retry_meta").await.unwrap().is_none());
     }
 
     #[tokio::test]
