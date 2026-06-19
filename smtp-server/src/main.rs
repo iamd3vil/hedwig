@@ -225,7 +225,9 @@ async fn run_server(config_path: &str) -> Result<()> {
         sender_channel.clone(),
         receiver_channel.clone(),
         cfg.clone(),
-    );
+    )
+    .await
+    .wrap_err("failed to initialize SMTP callbacks and workers")?;
 
     let max_message_size = cfg.server.max_message_size.unwrap_or(25 * 1024 * 1024);
     let cmd_timeout = cfg

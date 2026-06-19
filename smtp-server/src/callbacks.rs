@@ -9,6 +9,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use hickory_resolver::{lookup::MxLookup, TokioAsyncResolver};
+use miette::{Context, IntoDiagnostic};
 use moka::{future::Cache, Expiry};
 use smtp::{Email, SmtpCallbacks, SmtpError};
 use tokio::sync::Mutex;
@@ -75,12 +76,12 @@ impl Callbacks {
     /// Keeping the join handles at the call site (e.g. `run_server`) allows the
     /// application to await worker completion and ensure any in-flight mail is
     /// processed before exit.
-    pub fn new(
+    pub async fn new(
         storage: Arc<dyn Storage>,
         sender_channel: async_channel::Sender<Job>,
         receiver_channel: async_channel::Receiver<Job>,
         cfg: Cfg,
-    ) -> (Self, Vec<JoinHandle<()>>, Arc<MtaStsResolver>) {
+    ) -> miette::Result<(Self, Vec<JoinHandle<()>>, Arc<MtaStsResolver>)> {
         let expiry = MXExpiry;
         let mx_cache: Cache<_, _> = Cache::builder()
             .max_capacity(10000)
@@ -88,8 +89,9 @@ impl Callbacks {
             .build();
 
         // Create a shared DNS resolver for workers and MTA-STS.
-        let resolver =
-            TokioAsyncResolver::tokio_from_system_conf().expect("failed to create DNS resolver");
+        let resolver = TokioAsyncResolver::tokio_from_system_conf()
+            .into_diagnostic()
+            .wrap_err("failed to create DNS resolver")?;
 
         // Create the shared MTA-STS resolver.
         let mta_sts_fetcher = MtaStsFetcher::new(resolver.clone());
@@ -123,35 +125,30 @@ impl Callbacks {
             "configured outbound SMTP pool"
         );
 
-        for _ in 0..worker_count {
+        for worker_index in 0..worker_count {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
             let dkim = cfg.server.dkim.clone();
             let mx_cache = mx_cache.clone();
-            let rate_limit_config = rate_limit_config.clone();
-            let helo_hostname = helo_hostname.clone();
-            let smtp_pool = smtp_pool.clone();
-            let resolver = resolver.clone();
-            let mta_sts = mta_sts_resolver.clone();
+            let worker_config = worker::WorkerConfig {
+                disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
+                outbound_local: cfg.server.outbound_local.unwrap_or(false),
+                helo_hostname: helo_hostname.clone(),
+                smtp_pool: smtp_pool.clone(),
+                rate_limit_config: rate_limit_config.clone(),
+            };
+            let mut worker = Worker::new(
+                receiver_channel,
+                storage_cloned,
+                &dkim,
+                mx_cache,
+                worker_config,
+                resolver.clone(),
+                mta_sts_resolver.clone(),
+            )
+            .await
+            .wrap_err_with(|| format!("failed to create worker {worker_index}"))?;
             let handle = tokio::spawn(async move {
-                let worker_config = worker::WorkerConfig {
-                    disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
-                    outbound_local: cfg.server.outbound_local.unwrap_or(false),
-                    helo_hostname,
-                    smtp_pool,
-                    rate_limit_config,
-                };
-                let mut worker = Worker::new(
-                    receiver_channel,
-                    storage_cloned.clone(),
-                    &dkim,
-                    mx_cache,
-                    worker_config,
-                    resolver,
-                    mta_sts,
-                )
-                .await
-                .expect("Failed to create worker");
                 worker.run().await;
             });
             worker_handles.push(handle);
@@ -173,7 +170,7 @@ impl Callbacks {
             auth_mapping: Mutex::new(auth_mapping),
         };
 
-        (callbacks, worker_handles, mta_sts_resolver)
+        Ok((callbacks, worker_handles, mta_sts_resolver))
     }
 
     /// Processes an email by parsing it, storing it, and sending it to a worker.
@@ -430,9 +427,7 @@ impl SmtpCallbacks for Callbacks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        CfgAuth, CfgDKIM, CfgFilter, CfgListener, CfgLog, CfgServer, CfgSmtp, CfgStorage,
-    };
+    use crate::config::{CfgAuth, CfgFilter, CfgListener, CfgLog, CfgServer, CfgSmtp, CfgStorage};
     use crate::worker::EmailMetadata;
     use futures::{stream, Stream};
     use miette::Result;
@@ -488,7 +483,7 @@ mod tests {
     }
 
     // Helper function to create Callbacks instance for tests
-    fn create_test_callbacks(filters: Option<Vec<CfgFilter>>) -> Callbacks {
+    async fn create_test_callbacks(filters: Option<Vec<CfgFilter>>) -> Callbacks {
         let cfg = Cfg {
             log: CfgLog::default(),
             server: CfgServer {
@@ -533,7 +528,9 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(MockStorage);
 
         let (callbacks, worker_handles, _mta_sts_resolver) =
-            Callbacks::new(storage, sender_channel, receiver_channel, cfg);
+            Callbacks::new(storage, sender_channel, receiver_channel, cfg)
+                .await
+                .expect("callbacks should initialize");
         for handle in worker_handles {
             // These handles outlive the test scope; aborting avoids leaking tasks into
             // other async tests once we have exercised the setup logic.
@@ -554,7 +551,7 @@ mod tests {
     // Tests for on_mail_from
     #[tokio::test]
     async fn test_on_mail_from_no_filters() {
-        let callbacks = create_test_callbacks(None);
+        let callbacks = create_test_callbacks(None).await;
         let result = callbacks
             .on_mail_from(&create_mail_from_command("test@example.com"))
             .await;
@@ -568,7 +565,7 @@ mod tests {
             domain: vec!["example.com".to_string()],
             action: FilterAction::Allow,
         }];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         let result = callbacks
             .on_mail_from(&create_mail_from_command("test@example.com"))
             .await;
@@ -582,7 +579,7 @@ mod tests {
             domain: vec!["another.com".to_string()],
             action: FilterAction::Allow,
         }];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         let result = callbacks
             .on_mail_from(&create_mail_from_command("test@example.com"))
             .await;
@@ -604,7 +601,7 @@ mod tests {
             domain: vec!["example.com".to_string()],
             action: FilterAction::Allow,
         }];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         let result = callbacks
             .on_mail_from(&create_mail_from_command("testuser"))
             .await; // No domain in from_path
@@ -626,7 +623,7 @@ mod tests {
             domain: vec!["example.com".to_string()],
             action: FilterAction::Deny,
         }];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         let result = callbacks
             .on_mail_from(&create_mail_from_command("test@example.com"))
             .await;
@@ -645,7 +642,7 @@ mod tests {
             domain: vec!["another.com".to_string()],
             action: FilterAction::Deny,
         }];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         let result = callbacks
             .on_mail_from(&create_mail_from_command("test@example.com"))
             .await;
@@ -668,7 +665,7 @@ mod tests {
                 action: FilterAction::Allow,
             },
         ];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         // This should be denied because example.com is denied, even if specific.example.com is on an allow list.
         // Deny rules take precedence if matched.
         let result = callbacks
@@ -698,7 +695,7 @@ mod tests {
                 action: FilterAction::Allow,
             },
         ];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         // Allowed because example.com is explicitly allowed and not bad.com
         let result_allowed = callbacks
             .on_mail_from(&create_mail_from_command("user@example.com"))
@@ -724,7 +721,7 @@ mod tests {
             domain: vec!["example.com".to_string()],
             action: FilterAction::Allow,
         }];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         let result = callbacks
             .on_mail_from(&create_mail_from_command("<testuser>"))
             .await; // no domain
@@ -742,7 +739,7 @@ mod tests {
     // Tests for on_rcpt_to
     #[tokio::test]
     async fn test_on_rcpt_to_no_filters() {
-        let callbacks = create_test_callbacks(None);
+        let callbacks = create_test_callbacks(None).await;
         let result = callbacks.on_rcpt_to("test@example.com").await;
         assert!(result.is_ok());
     }
@@ -754,7 +751,7 @@ mod tests {
             domain: vec!["example.com".to_string()],
             action: FilterAction::Allow,
         }];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         let result = callbacks.on_rcpt_to("test@example.com").await;
         assert!(result.is_ok());
     }
@@ -766,7 +763,7 @@ mod tests {
             domain: vec!["another.com".to_string()],
             action: FilterAction::Allow,
         }];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         let result = callbacks.on_rcpt_to("test@example.com").await;
         assert!(result.is_err());
         if let Err(SmtpError::RcptToDenied { message }) = result {
@@ -786,7 +783,7 @@ mod tests {
             domain: vec!["example.com".to_string()],
             action: FilterAction::Allow,
         }];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         let result = callbacks.on_rcpt_to("testuser").await; // No domain
         assert!(result.is_err());
         if let Err(SmtpError::RcptToDenied { message }) = result {
@@ -806,7 +803,7 @@ mod tests {
             domain: vec!["example.com".to_string()],
             action: FilterAction::Deny,
         }];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         let result = callbacks.on_rcpt_to("test@example.com").await;
         assert!(result.is_err());
         if let Err(SmtpError::RcptToDenied { message }) = result {
@@ -823,7 +820,7 @@ mod tests {
             domain: vec!["another.com".to_string()],
             action: FilterAction::Deny,
         }];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         let result = callbacks.on_rcpt_to("test@example.com").await;
         assert!(result.is_ok());
     }
@@ -844,7 +841,7 @@ mod tests {
                 action: FilterAction::Allow,
             },
         ];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
 
         let result = callbacks.on_rcpt_to("user@example.com").await;
         assert!(result.is_err());
@@ -871,7 +868,7 @@ mod tests {
                 action: FilterAction::Allow,
             },
         ];
-        let callbacks = create_test_callbacks(Some(filters));
+        let callbacks = create_test_callbacks(Some(filters)).await;
         // Allowed because example.com is explicitly allowed and not bad.com
         let result_allowed = callbacks.on_rcpt_to("user@example.com").await;
         assert!(result_allowed.is_ok());
@@ -951,18 +948,16 @@ mod tests {
         // Test Callbacks::new with workers enabled (lines 90-97, 99-101)
         let mut cfg = create_test_config();
         cfg.server.workers = Some(1);
-        cfg.server.dkim = Some(CfgDKIM {
-            private_key: "test_key".to_string(),
-            selector: "test".to_string(),
-            domain: "example.com".to_string(),
-            key_type: crate::config::DkimKeyType::Rsa,
-        });
+        // Keep DKIM disabled here; DKIM key parsing is covered by worker tests.
+        cfg.server.dkim = None;
 
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
 
         let (_callbacks, worker_handles, _mta_sts_resolver) =
-            Callbacks::new(storage, sender, receiver, cfg);
+            Callbacks::new(storage, sender, receiver, cfg)
+                .await
+                .expect("callbacks should initialize");
         for handle in worker_handles {
             // Abort so the spawned worker does not keep running past the test lifetime.
             handle.abort();
@@ -989,7 +984,9 @@ mod tests {
         let (sender, receiver) = async_channel::bounded(100);
 
         let (callbacks, worker_handles, _mta_sts_resolver) =
-            Callbacks::new(storage, sender, receiver, cfg);
+            Callbacks::new(storage, sender, receiver, cfg)
+                .await
+                .expect("callbacks should initialize");
         let auth_mapping = callbacks.auth_mapping.lock().await;
         assert_eq!(auth_mapping.get("user1"), Some(&"pass1".to_string()));
         assert_eq!(auth_mapping.get("user2"), Some(&"pass2".to_string()));
@@ -1003,7 +1000,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_email_success() {
         // Test process_email method (lines 123-124, 128-131, 134-139, 143-149, 151)
-        let callbacks = create_test_callbacks(None);
+        let callbacks = create_test_callbacks(None).await;
         let email = Email {
             from: "sender@example.com".to_string(),
             to: vec!["recipient@example.com".to_string()],
@@ -1021,7 +1018,9 @@ mod tests {
         let storage = Arc::new(MockStorageWithError {});
         let (sender, receiver) = async_channel::bounded(100);
         let (callbacks, worker_handles, _mta_sts_resolver) =
-            Callbacks::new(storage, sender, receiver, cfg);
+            Callbacks::new(storage, sender, receiver, cfg)
+                .await
+                .expect("callbacks should initialize");
 
         let email = Email {
             from: "sender@example.com".to_string(),
@@ -1040,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn test_on_ehlo() {
         // Test on_ehlo method (lines 159, 161)
-        let callbacks = create_test_callbacks(None);
+        let callbacks = create_test_callbacks(None).await;
         let result = callbacks.on_ehlo("example.com").await;
         assert!(result.is_ok());
     }
@@ -1048,7 +1047,7 @@ mod tests {
     #[tokio::test]
     async fn test_on_auth_no_config() {
         // Test on_auth when auth is not configured (lines 165-167)
-        let callbacks = create_test_callbacks(None);
+        let callbacks = create_test_callbacks(None).await;
         let result = callbacks.on_auth("user", "pass").await;
         assert!(result.is_ok());
         assert!(!result.unwrap());
@@ -1066,7 +1065,9 @@ mod tests {
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
         let (callbacks, worker_handles, _mta_sts_resolver) =
-            Callbacks::new(storage, sender, receiver, cfg);
+            Callbacks::new(storage, sender, receiver, cfg)
+                .await
+                .expect("callbacks should initialize");
 
         let result = callbacks.on_auth("testuser", "testpass").await;
         assert!(result.is_ok());
@@ -1090,7 +1091,9 @@ mod tests {
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
         let (callbacks, worker_handles, _mta_sts_resolver) =
-            Callbacks::new(storage, sender, receiver, cfg);
+            Callbacks::new(storage, sender, receiver, cfg)
+                .await
+                .expect("callbacks should initialize");
 
         let result = callbacks.on_auth("wronguser", "testpass").await;
         assert!(result.is_ok());
@@ -1110,7 +1113,9 @@ mod tests {
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
         let (callbacks, worker_handles, _mta_sts_resolver) =
-            Callbacks::new(storage, sender, receiver, cfg);
+            Callbacks::new(storage, sender, receiver, cfg)
+                .await
+                .expect("callbacks should initialize");
 
         let mail_cmd = create_mail_from_command("sender@example.com");
         let result = callbacks.on_mail_from(&mail_cmd).await;
@@ -1134,7 +1139,9 @@ mod tests {
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
         let (callbacks, worker_handles, _mta_sts_resolver) =
-            Callbacks::new(storage, sender, receiver, cfg);
+            Callbacks::new(storage, sender, receiver, cfg)
+                .await
+                .expect("callbacks should initialize");
 
         let mail_cmd = create_mail_from_command("invalidpath");
         let result = callbacks.on_mail_from(&mail_cmd).await;
@@ -1154,7 +1161,9 @@ mod tests {
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
         let (callbacks, worker_handles, _mta_sts_resolver) =
-            Callbacks::new(storage, sender, receiver, cfg);
+            Callbacks::new(storage, sender, receiver, cfg)
+                .await
+                .expect("callbacks should initialize");
 
         let result = callbacks.on_rcpt_to("recipient@example.com").await;
         assert!(result.is_ok());
@@ -1177,7 +1186,9 @@ mod tests {
         let storage = Arc::new(MockStorage {});
         let (sender, receiver) = async_channel::bounded(100);
         let (callbacks, worker_handles, _mta_sts_resolver) =
-            Callbacks::new(storage, sender, receiver, cfg);
+            Callbacks::new(storage, sender, receiver, cfg)
+                .await
+                .expect("callbacks should initialize");
 
         let result = callbacks.on_rcpt_to("invalidpath").await;
         assert!(result.is_err());
@@ -1190,7 +1201,7 @@ mod tests {
     #[tokio::test]
     async fn test_on_data() {
         // Test on_data method (lines 339-341)
-        let callbacks = create_test_callbacks(None);
+        let callbacks = create_test_callbacks(None).await;
         let email = Email {
             from: "sender@example.com".to_string(),
             to: vec!["recipient@example.com".to_string()],

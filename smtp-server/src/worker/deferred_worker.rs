@@ -349,7 +349,15 @@ mod tests {
 
         worker.process_deferred_jobs().await.unwrap();
 
-        assert!(worker.storage.get_meta("orphan_max").await.unwrap().is_none());
+        // The orphan cleanup should remove retry metadata even when attempts
+        // are already exhausted.
+        assert!(worker
+            .storage
+            .get_meta("orphan_max")
+            .await
+            .unwrap()
+            .is_none());
+        // No bounced message should be created because there is no deferred body to move.
         assert!(worker
             .storage
             .get("orphan_max", Status::Bounced)
@@ -383,7 +391,12 @@ mod tests {
         // Job enqueued and body moved to queued.
         assert_eq!(receiver.recv().await.unwrap().job_id, "retry_meta");
         // Metadata removed so the next scan won't re-process the moved body.
-        assert!(worker.storage.get_meta("retry_meta").await.unwrap().is_none());
+        assert!(worker
+            .storage
+            .get_meta("retry_meta")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

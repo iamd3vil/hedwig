@@ -183,9 +183,20 @@ impl Worker {
                 let pem = pem::parse(priv_key)
                     .into_diagnostic()
                     .wrap_err("parsing RSA PEM")?;
-                let pk_rsa = RsaKey::<Sha256>::from_pkcs8_der(pem.contents())
-                    .into_diagnostic()
-                    .wrap_err("error reading RSA priv key")?;
+                let pk_rsa = match pem.tag() {
+                    "PRIVATE KEY" => RsaKey::<Sha256>::from_pkcs8_der(pem.contents())
+                        .into_diagnostic()
+                        .wrap_err("error reading PKCS#8 RSA private key")?,
+                    "RSA PRIVATE KEY" => RsaKey::<Sha256>::from_der(pem.contents())
+                        .into_diagnostic()
+                        .wrap_err("error reading PKCS#1 RSA private key")?,
+                    "ENCRYPTED PRIVATE KEY" => bail!(
+                        "encrypted RSA private keys are not supported; use an unencrypted PKCS#8 or PKCS#1 PEM key"
+                    ),
+                    tag => bail!(
+                        "unsupported RSA private key PEM tag {tag:?}; expected \"PRIVATE KEY\" or \"RSA PRIVATE KEY\""
+                    ),
+                };
 
                 Ok(DkimSignerType::Rsa(
                     DkimSigner::from_key(pk_rsa)
@@ -890,7 +901,53 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{CfgDKIM, DkimKeyType};
     use std::str;
+
+    #[test]
+    fn test_create_dkim_signer_accepts_pkcs1_rsa_pem() {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+
+        let mut rng = rand::thread_rng();
+        let key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
+        let pem = key
+            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+            .expect("encode test RSA key as PKCS#1 PEM");
+        let dkim = CfgDKIM {
+            domain: "example.com".to_string(),
+            selector: "default".to_string(),
+            private_key: "unused-in-this-test.pem".to_string(),
+            key_type: DkimKeyType::Rsa,
+        };
+
+        assert!(matches!(
+            Worker::create_dkim_signer(&dkim, &pem),
+            Ok(DkimSignerType::Rsa(_))
+        ));
+    }
+
+    #[test]
+    fn test_create_dkim_signer_rejects_encrypted_rsa_pem_with_clear_error() {
+        let dkim = CfgDKIM {
+            domain: "example.com".to_string(),
+            selector: "default".to_string(),
+            private_key: "unused-in-this-test.pem".to_string(),
+            key_type: DkimKeyType::Rsa,
+        };
+        let err = match Worker::create_dkim_signer(
+            &dkim,
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAA==\n-----END ENCRYPTED PRIVATE KEY-----\n",
+        ) {
+            Ok(_) => panic!("encrypted RSA PEM should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("encrypted RSA private keys are not supported"),
+            "unexpected error: {err:#}"
+        );
+    }
 
     #[test]
     fn test_remove_bcc_header_present() {
