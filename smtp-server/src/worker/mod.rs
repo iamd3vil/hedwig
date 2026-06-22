@@ -46,7 +46,7 @@ use rate_limiter::{RateLimitConfig, RateLimitResult, RateLimiter};
 
 const HEADER_BODY_SEPARATOR: &[u8] = b"\r\n\r\n";
 const BCC_HEADER_PREFIX: &[u8] = b"Bcc:";
-const DKIM_HEADERS: [&str; 5] = ["From", "To", "Subject", "Date", "Message-ID"];
+const DKIM_HEADERS: [&str; 3] = ["From", "Subject", "To"];
 
 struct DeliveryContext<'a> {
     job_id: &'a str,
@@ -204,7 +204,7 @@ impl Worker {
                         .selector(&dkim.selector)
                         .headers(DKIM_HEADERS)
                         .expiration(60 * 60 * 7)
-                        .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                        .body_canonicalization(mail_auth::dkim::Canonicalization::Simple)
                         .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed),
                 ))
             }
@@ -225,7 +225,7 @@ impl Worker {
                         .selector(&dkim.selector)
                         .headers(DKIM_HEADERS)
                         .expiration(60 * 60 * 7)
-                        .body_canonicalization(mail_auth::dkim::Canonicalization::Relaxed)
+                        .body_canonicalization(mail_auth::dkim::Canonicalization::Simple)
                         .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed),
                 ))
             }
