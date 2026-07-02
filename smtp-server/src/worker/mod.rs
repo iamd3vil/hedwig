@@ -16,6 +16,7 @@ use mail_auth::{
 use mail_auth::{common::headers::HeaderWriter, dkim::Done};
 use mail_parser::{Message, MessageParser};
 use miette::{bail, Context, IntoDiagnostic, Result};
+use rustls_pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
 // use pool::SmtpClientPool;
 use memchr::memmem;
 use moka::future::Cache;
@@ -184,12 +185,16 @@ impl Worker {
                     .into_diagnostic()
                     .wrap_err("parsing RSA PEM")?;
                 let pk_rsa = match pem.tag() {
-                    "PRIVATE KEY" => RsaKey::<Sha256>::from_pkcs8_der(pem.contents())
-                        .into_diagnostic()
-                        .wrap_err("error reading PKCS#8 RSA private key")?,
-                    "RSA PRIVATE KEY" => RsaKey::<Sha256>::from_der(pem.contents())
-                        .into_diagnostic()
-                        .wrap_err("error reading PKCS#1 RSA private key")?,
+                    "PRIVATE KEY" => RsaKey::<Sha256>::from_key_der(PrivateKeyDer::Pkcs8(
+                        PrivatePkcs8KeyDer::from(pem.contents()),
+                    ))
+                    .into_diagnostic()
+                    .wrap_err("error reading PKCS#8 RSA private key")?,
+                    "RSA PRIVATE KEY" => RsaKey::<Sha256>::from_key_der(PrivateKeyDer::Pkcs1(
+                        PrivatePkcs1KeyDer::from(pem.contents()),
+                    ))
+                    .into_diagnostic()
+                    .wrap_err("error reading PKCS#1 RSA private key")?,
                     "ENCRYPTED PRIVATE KEY" => bail!(
                         "encrypted RSA private keys are not supported; use an unencrypted PKCS#8 or PKCS#1 PEM key"
                     ),
