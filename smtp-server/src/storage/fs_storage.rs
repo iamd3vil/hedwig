@@ -1,19 +1,92 @@
 /// File system based storage implementation for email handling.
 ///
-/// This module provides a file system based implementation of the `Storage` trait,
-/// allowing emails to be stored and managed on disk in JSON format. Emails are organized
-/// into different directories based on their status (queued, deferred, or bounced).
+/// This module provides a file system based implementation of the `Storage` trait.
+/// Each email is stored as a single-line JSON envelope header followed by the raw
+/// message bytes (see `encode_email`), so the message body is written and read
+/// verbatim instead of being JSON-escaped. Emails are organized into different
+/// directories based on their status (queued, deferred, or bounced).
 use crate::{
     storage::{CleanupConfig, Status, Storage, StoredEmail},
     worker::EmailMetadata,
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
+use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
-use miette::{Context, IntoDiagnostic, Result};
+use miette::{miette, Context, IntoDiagnostic, Result};
+use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 use tokio::fs;
+
+/// Magic prefix identifying the envelope-header + raw-body file format.
+const FORMAT_MAGIC: &[u8] = b"HEDWIG1 ";
+
+/// Envelope fields stored on the first line of an email file. This is
+/// `StoredEmail` without the body, which follows as raw bytes.
+#[derive(Serialize)]
+struct EnvelopeRef<'a> {
+    message_id: &'a str,
+    from: &'a str,
+    to: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct Envelope {
+    message_id: String,
+    from: String,
+    to: Vec<String>,
+    #[serde(default)]
+    queued_at: Option<DateTime<Utc>>,
+}
+
+/// Serializes an email as a one-line JSON envelope followed by the raw body.
+///
+/// JSON-encoding the whole email would escape (and later unescape) every body
+/// byte, which dominates storage CPU at high message rates.
+fn encode_email(email: &StoredEmail) -> Result<Vec<u8>> {
+    let envelope = serde_json::to_string(&EnvelopeRef {
+        message_id: &email.message_id,
+        from: &email.from,
+        to: &email.to,
+        queued_at: email.queued_at,
+    })
+    .into_diagnostic()?;
+
+    let mut buf = Vec::with_capacity(FORMAT_MAGIC.len() + envelope.len() + 1 + email.body.len());
+    buf.extend_from_slice(FORMAT_MAGIC);
+    buf.extend_from_slice(envelope.as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(email.body.as_bytes());
+    Ok(buf)
+}
+
+/// Parses an email file in either the current envelope + raw-body format or
+/// the legacy whole-file JSON format, so spools written by older versions
+/// still replay after an upgrade.
+fn decode_email(mut bytes: Vec<u8>) -> Result<StoredEmail> {
+    if bytes.starts_with(FORMAT_MAGIC) {
+        let newline = memchr::memchr(b'\n', &bytes)
+            .ok_or_else(|| miette!("email file has no envelope terminator"))?;
+        let body_bytes = bytes.split_off(newline + 1);
+        let envelope: Envelope =
+            serde_json::from_slice(&bytes[FORMAT_MAGIC.len()..newline]).into_diagnostic()?;
+        let body = String::from_utf8(body_bytes)
+            .into_diagnostic()
+            .wrap_err("email body is not valid UTF-8")?;
+        Ok(StoredEmail {
+            message_id: envelope.message_id,
+            from: envelope.from,
+            to: envelope.to,
+            body,
+            queued_at: envelope.queued_at,
+        })
+    } else {
+        serde_json::from_slice(&bytes).into_diagnostic()
+    }
+}
 
 /// A storage implementation that uses the file system to store emails and metadata.
 ///
@@ -136,10 +209,9 @@ impl FileSystemStorage {
             while let Some(entry) = entries.next_entry().await.into_diagnostic()? {
                 let path = entry.path();
                 if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
-                    if file_name.ends_with(".json") {
-                        let contents = fs::read_to_string(&path).await.into_diagnostic()?;
-                        let email: StoredEmail = serde_json::from_str(&contents).into_diagnostic()?;
-                        yield email;
+                    if file_name.ends_with(".json") && !file_name.ends_with(".meta.json") {
+                        let contents = fs::read(&path).await.into_diagnostic()?;
+                        yield decode_email(contents)?;
                     }
                 }
             }
@@ -240,13 +312,12 @@ impl Storage for FileSystemStorage {
     /// * `Result<Option<StoredEmail>>` - The email if found, None if not found
     async fn get(&self, key: &str, status: Status) -> Result<Option<StoredEmail>> {
         let path = self.file_path(key, &status);
-        let contents = match fs::read_to_string(&path).await {
+        let contents = match fs::read(&path).await {
             Ok(contents) => contents,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).into_diagnostic(),
         };
-        let email: StoredEmail = serde_json::from_str(&contents).into_diagnostic()?;
-        Ok(Some(email))
+        Ok(Some(decode_email(contents)?))
     }
 
     /// Stores an email with the specified status.
@@ -259,7 +330,7 @@ impl Storage for FileSystemStorage {
     /// * `Result<Utf8PathBuf>` - The path where the email was stored
     async fn put(&self, email: StoredEmail, status: Status) -> Result<()> {
         let path = self.file_path(&email.message_id, &status);
-        let serialized = serde_json::to_string(&email).into_diagnostic()?;
+        let serialized = encode_email(&email)?;
         fs::write(&path, &serialized).await.into_diagnostic()?;
         Ok(())
     }
@@ -420,6 +491,46 @@ mod tests {
         // Test get non-existent
         let not_found = storage.get("nonexistent", Status::Queued).await.unwrap();
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    async fn test_put_get_roundtrip_preserves_raw_body() {
+        let (storage, _temp) = create_test_storage().await;
+        let mut email = create_test_email("raw1");
+        // Bytes that JSON escaping used to mangle-and-restore: quotes,
+        // backslashes, CRLF line endings, and multibyte UTF-8.
+        email.body =
+            "Subject: \"quoted\"\r\n\r\nline one\\ two\r\nnaïve 日本語\r\n{\"not\":\"json\"}"
+                .to_string();
+        email.queued_at = Some(Utc::now());
+
+        storage.put(email.clone(), Status::Queued).await.unwrap();
+        let retrieved = storage.get("raw1", Status::Queued).await.unwrap().unwrap();
+
+        assert_eq!(retrieved.message_id, email.message_id);
+        assert_eq!(retrieved.from, email.from);
+        assert_eq!(retrieved.to, email.to);
+        assert_eq!(retrieved.body, email.body);
+        assert_eq!(retrieved.queued_at, email.queued_at);
+    }
+
+    #[test]
+    async fn test_get_reads_legacy_whole_file_json_format() {
+        let (storage, _temp) = create_test_storage().await;
+        let email = create_test_email("legacy1");
+
+        // Simulate a spool file written by an older version.
+        let legacy = serde_json::to_string(&email).unwrap();
+        let path = storage.file_path("legacy1", &Status::Queued);
+        fs::write(&path, legacy).await.unwrap();
+
+        let retrieved = storage
+            .get("legacy1", Status::Queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved.message_id, email.message_id);
+        assert_eq!(retrieved.body, email.body);
     }
 
     #[test]
