@@ -4,7 +4,7 @@ use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
 use mta_sts::refresher;
 use rustls::pki_types::CertificateDer;
-use smtp::{SmtpServer, SmtpStream};
+use smtp::{MaybeTlsStream, SmtpServer, SmtpStream};
 use std::sync::Arc;
 use storage::{fs_storage::FileSystemStorage, sqlite_storage::SqliteStorage, Status, Storage};
 use subtle::ConstantTimeEq;
@@ -294,10 +294,10 @@ async fn run_server(config_path: &str) -> Result<()> {
             .into_diagnostic()
             .wrap_err_with(|| format!("Failed to bind to address: {}", listener_config.addr))?;
 
-        let tls_status = if listener_config.tls.is_some() {
-            "TLS"
-        } else {
-            "plaintext"
+        let tls_status = match &listener_config.tls {
+            Some(tls) if tls.mode == config::TlsMode::Starttls => "STARTTLS",
+            Some(_) => "TLS",
+            None => "plaintext",
         };
         info!(
             storage_type = cfg.storage.storage_type,
@@ -310,6 +310,11 @@ async fn run_server(config_path: &str) -> Result<()> {
     for (listener, acceptor_index) in listeners {
         let server_clone = smtp_server.clone();
         let tls_acceptor = tls_acceptors[acceptor_index].clone();
+        let tls_mode = cfg.server.listeners[acceptor_index]
+            .tls
+            .as_ref()
+            .map(|tls| tls.mode)
+            .unwrap_or_default();
         let shutdown = shutdown_token.clone();
         let listener_addr = cfg.server.listeners[acceptor_index].addr.clone();
         let conn_semaphore = Arc::clone(&conn_semaphore);
@@ -349,11 +354,18 @@ async fn run_server(config_path: &str) -> Result<()> {
                             // Hold the permit for the lifetime of this connection.
                             let _permit = permit;
 
-                            let mut boxed_socket: Box<dyn SmtpStream> =
-                                if let Some(acceptor) = tls_acceptor {
-                                    match acceptor.accept(socket).await {
-                                        Ok(tls_stream) => Box::new(tls_stream),
-                                        Err(e) => {
+                            let mut boxed_socket: Box<dyn SmtpStream> = match tls_acceptor {
+                                // Implicit TLS: the handshake happens before any SMTP traffic.
+                                // Bounded so a silent client can't hold a connection permit forever.
+                                Some(acceptor) if tls_mode == config::TlsMode::Implicit => {
+                                    match tokio::time::timeout(
+                                        cmd_timeout,
+                                        acceptor.accept(socket),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(tls_stream)) => Box::new(tls_stream),
+                                        Ok(Err(e)) => {
                                             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                                                 debug!("TLS handshake failed: {}", e);
                                             } else {
@@ -362,10 +374,18 @@ async fn run_server(config_path: &str) -> Result<()> {
 
                                             return;
                                         }
+                                        Err(_) => {
+                                            debug!("TLS handshake timed out");
+                                            return;
+                                        }
                                     }
-                                } else {
-                                    Box::new(socket)
-                                };
+                                }
+                                // STARTTLS: start in plaintext, upgrade when the client asks.
+                                Some(acceptor) => {
+                                    Box::new(MaybeTlsStream::Plain(socket, Some(acceptor)))
+                                }
+                                None => Box::new(socket),
+                            };
 
                             if let Err(e) = server_clone.handle_client(&mut boxed_socket).await {
                                 error!("Error handling client: {:#}", e);

@@ -25,10 +25,17 @@ max_size = 10
 
 # Multiple listeners
 [[server.listeners]]
-addr = "0.0.0.0:25"
+addr = "0.0.0.0:465"     # Implicit TLS (default mode)
 [server.listeners.tls]
 cert_path = "/etc/hedwig/server.crt"
 key_path = "/etc/hedwig/server.key"
+
+[[server.listeners]]
+addr = "0.0.0.0:587"     # Plaintext with STARTTLS upgrade
+[server.listeners.tls]
+cert_path = "/etc/hedwig/server.crt"
+key_path = "/etc/hedwig/server.key"
+mode = "starttls"
 
 [[server.listeners]]
 addr = "127.0.0.1:2525"  # Local plaintext listener

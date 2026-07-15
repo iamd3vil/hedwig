@@ -141,6 +141,19 @@ pub struct CfgListener {
 pub struct CfgTls {
     pub cert_path: String,
     pub key_path: String,
+    /// How TLS is negotiated on this listener: "implicit" wraps the
+    /// connection in TLS immediately (e.g. port 465), "starttls" accepts
+    /// plaintext and upgrades when the client issues STARTTLS (e.g. port 587).
+    #[serde(default)]
+    pub mode: TlsMode,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    #[default]
+    Implicit,
+    Starttls,
 }
 
 #[derive(Debug, Deserialize, Clone)]

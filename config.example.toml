@@ -38,16 +38,22 @@ bind = "0.0.0.0:8080"
 [[server.listeners]]
 addr = "0.0.0.0:25"
 
-# SMTP submission port (plaintext)
+# SMTP submission port (STARTTLS: starts plaintext, upgrades when the
+# client issues STARTTLS)
 [[server.listeners]]
 addr = "0.0.0.0:587"
+[server.listeners.tls]
+cert_path = "/etc/ssl/certs/smtp.crt"
+key_path = "/etc/ssl/private/smtp.key"
+mode = "starttls"
 
-# SMTPS port (TLS)
+# SMTPS port (implicit TLS: the connection is TLS from the first byte)
 [[server.listeners]]
 addr = "0.0.0.0:465"
 [server.listeners.tls]
 cert_path = "/etc/ssl/certs/smtp.crt"
 key_path = "/etc/ssl/private/smtp.key"
+mode = "implicit" # default when omitted
 
 # Local testing port (plaintext)
 [[server.listeners]]
