@@ -14,7 +14,6 @@ use tokio::time::Duration;
 
 pub struct SqliteStorage {
     pub read_pools: Vec<SqlitePool>,
-    pub write_pools: Vec<SqlitePool>,
     pub shard_senders: Vec<mpsc::Sender<ShardWriteOp>>,
     pub num_shards: usize,
 }
@@ -96,7 +95,6 @@ impl SqliteStorage {
         let cache_kb_per_shard = (cache_size_mb as i64 * 1024) / (num_shards as i64);
 
         let mut read_pools = Vec::with_capacity(num_shards);
-        let mut write_pools = Vec::with_capacity(num_shards);
         let mut shard_senders = Vec::with_capacity(num_shards);
 
         for i in 0..num_shards {
@@ -135,20 +133,18 @@ impl SqliteStorage {
             let (tx, rx) = mpsc::channel::<ShardWriteOp>(1024);
             tokio::spawn(shard_writer_task(
                 i,
-                write_pool.clone(),
+                write_pool,
                 rx,
                 batch_size,
                 batch_timeout_ms,
             ));
 
             read_pools.push(read_pool);
-            write_pools.push(write_pool);
             shard_senders.push(tx);
         }
 
         Ok(SqliteStorage {
             read_pools,
-            write_pools,
             shard_senders,
             num_shards,
         })
@@ -682,8 +678,7 @@ impl Storage for SqliteStorage {
                 let body = String::from_utf8(body_bytes)
                     .into_diagnostic()
                     .wrap_err("email body is not valid UTF-8")?;
-                let queued_at =
-                    queued_at.and_then(|ms| chrono::DateTime::from_timestamp_millis(ms));
+                let queued_at = queued_at.and_then(chrono::DateTime::from_timestamp_millis);
                 Ok(Some(StoredEmail {
                     message_id,
                     from: from_addr,
@@ -755,7 +750,7 @@ impl Storage for SqliteStorage {
                         .into_diagnostic()
                         .wrap_err("email body is not valid UTF-8")?;
                     let queued_at =
-                        queued_at.and_then(|ms| chrono::DateTime::from_timestamp_millis(ms));
+                        queued_at.and_then(chrono::DateTime::from_timestamp_millis);
                     yield StoredEmail {
                         message_id,
                         from: from_addr,
@@ -850,7 +845,6 @@ mod tests {
 
         assert_eq!(storage.num_shards, 4);
         assert_eq!(storage.read_pools.len(), 4);
-        assert_eq!(storage.write_pools.len(), 4);
         assert_eq!(storage.shard_senders.len(), 4);
 
         for i in 0..4 {

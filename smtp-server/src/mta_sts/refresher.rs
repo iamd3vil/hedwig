@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -67,15 +67,8 @@ async fn refresh_all_policies(resolver: &MtaStsResolver) {
         };
 
         if txt_record.id == cached.txt_id {
-            let refreshed_policy = CachedPolicy {
-                fetched_at: Instant::now(),
-                ..cached
-            };
-
-            resolver
-                .cache()
-                .insert(domain.clone(), refreshed_policy)
-                .await;
+            // Re-inserting resets the cache's expire-after-create TTL.
+            resolver.cache().insert(domain.clone(), cached).await;
             refreshed += 1;
             debug!(%domain, txt_id = %txt_record.id, "MTA-STS TXT id unchanged, extended cache freshness");
             continue;
@@ -96,7 +89,6 @@ async fn refresh_all_policies(resolver: &MtaStsResolver) {
                 let refreshed_policy = CachedPolicy {
                     policy,
                     txt_id: txt_record.id,
-                    fetched_at: Instant::now(),
                 };
 
                 resolver

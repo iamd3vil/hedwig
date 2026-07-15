@@ -1,4 +1,4 @@
-use std::{fmt, time::Instant};
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyMode {
@@ -28,7 +28,6 @@ pub struct MtaStsPolicy {
 pub struct CachedPolicy {
     pub policy: MtaStsPolicy,
     pub txt_id: String,
-    pub fetched_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,10 +131,8 @@ pub fn parse_policy(policy_body: &str) -> Result<MtaStsPolicy, PolicyParseError>
                 }
                 max_age = Some(parsed_max_age);
             }
-            "mx" => {
-                if !value.is_empty() {
-                    mx_patterns.push(value.to_ascii_lowercase());
-                }
+            "mx" if !value.is_empty() => {
+                mx_patterns.push(value.to_ascii_lowercase());
             }
             _ => {}
         }

@@ -78,7 +78,6 @@ impl MtaStsResolver {
                 let cached_policy = CachedPolicy {
                     policy: policy.clone(),
                     txt_id: txt_record.id,
-                    fetched_at: Instant::now(),
                 };
 
                 info!(%domain, mode = %policy.mode, max_age = policy.max_age, "cached MTA-STS policy");
