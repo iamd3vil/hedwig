@@ -227,6 +227,19 @@ pub trait SmtpCallbacks: Send + Sync {
 
 /// Default maximum message size: 25 MiB.
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 25 * 1024 * 1024;
+/// End-of-DATA sequence: a lone dot on its own line.
+const DATA_TERMINATOR: &[u8] = b"\r\n.\r\n";
+
+/// Incrementally searches `buffer` for the DATA terminator.
+///
+/// `scanned` is the buffer length after the previous (unsuccessful) search;
+/// the search resumes 4 bytes before it so a terminator split across two
+/// reads is still found, while keeping the total work linear in message size
+/// instead of rescanning from the start on every read.
+fn find_data_terminator(buffer: &[u8], scanned: usize) -> Option<usize> {
+    let start = scanned.saturating_sub(DATA_TERMINATOR.len() - 1);
+    memchr::memmem::find(&buffer[start..], DATA_TERMINATOR).map(|pos| start + pos)
+}
 /// Default idle timeout between commands: 5 minutes (RFC 5321).
 const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Default timeout during DATA transfer: 10 minutes.
@@ -345,6 +358,9 @@ impl SmtpServer {
     ) -> Result<()> {
         let mut buf = BytesMut::with_capacity(32768); // 32kb
         let mut data_buffer = BytesMut::new();
+        // Length of data_buffer already searched for the DATA terminator;
+        // lets each read scan only the newly received bytes.
+        let mut data_scanned: usize = 0;
 
         loop {
             let timeout = if session.state == SessionState::ReceivingData {
@@ -370,15 +386,19 @@ impl SmtpServer {
                 data_buffer.extend_from_slice(&buf[..]);
                 buf.clear();
 
+                // Only the newly received bytes need to be searched; earlier
+                // reads already covered the rest.
+                let terminator = find_data_terminator(&data_buffer, data_scanned);
+
                 // Enforce message size limit.
                 // After rejecting, keep discarding until the DATA terminator
                 // (<CRLF>.<CRLF>) so the remaining body bytes aren't
                 // misparsed as SMTP commands on this connection.
                 if data_buffer.len() > self.max_message_size {
-                    // Check if the terminator is already in the buffer.
-                    if memchr::memmem::find(&data_buffer, b"\r\n.\r\n").is_some() {
+                    if terminator.is_some() {
                         stream.write_line(b"552 5.3.4 Message too big\r\n").await?;
                         data_buffer.clear();
+                        data_scanned = 0;
                         session.state = SessionState::Authenticated;
                     }
                     // Otherwise keep accumulating until terminator arrives,
@@ -389,13 +409,15 @@ impl SmtpServer {
                         let tail: Vec<u8> = data_buffer[keep_from..].to_vec();
                         data_buffer.clear();
                         data_buffer.extend_from_slice(&tail);
+                        data_scanned = 0;
+                    } else {
+                        data_scanned = data_buffer.len();
                     }
                     continue;
                 }
 
-                let mut termination_found = false;
-                for pos in memchr::memchr_iter(b'\r', &data_buffer) {
-                    if pos + 5 <= data_buffer.len() && &data_buffer[pos..pos + 5] == b"\r\n.\r\n" {
+                match terminator {
+                    Some(pos) => {
                         // raw_message holds all data up to the termination sequence.
                         let raw_message = &data_buffer[..pos];
                         // Instead of converting to a string, unstuff directly on the bytes.
@@ -413,12 +435,11 @@ impl SmtpServer {
                         stream.write_line(b"250 OK\r\n").await?;
                         session.state = SessionState::Authenticated;
                         data_buffer.clear();
-                        termination_found = true;
-                        break;
+                        data_scanned = 0;
                     }
-                }
-                if termination_found {
-                    continue;
+                    None => {
+                        data_scanned = data_buffer.len();
+                    }
                 }
                 continue;
             }
@@ -739,4 +760,175 @@ pub fn decode_base64(input: &str) -> Result<String, SmtpError> {
             .map_err(|_| SmtpError::AuthError)?,
     )
     .map_err(|_| SmtpError::AuthError)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn test_find_data_terminator_in_one_chunk() {
+        let buf = b"hello world\r\n.\r\n";
+        assert_eq!(find_data_terminator(buf, 0), Some(11));
+    }
+
+    #[test]
+    fn test_find_data_terminator_absent() {
+        let buf = b"hello world\r\n..\r\n";
+        assert_eq!(find_data_terminator(buf, 0), None);
+    }
+
+    #[test]
+    fn test_find_data_terminator_split_across_reads() {
+        // Terminator arrives split at every possible boundary; the overlap
+        // window must still find it once the second half lands.
+        let full = b"body text\r\n.\r\n";
+        let term_start = 9;
+        for split in term_start + 1..full.len() {
+            // First read: no terminator yet.
+            assert_eq!(
+                find_data_terminator(&full[..split], 0),
+                None,
+                "false positive at split {split}"
+            );
+            // Second read appends the rest; scan resumes from the old length.
+            assert_eq!(
+                find_data_terminator(full, split),
+                Some(term_start),
+                "missed terminator at split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_data_terminator_skips_already_scanned_region() {
+        // A terminator fully inside the already-scanned region (minus the
+        // 4-byte overlap) is not refound; callers reset state after acting
+        // on a find, so this situation only occurs for stale offsets.
+        let buf = b"x\r\n.\r\nyyyyyyyyyy";
+        assert_eq!(find_data_terminator(buf, 10), None);
+    }
+
+    struct RecordingCallbacks {
+        emails: StdMutex<Vec<Email>>,
+    }
+
+    #[async_trait]
+    impl SmtpCallbacks for RecordingCallbacks {
+        async fn on_ehlo(&self, _domain: &str) -> Result<(), SmtpError> {
+            Ok(())
+        }
+        async fn on_auth(&self, _username: &str, _password: &str) -> Result<bool, SmtpError> {
+            Ok(true)
+        }
+        async fn on_mail_from(
+            &self,
+            _from_command: &parser::MailFromCommand,
+        ) -> Result<(), SmtpError> {
+            Ok(())
+        }
+        async fn on_rcpt_to(&self, _to: &str) -> Result<(), SmtpError> {
+            Ok(())
+        }
+        async fn on_data(&self, email: Email) -> Result<(), SmtpError> {
+            self.emails.lock().unwrap().push(email);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SmtpStream for tokio::io::DuplexStream {}
+
+    /// Drives a full session over an in-memory duplex stream, sending the
+    /// DATA body in `chunk_size`-byte writes, and returns the received body.
+    async fn run_chunked_data_session(body: &str, chunk_size: usize) -> String {
+        let callbacks = Arc::new(RecordingCallbacks {
+            emails: StdMutex::new(Vec::new()),
+        });
+        let server = SmtpServer {
+            callbacks: callbacks.clone(),
+            auth_enabled: false,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            cmd_timeout: Duration::from_secs(5),
+            data_timeout: Duration::from_secs(5),
+            hostname: "test.local".to_string(),
+        };
+
+        let (client, server_side) = tokio::io::duplex(4096);
+        let mut server_stream: Box<dyn SmtpStream> = Box::new(server_side);
+        let server_task =
+            tokio::spawn(async move { server.handle_client(&mut server_stream).await });
+
+        let (mut reader, mut writer) = tokio::io::split(client);
+
+        async fn read_reply<R: tokio::io::AsyncRead + Unpin>(
+            reader: &mut R,
+            expected: &str,
+        ) -> String {
+            let mut buf = vec![0u8; 512];
+            let n = reader.read(&mut buf).await.unwrap();
+            let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                reply.contains(expected),
+                "expected {expected:?}, got {reply:?}"
+            );
+            reply
+        }
+
+        // Greeting + handshake up to DATA.
+        read_reply(&mut reader, "220").await;
+        writer.write_all(b"EHLO client.test\r\n").await.unwrap();
+        read_reply(&mut reader, "250").await;
+        writer
+            .write_all(b"MAIL FROM:<a@example.com>\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut reader, "250").await;
+        writer
+            .write_all(b"RCPT TO:<b@example.org>\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut reader, "250").await;
+        writer.write_all(b"DATA\r\n").await.unwrap();
+        read_reply(&mut reader, "354").await;
+
+        // Body plus terminator, in small chunks with explicit flushes so the
+        // server sees many partial reads (including one that splits the
+        // terminator itself).
+        let mut wire = body.as_bytes().to_vec();
+        wire.extend_from_slice(DATA_TERMINATOR);
+        for chunk in wire.chunks(chunk_size) {
+            writer.write_all(chunk).await.unwrap();
+            writer.flush().await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        read_reply(&mut reader, "250").await;
+
+        writer.write_all(b"QUIT\r\n").await.unwrap();
+        drop(writer);
+        server_task.await.unwrap().unwrap();
+
+        let emails = callbacks.emails.lock().unwrap();
+        assert_eq!(emails.len(), 1);
+        emails[0].body.clone()
+    }
+
+    #[tokio::test]
+    async fn test_data_body_received_in_tiny_chunks() {
+        let body = "Subject: chunked\r\n\r\nline one\r\nline two with a . dot\r\n";
+        // 3-byte chunks guarantee the CRLF.CRLF terminator is split across
+        // multiple reads.
+        let received = run_chunked_data_session(body, 3).await;
+        assert_eq!(received, body);
+    }
+
+    #[tokio::test]
+    async fn test_data_dot_stuffed_lines_are_unstuffed() {
+        let sent = "Subject: dots\r\n\r\n..leading dot line\r\nmiddle\r\n";
+        let expected = "Subject: dots\r\n\r\n.leading dot line\r\nmiddle\r\n";
+        let received = run_chunked_data_session(sent, 7).await;
+        assert_eq!(received, expected);
+    }
 }
