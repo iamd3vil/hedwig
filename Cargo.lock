@@ -1123,6 +1123,7 @@ dependencies = [
  "email-address-parser",
  "futures",
  "hickory-resolver 0.24.2",
+ "hostname 0.4.0",
  "humantime-serde",
  "huml-rs",
  "hyper 0.14.32",

@@ -17,6 +17,7 @@ format = "fmt"
 workers = 4
 max_retries = 3
 helo_hostname = "mail.example.com"
+hostname = "mx.example.com"
 
 [server.smtp]
 cache_size = 100

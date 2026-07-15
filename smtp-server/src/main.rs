@@ -238,10 +238,20 @@ async fn run_server(config_path: &str) -> Result<()> {
         .server
         .data_timeout
         .unwrap_or(std::time::Duration::from_secs(10 * 60));
+    // Inbound identity for the 220 greeting and EHLO reply: config wins,
+    // otherwise the OS hostname, with "localhost" as the last resort.
+    let smtp_hostname = cfg.server.hostname.clone().unwrap_or_else(|| {
+        hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| String::from("localhost"))
+    });
+    info!("Inbound SMTP hostname: {}", smtp_hostname);
     let smtp_server = SmtpServer::new(callbacks, auth_enabled)
         .with_max_message_size(max_message_size)
         .with_cmd_timeout(cmd_timeout)
-        .with_data_timeout(data_timeout);
+        .with_data_timeout(data_timeout)
+        .with_hostname(smtp_hostname);
 
     // Replay any queued emails so workers process them immediately.
     if !queued_jobs.is_empty() {
