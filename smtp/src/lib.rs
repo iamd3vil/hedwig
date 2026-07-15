@@ -5,17 +5,14 @@ use base64::prelude::*;
 use bytes::BytesMut;
 use memchr::memchr;
 use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
-use std::os::unix::io::AsRawFd; // or windows equivalent
-use std::os::unix::io::FromRawFd;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
-use rustls::pki_types::CertificateDer;
-use std::path::Path;
-use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 
 pub mod parser;
@@ -28,30 +25,116 @@ pub trait SmtpStream: AsyncRead + AsyncWrite + Unpin + Send {
         Ok(())
     }
 
-    async fn upgrade_to_tls(
-        &mut self,
-        _acceptor: &TlsAcceptor,
-    ) -> Result<Option<TlsStream<TcpStream>>> {
-        Ok(None)
+    /// Whether this stream can be upgraded to TLS via STARTTLS.
+    fn supports_starttls(&self) -> bool {
+        false
+    }
+
+    /// Upgrades the stream to TLS in place. Only valid when
+    /// `supports_starttls()` returns true.
+    async fn upgrade_to_tls(&mut self) -> Result<()> {
+        bail!("STARTTLS not supported on this stream")
     }
 }
 
 #[async_trait]
-impl SmtpStream for TcpStream {
-    async fn upgrade_to_tls(
-        &mut self,
-        acceptor: &TlsAcceptor,
-    ) -> Result<Option<TlsStream<TcpStream>>> {
-        let fd = self.as_raw_fd();
-        let stream = unsafe { TcpStream::from_std(std::net::TcpStream::from_raw_fd(fd)) }
-            .into_diagnostic()?;
-        let tls_stream = acceptor.accept(stream).await.into_diagnostic()?;
-        Ok(Some(tls_stream))
-    }
-}
+impl SmtpStream for TcpStream {}
 
 #[async_trait]
 impl SmtpStream for TlsStream<TcpStream> {}
+
+/// A connection that starts out as plain TCP and may be upgraded to TLS
+/// mid-session via STARTTLS. Carrying the acceptor with the stream lets each
+/// listener decide independently whether to offer STARTTLS.
+pub enum MaybeTlsStream {
+    Plain(TcpStream, Option<TlsAcceptor>),
+    Tls(Box<TlsStream<TcpStream>>),
+    /// Transient state while the TLS handshake runs; only observable if the
+    /// handshake fails, after which the connection is unusable.
+    Upgrading,
+}
+
+impl AsyncRead for MaybeTlsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s, _) => Pin::new(s).poll_read(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            MaybeTlsStream::Upgrading => Poll::Ready(Err(upgrading_io_error())),
+        }
+    }
+}
+
+impl AsyncWrite for MaybeTlsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s, _) => Pin::new(s).poll_write(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeTlsStream::Upgrading => Poll::Ready(Err(upgrading_io_error())),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s, _) => Pin::new(s).poll_flush(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_flush(cx),
+            MaybeTlsStream::Upgrading => Poll::Ready(Err(upgrading_io_error())),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s, _) => Pin::new(s).poll_shutdown(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeTlsStream::Upgrading => Poll::Ready(Err(upgrading_io_error())),
+        }
+    }
+}
+
+fn upgrading_io_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "connection unusable after failed TLS upgrade",
+    )
+}
+
+#[async_trait]
+impl SmtpStream for MaybeTlsStream {
+    fn supports_starttls(&self) -> bool {
+        matches!(self, MaybeTlsStream::Plain(_, Some(_)))
+    }
+
+    async fn upgrade_to_tls(&mut self) -> Result<()> {
+        match std::mem::replace(self, MaybeTlsStream::Upgrading) {
+            MaybeTlsStream::Plain(tcp, Some(acceptor)) => {
+                let tls_stream = acceptor
+                    .accept(tcp)
+                    .await
+                    .into_diagnostic()
+                    .wrap_err("TLS handshake failed during STARTTLS upgrade")?;
+                *self = MaybeTlsStream::Tls(Box::new(tls_stream));
+                Ok(())
+            }
+            other => {
+                *self = other;
+                bail!("STARTTLS not supported on this stream")
+            }
+        }
+    }
+}
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum SmtpError {
@@ -157,9 +240,6 @@ pub struct SmtpServer {
     // Indicates whether authentication is enabled for this server.
     auth_enabled: bool,
 
-    // TLS acceptor for handling encrypted connections.
-    tls_acceptor: Option<TlsAcceptor>,
-
     // Maximum message size in bytes. Enforced during DATA and advertised via SIZE in EHLO.
     max_message_size: usize,
 
@@ -184,7 +264,6 @@ impl SmtpServer {
         SmtpServer {
             callbacks: Arc::new(callbacks),
             auth_enabled,
-            tls_acceptor: None,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             cmd_timeout: DEFAULT_CMD_TIMEOUT,
             data_timeout: DEFAULT_DATA_TIMEOUT,
@@ -204,36 +283,6 @@ impl SmtpServer {
     pub fn with_data_timeout(mut self, timeout: Duration) -> Self {
         self.data_timeout = timeout;
         self
-    }
-
-    pub fn with_tls(
-        mut self,
-        cert_path: impl AsRef<Path>,
-        key_path: impl AsRef<Path>,
-    ) -> Result<Self> {
-        let cert_file = std::fs::File::open(cert_path)
-            .into_diagnostic()
-            .wrap_err("Failed to open certificate file")?;
-        let key_file = std::fs::File::open(key_path)
-            .into_diagnostic()
-            .wrap_err("Failed to open private key file")?;
-
-        let certs: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
-                .collect::<std::io::Result<Vec<_>>>()
-                .into_diagnostic()?;
-
-        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
-            .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("No private key found"))?;
-
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .into_diagnostic()?;
-
-        self.tls_acceptor = Some(TlsAcceptor::from(Arc::new(config)));
-        Ok(self)
     }
 
     /// Handles a client connection.
@@ -273,8 +322,9 @@ impl SmtpServer {
                 _ => Ok(()),
             }
         } else {
-            // Handle successful connection termination
-            socket.write_line(b"221 Bye\r\n").await
+            // Clean termination: QUIT already answered with 221, and on
+            // EOF/timeout the client is gone — nothing more to write.
+            Ok(())
         }
     }
 
@@ -370,6 +420,9 @@ impl SmtpServer {
                     let line = buf.split_to(cr + 2);
                     // Remove CRLF.
                     let line = &line[..line.len().saturating_sub(2)];
+                    // Deliberate leniency: surrounding whitespace is trimmed
+                    // before parsing, so padded commands from sloppy clients
+                    // (e.g. "STARTTLS \r\n") are accepted.
                     let command = std::str::from_utf8(line)
                         .map_err(|err| SmtpError::ParseError {
                             message: format!("Invalid UTF-8 sequence: {}", err),
@@ -379,6 +432,44 @@ impl SmtpServer {
                         .to_string();
 
                     match parse_command(&command, &session.state) {
+                        // STARTTLS is handled here rather than in handle_command
+                        // because the upgrade must also discard any bytes the
+                        // client pipelined after the command (RFC 3207: possible
+                        // plaintext injection) — and those live in `buf`.
+                        Ok(SmtpCommand::StartTls) => {
+                            if !stream.supports_starttls() {
+                                stream.write_line(b"502 STARTTLS not supported\r\n").await?;
+                            } else if matches!(
+                                session.state,
+                                SessionState::ReceivingMailFrom | SessionState::ReceivingRcptTo
+                            ) {
+                                stream
+                                    .write_line(b"503 STARTTLS not allowed during mail transaction\r\n")
+                                    .await?;
+                            } else {
+                                stream.write_line(b"220 Ready to start TLS\r\n").await?;
+                                buf.clear();
+                                data_buffer.clear();
+                                // Bound the handshake so a client that goes
+                                // silent after STARTTLS can't hold the
+                                // connection (and its permit) forever.
+                                match tokio::time::timeout(
+                                    self.cmd_timeout,
+                                    stream.upgrade_to_tls(),
+                                )
+                                .await
+                                {
+                                    Ok(result) => result?,
+                                    // The handshake never completed; the stream
+                                    // is unusable, so just drop the connection.
+                                    Err(_) => return Ok(()),
+                                }
+                                // RFC 3207: the session is reset to its initial
+                                // state; the client must EHLO again.
+                                session.email = Email::default();
+                                session.state = SessionState::Connected;
+                            }
+                        }
                         Ok(cmd) => {
                             if self.handle_command(session, cmd, stream).await? {
                                 return Ok(());
@@ -410,7 +501,7 @@ impl SmtpServer {
                 self.callbacks.on_ehlo(&domain).await?;
                 let mut response = String::from("250-localhost\r\n");
                 response.push_str(&format!("250-SIZE {}\r\n", self.max_message_size));
-                if self.tls_acceptor.is_some() {
+                if stream.supports_starttls() {
                     response.push_str("250-STARTTLS\r\n");
                 }
                 // Add AUTH support if enabled.
@@ -473,25 +564,6 @@ impl SmtpServer {
                     .write_line(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n")
                     .await?;
                 session.state = SessionState::ReceivingData;
-            }
-            (_, SmtpCommand::StartTls) => {
-                if let Some(acceptor) = &self.tls_acceptor {
-                    stream.write_line(b"220 Ready to start TLS\r\n").await?;
-
-                    if let Some(tls_stream) = stream.upgrade_to_tls(acceptor).await? {
-                        session.state = SessionState::Connected;
-                        let mut new_stream = Box::new(tls_stream) as Box<dyn SmtpStream>;
-                        // Wrap the recursive call in Box::pin
-                        Box::pin(self.handle_connection(session, &mut new_stream)).await?;
-                        return Ok(true);
-                    } else {
-                        stream
-                            .write_line(b"454 TLS not available due to temporary reason\r\n")
-                            .await?;
-                    }
-                } else {
-                    stream.write_line(b"502 STARTTLS not supported\r\n").await?;
-                }
             }
             (_, SmtpCommand::Quit) => {
                 stream.write_line(b"221 Bye\r\n").await?;

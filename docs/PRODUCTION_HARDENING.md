@@ -82,9 +82,11 @@ Production deployments should set `server.helo_hostname` to the public FQDN for 
 
 ---
 
-### 8. STARTTLS is broken on plaintext listeners
+### 8. ~~STARTTLS is broken on plaintext listeners~~ → Addressed
 
-**Problem:** Two issues:
+**Status:** Addressed. Listeners now take `mode = "starttls"` in their TLS config to accept plaintext connections and upgrade via STARTTLS (RFC 3207). The upgrade happens in place through `smtp::MaybeTlsStream` (no raw-FD tricks), any bytes pipelined after the STARTTLS command are discarded to prevent plaintext injection, and the SMTP session is fully reset after the handshake.
+
+**Problem (original):** Two issues:
 1. `main.rs` never calls `SmtpServer::with_tls()`, so the SMTP session never has a `tls_acceptor` and STARTTLS is never advertised on plaintext listeners.
 2. `upgrade_to_tls()` in `smtp/src/lib.rs` uses `unsafe { TcpStream::from_raw_fd() }` which creates two owners of the same FD — a use-after-free risk.
 

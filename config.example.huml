@@ -17,11 +17,16 @@ server::
       addr: "0.0.0.0:25"
     - ::
       addr: "0.0.0.0:587"
+      tls::
+        cert_path: "/etc/ssl/certs/smtp.crt"
+        key_path: "/etc/ssl/private/smtp.key"
+        mode: "starttls"
     - ::
       addr: "0.0.0.0:465"
       tls::
         cert_path: "/etc/ssl/certs/smtp.crt"
         key_path: "/etc/ssl/private/smtp.key"
+        mode: "implicit"
     - ::
       addr: "127.0.0.1:2525"
   max_retries: 5

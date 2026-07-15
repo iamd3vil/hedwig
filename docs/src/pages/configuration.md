@@ -48,15 +48,28 @@ For new or low-volume senders, keep `min_idle` and `max_size` small so strict re
 
 ```toml
 [[server.listeners]]
-addr = "0.0.0.0:25"           # Bind address and port
+addr = "0.0.0.0:465"          # Bind address and port
 # Optional TLS configuration
 [server.listeners.tls]
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
+mode = "implicit"             # "implicit" (default) or "starttls"
 
 [[server.listeners]]
-addr = "127.0.0.1:2525"       # Second listener without TLS
+addr = "0.0.0.0:587"          # STARTTLS listener: accepts plaintext and
+[server.listeners.tls]        # upgrades to TLS when the client asks
+cert_path = "/path/to/cert.pem"
+key_path = "/path/to/key.pem"
+mode = "starttls"
+
+[[server.listeners]]
+addr = "127.0.0.1:2525"       # Listener without TLS
 ```
+
+Each listener can negotiate TLS in one of two ways:
+
+- `mode = "implicit"` (the default): the TLS handshake happens as soon as the connection opens, before any SMTP traffic. Use this for SMTPS (port 465).
+- `mode = "starttls"`: the connection starts in plaintext and the server advertises `STARTTLS` in its EHLO response; the session is upgraded to TLS when the client issues the `STARTTLS` command (RFC 3207). Use this for submission (port 587).
 
 ## Authentication (`[[server.auth]]`)
 

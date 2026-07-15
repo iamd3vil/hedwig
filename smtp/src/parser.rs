@@ -89,8 +89,7 @@ fn parse_normal_command(input: &str) -> IResult<&str, SmtpCommand> {
         parse_mail_from,
         parse_rcpt_to,
         parse_simple_command,
-        // Changed this line to be exact
-        map(tag_no_case("STARTTLS\r\n"), |_| SmtpCommand::StartTls),
+        parse_starttls,
     ))
     .parse(input)
 }
@@ -206,6 +205,19 @@ fn parse_rcpt_to(input: &str) -> IResult<&str, SmtpCommand> {
     map(
         preceded(tag_no_case("RCPT TO:"), rest), // Use `rest` to capture everything after the prefix
         |address_part: &str| SmtpCommand::RcptTo(address_part.trim().to_string()), // Trim whitespace from the captured address
+    )
+    .parse(input)
+}
+
+/// Parses STARTTLS. RFC 3207 forbids parameters, so nothing may follow the
+/// command word (the read loop has already stripped the CRLF, but accept a
+/// trailing CRLF too for callers that pass raw lines).
+fn parse_starttls(input: &str) -> IResult<&str, SmtpCommand> {
+    map(
+        verify(preceded(tag_no_case("STARTTLS"), rest), |r: &str| {
+            r.is_empty() || r == "\r\n"
+        }),
+        |_| SmtpCommand::StartTls,
     )
     .parse(input)
 }
@@ -648,13 +660,20 @@ mod tests {
             SmtpCommand::StartTls
         );
 
-        // Should fail without CRLF
-        assert!(parse_command("STARTTLS", &SessionState::Connected).is_err());
+        // The read loop strips CRLF before parsing, so the bare word must parse
+        assert_eq!(
+            parse_command("STARTTLS", &SessionState::Connected).unwrap(),
+            SmtpCommand::StartTls
+        );
 
         // Should fail with parameters
         assert!(parse_command("STARTTLS param\r\n", &SessionState::Connected).is_err());
+        assert!(parse_command("STARTTLS param", &SessionState::Connected).is_err());
 
-        // Should fail with extra spaces
+        // The parser itself rejects surrounding whitespace. Note that the
+        // server's read loop trims each line before parsing, so whitespace-
+        // padded commands (e.g. "STARTTLS \r\n") are normalized and accepted
+        // there — these assertions only cover direct parser callers.
         assert!(parse_command("STARTTLS \r\n", &SessionState::Connected).is_err());
         assert!(parse_command(" STARTTLS\r\n", &SessionState::Connected).is_err());
     }

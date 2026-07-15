@@ -3144,8 +3144,6 @@ dependencies = [
  "memchr",
  "miette",
  "nom 8.0.0",
- "rustls",
- "rustls-pemfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
