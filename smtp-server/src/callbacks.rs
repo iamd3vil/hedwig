@@ -1,6 +1,4 @@
 use chrono::Utc;
-use email_address_parser::EmailAddress;
-use mailparse::MailAddr;
 /// This file defines the callbacks for the SMTP server.
 ///
 /// This module implements the `SmtpCallbacks` trait, providing the logic for
@@ -33,19 +31,19 @@ pub struct Callbacks {
     sender_channel: async_channel::Sender<worker::Job>,
 }
 
+/// Extracts the lowercased domain from an SMTP path like `<user@example.com>`.
+///
+/// The command parser has already constrained the address syntax by the time
+/// this runs, so a full address-grammar parse here would be redundant work on
+/// the per-message hot path. Splitting on the last `@` also keeps quoted
+/// local parts containing `@` correct.
 fn extract_domain_from_path(path: &str) -> Option<String> {
-    mailparse::addrparse(path).ok().and_then(|addr| {
-        if let Some(email) = addr.first() {
-            match email {
-                MailAddr::Single(info) => {
-                    return EmailAddress::parse(info.addr.as_ref(), None)
-                        .map(|e| e.domain().to_lowercase())
-                }
-                _ => return None,
-            }
-        }
-        None
-    })
+    let addr = path.trim().trim_matches(|c| c == '<' || c == '>');
+    let (local, domain) = addr.rsplit_once('@')?;
+    if local.is_empty() || domain.is_empty() {
+        return None;
+    }
+    Some(domain.to_lowercase())
 }
 
 pub struct MXExpiry;
