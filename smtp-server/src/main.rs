@@ -80,8 +80,9 @@ async fn run_server(config_path: &str) -> Result<()> {
         .with_line_number(false)
         .with_level(true)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("HEDWIG_LOG_LEVEL")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("hedwig=info")),
+            tracing_subscriber::EnvFilter::try_from_env("HEDWIG_LOG_LEVEL").unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(format!("hedwig={}", level))
+            }),
         );
 
     if cfg.log.format == "json" {

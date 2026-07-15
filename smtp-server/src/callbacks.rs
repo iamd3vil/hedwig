@@ -33,16 +33,66 @@ pub struct Callbacks {
     sender_channel: async_channel::Sender<worker::Job>,
 }
 
+/// Extracts the lowercased domain from an SMTP path like `<user@example.com>`.
+///
+/// This runs twice per message (MAIL FROM and RCPT TO) and feeds the domain
+/// allow/deny filters, so both speed and exact semantics matter. Plain
+/// dot-atom addresses — effectively all real traffic — take a cheap
+/// character-level fast path; anything unusual (quoted local parts,
+/// internationalized domains, malformed input) falls back to the full
+/// parser so filter behavior is identical to the pre-fast-path code.
 fn extract_domain_from_path(path: &str) -> Option<String> {
+    extract_domain_fast(path).or_else(|| extract_domain_full(path))
+}
+
+/// Cheap validation for plain dot-atom addresses with LDH domain labels.
+///
+/// Deliberately a strict subset of what `extract_domain_full` accepts: a
+/// `Some` here must always agree with the full parser (see
+/// `test_fast_path_agrees_with_full_parser`), so falling back only on `None`
+/// cannot change filter semantics.
+fn extract_domain_fast(path: &str) -> Option<String> {
+    let path = path.trim();
+    // Accept bare paths ("user@example.com") and bracketed forms, including
+    // with a display name ("Name <user@example.com>").
+    let addr = match (path.rfind('<'), path.rfind('>')) {
+        (Some(lt), Some(gt)) if lt < gt => &path[lt + 1..gt],
+        (None, None) => path,
+        _ => return None,
+    };
+    let (local, domain) = addr.rsplit_once('@')?;
+
+    // RFC 5321 atext, dot-separated with no empty atoms.
+    let is_atext = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-/=?^_`{|}~".contains(c);
+    let local_ok = !local.is_empty()
+        && local
+            .split('.')
+            .all(|atom| !atom.is_empty() && atom.chars().all(is_atext));
+
+    // LDH domain labels: letters/digits/hyphens, no leading/trailing hyphen.
+    let domain_ok = !domain.is_empty()
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+
+    if local_ok && domain_ok {
+        Some(domain.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// The original full-parser extraction; kept as the fallback for addresses
+/// the fast path is not certain about.
+fn extract_domain_full(path: &str) -> Option<String> {
     mailparse::addrparse(path).ok().and_then(|addr| {
-        if let Some(email) = addr.first() {
-            match email {
-                MailAddr::Single(info) => {
-                    return EmailAddress::parse(info.addr.as_ref(), None)
-                        .map(|e| e.domain().to_lowercase())
-                }
-                _ => return None,
-            }
+        if let Some(MailAddr::Single(info)) = addr.first() {
+            return EmailAddress::parse(info.addr.as_ref(), None)
+                .map(|e| e.domain().to_lowercase());
         }
         None
     })
@@ -432,6 +482,88 @@ mod tests {
     use futures::{stream, Stream};
     use miette::Result;
     use std::pin::Pin;
+
+    #[test]
+    fn test_extract_domain_valid_addresses() {
+        let cases = [
+            ("test@example.com", "example.com"),
+            ("<test@example.com>", "example.com"),
+            ("  <test@Example.COM>  ", "example.com"),
+            ("<a@sub.domain-with-dash.org>", "sub.domain-with-dash.org"),
+            // Display-name form.
+            ("Testing <testing@hedwig.example.com>", "hedwig.example.com"),
+            // Valid quoted local part with whitespace: the domain must still
+            // be extracted so deny filters can match (full-parser fallback).
+            ("<\"blocked user\"@blocked.example>", "blocked.example"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                extract_domain_from_path(input).as_deref(),
+                Some(expected),
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_domain_junk_addresses_yield_none() {
+        // The command parser accepts nearly anything in angle brackets, so
+        // junk shapes must not produce a domain (an allow filter would
+        // otherwise match on them). Mirrors the old parser-based behavior.
+        let cases = [
+            "testuser",
+            "<testuser>",
+            "<>",
+            "<@example.com>",
+            "<test@>",
+            "<foo@bar@example.com>",      // unquoted '@' in local part
+            "<foo..bar@allowed.example>", // empty atom in local part
+            "<.foo@allowed.example>",     // leading dot in local part
+            "<foo.@allowed.example>",     // trailing dot in local part
+            "<test@bad domain.com>",      // whitespace in domain
+            "<test@.example.com>",        // empty label in domain
+        ];
+        for input in cases {
+            assert_eq!(extract_domain_from_path(input), None, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_fast_path_agrees_with_full_parser() {
+        // The fast path must be a strict subset of the full parser: whenever
+        // it returns Some, the full parser must return the same domain.
+        // Otherwise filter results would depend on which path ran.
+        let inputs = [
+            "test@example.com",
+            "<test@example.com>",
+            "  <test@Example.COM>  ",
+            "<a@sub.domain-with-dash.org>",
+            "Testing <testing@hedwig.example.com>",
+            "<\"blocked user\"@blocked.example>",
+            "<\"a@b\"@example.com>",
+            "<user!#$%&'*+-/=?^_`{|}~@example.com>",
+            "<a.b.c@a-b.c-d.org>",
+            "<x@localhost>",
+            "<user@b\u{fc}cher.example>",
+            "<foo..bar@allowed.example>",
+            "<.foo@allowed.example>",
+            "<foo.@allowed.example>",
+            "<foo@bar@example.com>",
+            "<test@example.com.>",
+            "<test@exa_mple.com>",
+            "testuser",
+            "<>",
+        ];
+        for input in inputs {
+            if let Some(fast) = extract_domain_fast(input) {
+                assert_eq!(
+                    Some(fast),
+                    extract_domain_full(input),
+                    "fast path diverged from full parser on {input:?}"
+                );
+            }
+        }
+    }
 
     // Mock Storage implementation for testing
     #[derive(Debug, Clone)]

@@ -8,7 +8,7 @@ base64 = "0.22.1"
 miette = { workspace = true }
 nom = "8.0.0"
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 async-trait = { workspace = true }
 tokio-rustls = "0.26.1"
 bytes = "1.10.0"
