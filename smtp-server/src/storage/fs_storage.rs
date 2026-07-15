@@ -240,14 +240,13 @@ impl Storage for FileSystemStorage {
     /// * `Result<Option<StoredEmail>>` - The email if found, None if not found
     async fn get(&self, key: &str, status: Status) -> Result<Option<StoredEmail>> {
         let path = self.file_path(key, &status);
-        if path.exists() {
-            let contents = fs::read_to_string(&path).await.into_diagnostic()?;
-            // let email: StoredEmail = bincode::deserialize(contents.as_bytes()).into_diagnostic()?;
-            let email: StoredEmail = serde_json::from_str(&contents).into_diagnostic()?;
-            Ok(Some(email))
-        } else {
-            Ok(None)
-        }
+        let contents = match fs::read_to_string(&path).await {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).into_diagnostic(),
+        };
+        let email: StoredEmail = serde_json::from_str(&contents).into_diagnostic()?;
+        Ok(Some(email))
     }
 
     /// Stores an email with the specified status.
@@ -272,10 +271,11 @@ impl Storage for FileSystemStorage {
     /// * `status` - The status of the email to delete
     async fn delete(&self, key: &str, status: Status) -> Result<()> {
         let path = self.file_path(key, &status);
-        if fs::metadata(&path).await.is_ok() {
-            fs::remove_file(path).await.into_diagnostic()?;
+        match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).into_diagnostic(),
         }
-        Ok(())
     }
 
     /// Retrieves metadata for an email by its key.
@@ -287,13 +287,13 @@ impl Storage for FileSystemStorage {
     /// * `Result<Option<EmailMetadata>>` - The metadata if found, None if not found
     async fn get_meta(&self, key: &str) -> Result<Option<EmailMetadata>> {
         let path = self.meta_file_path(key);
-        if fs::metadata(&path).await.is_ok() {
-            let contents = fs::read_to_string(&path).await.into_diagnostic()?;
-            let meta: EmailMetadata = serde_json::from_str(&contents).into_diagnostic()?;
-            Ok(Some(meta))
-        } else {
-            Ok(None)
-        }
+        let contents = match fs::read_to_string(&path).await {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).into_diagnostic(),
+        };
+        let meta: EmailMetadata = serde_json::from_str(&contents).into_diagnostic()?;
+        Ok(Some(meta))
     }
 
     /// Stores metadata for an email.
@@ -317,10 +317,11 @@ impl Storage for FileSystemStorage {
     /// * `key` - The email message ID
     async fn delete_meta(&self, key: &str) -> Result<()> {
         let path = self.meta_file_path(key);
-        if path.exists() {
-            fs::remove_file(path).await.into_diagnostic()?;
+        match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).into_diagnostic(),
         }
-        Ok(())
     }
 
     /// Moves an email from one status to another, potentially with a new key.
