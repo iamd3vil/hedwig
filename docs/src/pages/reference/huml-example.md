@@ -46,6 +46,7 @@ server::
   health::
     bind: "0.0.0.0:8080"
   helo_hostname: "mail.example.com"
+  hostname: "mx.example.com"
   outbound_local: false
   smtp::
     cache_size: 100

@@ -247,6 +247,9 @@ pub struct SmtpServer {
     cmd_timeout: Duration,
     // Timeout during DATA transfer reads.
     data_timeout: Duration,
+
+    // Hostname announced in the 220 greeting and the EHLO reply.
+    hostname: String,
 }
 
 impl SmtpServer {
@@ -267,6 +270,7 @@ impl SmtpServer {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             cmd_timeout: DEFAULT_CMD_TIMEOUT,
             data_timeout: DEFAULT_DATA_TIMEOUT,
+            hostname: String::from("localhost"),
         }
     }
 
@@ -285,6 +289,12 @@ impl SmtpServer {
         self
     }
 
+    /// Sets the hostname announced in the 220 greeting and the EHLO reply.
+    pub fn with_hostname(mut self, hostname: String) -> Self {
+        self.hostname = hostname;
+        self
+    }
+
     /// Handles a client connection.
     ///
     /// This method processes SMTP commands from the client and manages the SMTP session.
@@ -300,7 +310,7 @@ impl SmtpServer {
         let mut session = SmtpSession::new();
 
         socket
-            .write_line(b"220 localhost ESMTP server ready\r\n")
+            .write_line(format!("220 {} ESMTP server ready\r\n", self.hostname).as_bytes())
             .await?;
 
         let res = self.handle_connection(&mut session, socket).await;
@@ -499,7 +509,7 @@ impl SmtpServer {
         match (&session.state, command) {
             (SessionState::Connected, SmtpCommand::Ehlo(domain)) => {
                 self.callbacks.on_ehlo(&domain).await?;
-                let mut response = String::from("250-localhost\r\n");
+                let mut response = format!("250-{}\r\n", self.hostname);
                 response.push_str(&format!("250-SIZE {}\r\n", self.max_message_size));
                 if stream.supports_starttls() {
                     response.push_str("250-STARTTLS\r\n");

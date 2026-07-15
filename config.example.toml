@@ -10,6 +10,7 @@ max_retries = 5          # Maximum number of retries for deferred emails (option
 disable_outbound = false # Disable outbound email delivery (optional)
 outbound_local = false   # Only allow local outbound delivery (optional)
 helo_hostname = "mail.example.com" # Public FQDN to advertise in outbound HELO/EHLO (optional)
+hostname = "mx.example.com" # Hostname announced in the inbound 220 greeting and EHLO reply (optional, default: OS hostname)
 queue_buffer = 1000      # Inbound work queue buffer size (optional, default: 1000)
 max_connections = 1000   # Max concurrent inbound connections (optional, default: 1000)
 max_message_size = 26214400  # Max message size in bytes (optional, default: 25 MiB)

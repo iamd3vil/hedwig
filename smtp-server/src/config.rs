@@ -42,6 +42,9 @@ pub struct CfgServer {
     pub disable_outbound: Option<bool>,
     pub outbound_local: Option<bool>,
     pub helo_hostname: Option<String>,
+    /// Hostname announced by the inbound listener in the 220 greeting and
+    /// EHLO reply. Defaults to the OS hostname.
+    pub hostname: Option<String>,
     pub smtp: Option<CfgSmtp>,
     /// Deprecated: use server.smtp.cache_size instead.
     pub pool_size: Option<u64>,
