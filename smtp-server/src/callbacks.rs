@@ -33,17 +33,39 @@ pub struct Callbacks {
 
 /// Extracts the lowercased domain from an SMTP path like `<user@example.com>`.
 ///
-/// The command parser has already constrained the address syntax by the time
-/// this runs, so a full address-grammar parse here would be redundant work on
-/// the per-message hot path. Splitting on the last `@` also keeps quoted
-/// local parts containing `@` correct.
+/// This runs twice per message (MAIL FROM and RCPT TO), so it avoids a full
+/// address-grammar parse. The command parser accepts nearly any bytes inside
+/// angle brackets, so filter semantics rely on the validation here: junk
+/// addresses must yield None (matching the previous parser-based behavior,
+/// where unparsable addresses could never satisfy an allow filter).
 fn extract_domain_from_path(path: &str) -> Option<String> {
-    let addr = path.trim().trim_matches(|c| c == '<' || c == '>');
+    let path = path.trim();
+    // Accept both bare paths ("user@example.com") and bracketed forms,
+    // including with a display name ("Name <user@example.com>"): when
+    // brackets are present, the address is what's inside them.
+    let addr = match (path.rfind('<'), path.rfind('>')) {
+        (Some(lt), Some(gt)) if lt < gt => &path[lt + 1..gt],
+        (None, None) => path,
+        _ => return None,
+    };
+    // Split on the last '@' so quoted local parts containing '@' stay intact.
     let (local, domain) = addr.rsplit_once('@')?;
-    if local.is_empty() || domain.is_empty() {
+
+    // A bare '@' in the local part is only valid inside a quoted string.
+    let local_valid = !local.is_empty()
+        && local.chars().all(|c| !c.is_whitespace() && !c.is_control())
+        && (!local.contains('@') || (local.starts_with('"') && local.ends_with('"')));
+
+    // Domain must be dot-separated labels of letters/digits/hyphens.
+    let domain_valid = !domain.is_empty()
+        && domain.split('.').all(|label| {
+            !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+
+    if !local_valid || !domain_valid {
         return None;
     }
-    Some(domain.to_lowercase())
+    Some(domain.to_ascii_lowercase())
 }
 
 pub struct MXExpiry;
@@ -430,6 +452,53 @@ mod tests {
     use futures::{stream, Stream};
     use miette::Result;
     use std::pin::Pin;
+
+    #[test]
+    fn test_extract_domain_valid_addresses() {
+        let cases = [
+            ("test@example.com", "example.com"),
+            ("<test@example.com>", "example.com"),
+            ("  <test@Example.COM>  ", "example.com"),
+            ("<a@sub.domain-with-dash.org>", "sub.domain-with-dash.org"),
+            // Quoted local part may contain '@'.
+            ("<\"a@b\"@example.com>", "example.com"),
+            // Display-name form.
+            ("Testing <testing@hedwig.example.com>", "hedwig.example.com"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                extract_domain_from_path(input).as_deref(),
+                Some(expected),
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_domain_junk_addresses_yield_none() {
+        // The command parser accepts nearly anything in angle brackets, so
+        // these junk shapes must not produce a domain (an allow filter would
+        // otherwise match on them). Mirrors the old parser-based behavior.
+        let cases = [
+            "testuser",
+            "<testuser>",
+            "<>",
+            "<@example.com>",
+            "<test@>",
+            "<foo@bar@example.com>",     // unquoted '@' in local part
+            "<foo bar@example.com>",     // whitespace in local part
+            "<test@bad domain.com>",     // whitespace in domain
+            "<test@exa_mple.com>",       // invalid domain char
+            "<test@.example.com>",       // empty label
+            "<test@example.com.>",       // trailing dot
+            "<test@bad.com\u{7f}>",      // control char
+            "Testing <test@example.com", // unbalanced brackets
+            "test@example.com>",         // unbalanced brackets
+        ];
+        for input in cases {
+            assert_eq!(extract_domain_from_path(input), None, "input: {input:?}");
+        }
+    }
 
     // Mock Storage implementation for testing
     #[derive(Debug, Clone)]

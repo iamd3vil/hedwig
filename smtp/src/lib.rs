@@ -803,6 +803,50 @@ mod tests {
     }
 
     #[test]
+    fn test_find_data_terminator_matches_full_rescan_on_random_chunkings() {
+        // Differential test: across random buffers dense in terminator
+        // fragments and random read chunkings, the incremental scan must
+        // agree with a from-scratch scan of the whole buffer at every step.
+        let mut seed: u64 = 0x5EED_CAFE;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        // Heavily weighted toward terminator bytes to hit split/overlap cases.
+        let alphabet: &[u8] = b"\r\n.\r\n.a";
+        for case in 0..5000 {
+            let len = next() % 200 + 1;
+            let data: Vec<u8> = (0..len)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect();
+
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut scanned = 0usize;
+            let mut offset = 0usize;
+            while offset < data.len() {
+                let end = (offset + next() % 7 + 1).min(data.len());
+                buffer.extend_from_slice(&data[offset..end]);
+                offset = end;
+
+                let incremental = find_data_terminator(&buffer, scanned);
+                let full_rescan = memchr::memmem::find(&buffer, DATA_TERMINATOR);
+                assert_eq!(
+                    incremental, full_rescan,
+                    "case {case}: divergence on buffer {buffer:?} (scanned={scanned})"
+                );
+                match incremental {
+                    // The session consumes the message and resets state here;
+                    // stop this case at the first find like the real loop.
+                    Some(_) => break,
+                    None => scanned = buffer.len(),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_find_data_terminator_skips_already_scanned_region() {
         // A terminator fully inside the already-scanned region (minus the
         // 4-byte overlap) is not refound; callers reset state after acting
