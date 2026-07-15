@@ -1158,8 +1158,7 @@ mod tests {
     #[test]
     fn into_diagnostic_makes_original_error_unreachable() {
         use miette::{IntoDiagnostic, WrapErr};
-        let err: Result<(), std::io::Error> =
-            Err(std::io::Error::other("boom"));
+        let err: Result<(), std::io::Error> = Err(std::io::Error::other("boom"));
         let report = err
             .into_diagnostic()
             .wrap_err("sending raw message")

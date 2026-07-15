@@ -454,7 +454,9 @@ impl SmtpServer {
                                 SessionState::ReceivingMailFrom | SessionState::ReceivingRcptTo
                             ) {
                                 stream
-                                    .write_line(b"503 STARTTLS not allowed during mail transaction\r\n")
+                                    .write_line(
+                                        b"503 STARTTLS not allowed during mail transaction\r\n",
+                                    )
                                     .await?;
                             } else {
                                 stream.write_line(b"220 Ready to start TLS\r\n").await?;
