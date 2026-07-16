@@ -162,9 +162,9 @@ Bounce immediately on 5xx — these are permanent failures.
 
 ### 12. AUTH advertised without TLS
 
-**Problem:** When auth is enabled, `AUTH PLAIN LOGIN` is advertised even on plaintext listeners. Clients may send credentials in cleartext over the wire.
+**Problem:** When auth is enabled, `AUTH PLAIN LOGIN CRAM-MD5` is advertised even on plaintext listeners. Clients using PLAIN or LOGIN may send credentials in cleartext over the wire (CRAM-MD5 sends only an HMAC digest, not the password itself).
 
-**Location:** `smtp/src/lib.rs` — EHLO response includes `AUTH PLAIN LOGIN` when `auth_enabled` is true, regardless of TLS state.
+**Location:** `smtp/src/lib.rs` — EHLO response includes `AUTH PLAIN LOGIN CRAM-MD5` when `auth_enabled` is true, regardless of TLS state.
 
 **Fix:** Only advertise `AUTH` after TLS is established (either implicit TLS listener or post-STARTTLS). This is required by RFC 4954 §4:
 > A server MUST NOT advertise the AUTH extension on a non-TLS connection if the server requires TLS for authentication.

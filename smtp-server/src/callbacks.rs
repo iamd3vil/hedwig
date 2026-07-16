@@ -25,6 +25,21 @@ use crate::{
     worker::{self, Job, Worker},
 };
 
+/// Computes the lowercase hex HMAC-MD5 digest a client must send for the
+/// given password and challenge (RFC 2195).
+fn cram_md5_digest(password: &str, challenge: &str) -> String {
+    use hmac::{Hmac, Mac};
+    // HMAC accepts keys of any length, so new_from_slice cannot fail.
+    let mut mac =
+        Hmac::<md5::Md5>::new_from_slice(password.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(challenge.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
 /// The Callbacks struct holds the configuration, storage, and sender channel.
 pub struct Callbacks {
     cfg: Cfg,
@@ -307,6 +322,33 @@ impl SmtpCallbacks for Callbacks {
         let auth_mapping = self.auth_mapping.lock().await;
         if let Some(expected_password) = auth_mapping.get(username) {
             let is_valid = constant_time_eq(password.as_bytes(), expected_password.as_bytes());
+            return Ok(is_valid);
+        }
+        Ok(false)
+    }
+
+    fn supports_cram_md5(&self) -> bool {
+        true
+    }
+
+    // Handles a CRAM-MD5 challenge response by recomputing the digest from
+    // the stored password (RFC 2195).
+    async fn on_auth_cram_md5(
+        &self,
+        username: &str,
+        challenge: &str,
+        digest: &str,
+    ) -> Result<bool, SmtpError> {
+        if self.cfg.server.auth.is_none() {
+            return Ok(false);
+        }
+
+        let auth_mapping = self.auth_mapping.lock().await;
+        if let Some(password) = auth_mapping.get(username) {
+            let expected = cram_md5_digest(password, challenge);
+            // RFC 2195 mandates lowercase hex, but accept uppercase too.
+            let is_valid =
+                constant_time_eq(expected.as_bytes(), digest.to_ascii_lowercase().as_bytes());
             return Ok(is_valid);
         }
         Ok(false)
@@ -1235,6 +1277,81 @@ mod tests {
             // Abort the spawned worker to avoid leaking background work between tests.
             handle.abort();
         }
+    }
+
+    #[test]
+    fn test_cram_md5_digest_rfc2195_vector() {
+        // Known-answer test straight from RFC 2195 section 2.
+        assert_eq!(
+            cram_md5_digest(
+                "tanstaaftanstaaf",
+                "<1896.697170952@postoffice.reston.mci.net>"
+            ),
+            "b913a602c7eda7a495b4e6e7334d3890"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_auth_cram_md5() {
+        let mut cfg = create_test_config();
+        cfg.server.auth = Some(vec![CfgAuth {
+            username: "testuser".to_string(),
+            password: "testpass".to_string(),
+        }]);
+
+        let storage = Arc::new(MockStorage {});
+        let (sender, receiver) = async_channel::bounded(100);
+        let (callbacks, worker_handles, _mta_sts_resolver) =
+            Callbacks::new(storage, sender, receiver, cfg)
+                .await
+                .expect("callbacks should initialize");
+
+        let challenge = "<42.1234567890@test.local>";
+        let digest = cram_md5_digest("testpass", challenge);
+
+        // Correct digest authenticates.
+        assert!(callbacks
+            .on_auth_cram_md5("testuser", challenge, &digest)
+            .await
+            .unwrap());
+        // Uppercase hex is tolerated.
+        assert!(callbacks
+            .on_auth_cram_md5("testuser", challenge, &digest.to_uppercase())
+            .await
+            .unwrap());
+        // Digest computed from the wrong password is rejected.
+        let wrong = cram_md5_digest("wrongpass", challenge);
+        assert!(!callbacks
+            .on_auth_cram_md5("testuser", challenge, &wrong)
+            .await
+            .unwrap());
+        // A digest for a different challenge (replay) is rejected.
+        let replayed = cram_md5_digest("testpass", "<1.1@test.local>");
+        assert!(!callbacks
+            .on_auth_cram_md5("testuser", challenge, &replayed)
+            .await
+            .unwrap());
+        // Unknown user is rejected.
+        assert!(!callbacks
+            .on_auth_cram_md5("nouser", challenge, &digest)
+            .await
+            .unwrap());
+
+        for handle in worker_handles {
+            // Abort the spawned worker to avoid leaking background work between tests.
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_auth_cram_md5_no_config() {
+        let callbacks = create_test_callbacks(None).await;
+        let digest = cram_md5_digest("pass", "<1.1@test.local>");
+        let result = callbacks
+            .on_auth_cram_md5("user", "<1.1@test.local>", &digest)
+            .await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
     }
 
     #[tokio::test]
