@@ -1,10 +1,18 @@
 {% set features = commits | selectattr("type", "equalto", "feat") | list %}
+{% set perfs = commits | selectattr("type", "equalto", "perf") | list %}
 {% set fixes = commits | selectattr("type", "equalto", "fix") | list %}
 {% set chores = commits | selectattr("type", "equalto", "chore") | list %}
 
 {% if features | length > 0 %}
 ### Features:
 {% for commit in features %}
+{{ commit.hash }}: {{ commit.subject }}{% if commit.handle %} (@{{ commit.handle }}){% endif %}
+{%- endfor %}
+{% endif %}
+
+{% if perfs | length > 0 %}
+### Performance:
+{% for commit in perfs %}
 {{ commit.hash }}: {{ commit.subject }}{% if commit.handle %} (@{{ commit.handle }}){% endif %}
 {%- endfor %}
 {% endif %}
