@@ -178,6 +178,8 @@ pub enum SessionState {
     Greeted,
     AuthenticatingUsername,
     AuthenticatingPassword(String),
+    /// Waiting for the client's CRAM-MD5 response; holds the issued challenge.
+    AuthenticatingCramMd5(String),
     Authenticated,
     ReceivingMailFrom,
     ReceivingRcptTo,
@@ -205,6 +207,37 @@ pub trait SmtpCallbacks: Send + Sync {
     /// # Returns
     /// `Ok(true)` if authentication is successful, `Ok(false)` or `Err` otherwise.
     async fn on_auth(&self, username: &str, password: &str) -> Result<bool, SmtpError>;
+
+    /// Whether this implementation supports CRAM-MD5. The mechanism is
+    /// advertised in EHLO and accepted only when this returns true, so
+    /// implementations overriding `on_auth_cram_md5` must also override
+    /// this to return true.
+    fn supports_cram_md5(&self) -> bool {
+        false
+    }
+
+    /// Called when a client responds to a CRAM-MD5 challenge (RFC 2195).
+    ///
+    /// The implementation must recompute `HMAC-MD5(password, challenge)` for
+    /// the user's stored password and compare it against `digest`. The
+    /// default implementation rejects every attempt; override it (together
+    /// with `supports_cram_md5`) to support CRAM-MD5.
+    ///
+    /// # Arguments
+    /// * `username` - The username from the client's response.
+    /// * `challenge` - The exact challenge string previously sent to the client.
+    /// * `digest` - The hex-encoded HMAC-MD5 digest from the client's response.
+    ///
+    /// # Returns
+    /// `Ok(true)` if authentication is successful, `Ok(false)` or `Err` otherwise.
+    async fn on_auth_cram_md5(
+        &self,
+        _username: &str,
+        _challenge: &str,
+        _digest: &str,
+    ) -> Result<bool, SmtpError> {
+        Ok(false)
+    }
 
     /// Called when a client sends a MAIL FROM command.
     ///
@@ -539,7 +572,11 @@ impl SmtpServer {
                 }
                 // Add AUTH support if enabled.
                 if self.auth_enabled {
-                    response.push_str("250-AUTH PLAIN LOGIN\r\n");
+                    if self.callbacks.supports_cram_md5() {
+                        response.push_str("250-AUTH PLAIN LOGIN CRAM-MD5\r\n");
+                    } else {
+                        response.push_str("250-AUTH PLAIN LOGIN\r\n");
+                    }
                 }
                 response.push_str("250 OK\r\n");
                 stream.write_line(response.as_bytes()).await?;
@@ -556,10 +593,51 @@ impl SmtpServer {
                 session.state = SessionState::AuthenticatingUsername;
                 stream.write_line(b"334 VXNlcm5hbWU6\r\n").await?;
             }
+            (SessionState::Greeted, SmtpCommand::AuthCramMd5) => {
+                if !self.callbacks.supports_cram_md5() {
+                    stream
+                        .write_line(b"504 Unrecognized authentication type\r\n")
+                        .await?;
+                    return Ok(false);
+                }
+                let challenge = self.generate_cram_md5_challenge();
+                let encoded = BASE64_STANDARD.encode(&challenge);
+                session.state = SessionState::AuthenticatingCramMd5(challenge);
+                stream
+                    .write_line(format!("334 {}\r\n", encoded).as_bytes())
+                    .await?;
+            }
+            // RFC 4954 §4: a client may cancel an in-progress AUTH exchange
+            // by sending "*"; the server must answer 501 and keep the
+            // session usable.
+            (
+                SessionState::AuthenticatingUsername
+                | SessionState::AuthenticatingPassword(_)
+                | SessionState::AuthenticatingCramMd5(_),
+                SmtpCommand::AuthUsername(ref line)
+                | SmtpCommand::AuthPassword(ref line)
+                | SmtpCommand::AuthCramMd5Response(ref line),
+            ) if line == "*" => {
+                session.state = SessionState::Greeted;
+                stream
+                    .write_line(b"501 Authentication cancelled\r\n")
+                    .await?;
+            }
+            (
+                SessionState::AuthenticatingCramMd5(challenge),
+                SmtpCommand::AuthCramMd5Response(response),
+            ) => {
+                self.handle_auth_cram_md5(session, challenge.clone(), response, stream)
+                    .await?;
+            }
             (SessionState::AuthenticatingUsername, SmtpCommand::AuthUsername(username)) => {
-                let decoded_username = decode_base64(&username)?;
-                session.state = SessionState::AuthenticatingPassword(decoded_username);
-                stream.write_line(b"334 UGFzc3dvcmQ6\r\n").await?;
+                match decode_base64(&username) {
+                    Ok(decoded_username) => {
+                        session.state = SessionState::AuthenticatingPassword(decoded_username);
+                        stream.write_line(b"334 UGFzc3dvcmQ6\r\n").await?;
+                    }
+                    Err(_) => self.reject_malformed_auth(session, stream).await?,
+                }
             }
             (
                 SessionState::AuthenticatingPassword(username),
@@ -624,18 +702,35 @@ impl SmtpServer {
         Ok(false)
     }
 
+    /// Rejects a malformed AUTH exchange with 501 and returns the session to
+    /// `Greeted`, keeping the connection usable for another attempt instead
+    /// of tearing it down.
+    async fn reject_malformed_auth(
+        &self,
+        session: &mut SmtpSession,
+        stream: &mut Box<dyn SmtpStream>,
+    ) -> Result<()> {
+        session.state = SessionState::Greeted;
+        stream
+            .write_line(b"501 Invalid authentication data\r\n")
+            .await?;
+        Ok(())
+    }
+
     async fn handle_auth_plain(
         &self,
         session: &mut SmtpSession,
         auth_data: String,
         stream: &mut Box<dyn SmtpStream>,
     ) -> Result<()> {
-        let decoded = decode_base64(&auth_data)?;
-        let parts: Vec<&str> = decoded.split('\0').collect();
-        if parts.len() != 3 {
-            bail!("Invalid AUTH PLAIN data");
-        }
-        self.handle_authentication(session, parts[1], parts[2], stream)
+        let credentials = decode_base64(&auth_data).ok().and_then(|decoded| {
+            let parts: Vec<&str> = decoded.split('\0').collect();
+            (parts.len() == 3).then(|| (parts[1].to_string(), parts[2].to_string()))
+        });
+        let Some((username, password)) = credentials else {
+            return self.reject_malformed_auth(session, stream).await;
+        };
+        self.handle_authentication(session, &username, &password, stream)
             .await
     }
 
@@ -646,9 +741,51 @@ impl SmtpServer {
         password: String,
         stream: &mut Box<dyn SmtpStream>,
     ) -> Result<()> {
-        let decoded_password = decode_base64(&password)?;
+        let Ok(decoded_password) = decode_base64(&password) else {
+            return self.reject_malformed_auth(session, stream).await;
+        };
         self.handle_authentication(session, &username, &decoded_password, stream)
             .await
+    }
+
+    async fn handle_auth_cram_md5(
+        &self,
+        session: &mut SmtpSession,
+        challenge: String,
+        response: String,
+        stream: &mut Box<dyn SmtpStream>,
+    ) -> Result<()> {
+        // RFC 2195: the response is "<username> <hex digest>". The digest
+        // never contains spaces, so split on the last one to tolerate
+        // usernames that do.
+        let credentials = decode_base64(&response).ok().and_then(|decoded| {
+            decoded
+                .rsplit_once(' ')
+                .map(|(u, d)| (u.to_string(), d.to_string()))
+        });
+        let Some((username, digest)) = credentials else {
+            return self.reject_malformed_auth(session, stream).await;
+        };
+        let result = self
+            .callbacks
+            .on_auth_cram_md5(&username, &challenge, &digest)
+            .await;
+        self.finish_authentication(session, result, stream).await
+    }
+
+    /// Generates a unique RFC 2195 challenge (`<counter.nanos@hostname>`).
+    /// Uniqueness per session is what prevents replaying a captured digest;
+    /// the counter plus wall-clock nanoseconds guarantees it without a
+    /// dependency on a randomness crate.
+    fn generate_cram_md5_challenge(&self) -> String {
+        static CHALLENGE_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let seq = CHALLENGE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("<{}.{}@{}>", seq, nanos, self.hostname)
     }
 
     async fn handle_authentication(
@@ -658,7 +795,17 @@ impl SmtpServer {
         password: &str,
         stream: &mut Box<dyn SmtpStream>,
     ) -> Result<()> {
-        match self.callbacks.on_auth(username, password).await {
+        let result = self.callbacks.on_auth(username, password).await;
+        self.finish_authentication(session, result, stream).await
+    }
+
+    async fn finish_authentication(
+        &self,
+        session: &mut SmtpSession,
+        result: Result<bool, SmtpError>,
+        stream: &mut Box<dyn SmtpStream>,
+    ) -> Result<()> {
+        match result {
             Ok(true) => {
                 session.state = SessionState::Authenticated;
                 stream
@@ -974,5 +1121,241 @@ mod tests {
         let expected = "Subject: dots\r\n\r\n.leading dot line\r\nmiddle\r\n";
         let received = run_chunked_data_session(sent, 7).await;
         assert_eq!(received, expected);
+    }
+
+    /// Accepts CRAM-MD5 attempts whose digest equals `accept_digest`, and
+    /// records every attempt so the test can assert what reached the callback.
+    struct CramCallbacks {
+        attempts: StdMutex<Vec<(String, String, String)>>,
+        accept_digest: String,
+    }
+
+    #[async_trait]
+    impl SmtpCallbacks for CramCallbacks {
+        async fn on_ehlo(&self, _domain: &str) -> Result<(), SmtpError> {
+            Ok(())
+        }
+        async fn on_auth(&self, _username: &str, _password: &str) -> Result<bool, SmtpError> {
+            Ok(false)
+        }
+        fn supports_cram_md5(&self) -> bool {
+            true
+        }
+        async fn on_auth_cram_md5(
+            &self,
+            username: &str,
+            challenge: &str,
+            digest: &str,
+        ) -> Result<bool, SmtpError> {
+            self.attempts.lock().unwrap().push((
+                username.to_string(),
+                challenge.to_string(),
+                digest.to_string(),
+            ));
+            Ok(digest == self.accept_digest)
+        }
+        async fn on_mail_from(
+            &self,
+            _from_command: &parser::MailFromCommand,
+        ) -> Result<(), SmtpError> {
+            Ok(())
+        }
+        async fn on_rcpt_to(&self, _to: &str) -> Result<(), SmtpError> {
+            Ok(())
+        }
+        async fn on_data(&self, _email: Email) -> Result<(), SmtpError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auth_cram_md5_flow() {
+        let good_digest = "64b2a43c1f6ed6806a980914e23e75f0";
+        let callbacks = Arc::new(CramCallbacks {
+            attempts: StdMutex::new(Vec::new()),
+            accept_digest: good_digest.to_string(),
+        });
+        let server = SmtpServer {
+            callbacks: callbacks.clone(),
+            auth_enabled: true,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            cmd_timeout: Duration::from_secs(5),
+            data_timeout: Duration::from_secs(5),
+            hostname: "test.local".to_string(),
+        };
+
+        let (client, server_side) = tokio::io::duplex(4096);
+        let mut server_stream: Box<dyn SmtpStream> = Box::new(server_side);
+        let server_task =
+            tokio::spawn(async move { server.handle_client(&mut server_stream).await });
+
+        let (mut reader, mut writer) = tokio::io::split(client);
+
+        async fn read_reply<R: tokio::io::AsyncRead + Unpin>(
+            reader: &mut R,
+            expected: &str,
+        ) -> String {
+            let mut buf = vec![0u8; 512];
+            let n = reader.read(&mut buf).await.unwrap();
+            let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                reply.contains(expected),
+                "expected {expected:?}, got {reply:?}"
+            );
+            reply
+        }
+
+        /// Requests a CRAM-MD5 challenge and returns it decoded.
+        async fn request_challenge<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+            reader: &mut R,
+            writer: &mut W,
+        ) -> String {
+            writer.write_all(b"AUTH CRAM-MD5\r\n").await.unwrap();
+            let mut buf = vec![0u8; 512];
+            let n = reader.read(&mut buf).await.unwrap();
+            let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+            let encoded = reply
+                .strip_prefix("334 ")
+                .unwrap_or_else(|| panic!("expected 334 challenge, got {reply:?}"))
+                .trim();
+            String::from_utf8(BASE64_STANDARD.decode(encoded).unwrap()).unwrap()
+        }
+
+        read_reply(&mut reader, "220").await;
+        writer.write_all(b"EHLO client.test\r\n").await.unwrap();
+        read_reply(&mut reader, "250-AUTH PLAIN LOGIN CRAM-MD5").await;
+
+        // A wrong digest is rejected and the session returns to Greeted.
+        let challenge1 = request_challenge(&mut reader, &mut writer).await;
+        assert!(
+            challenge1.starts_with('<') && challenge1.ends_with("@test.local>"),
+            "malformed challenge: {challenge1:?}"
+        );
+        let bad = BASE64_STANDARD.encode(format!("alice {}", "0".repeat(32)));
+        writer
+            .write_all(format!("{}\r\n", bad).as_bytes())
+            .await
+            .unwrap();
+        read_reply(&mut reader, "535").await;
+
+        // Cancelling the exchange with "*" (RFC 4954) gets a 501 and keeps
+        // the session usable.
+        let _ = request_challenge(&mut reader, &mut writer).await;
+        writer.write_all(b"*\r\n").await.unwrap();
+        read_reply(&mut reader, "501").await;
+
+        // Malformed responses — invalid base64, and valid base64 missing the
+        // "username digest" separator — also get 501 without dropping the
+        // connection.
+        let _ = request_challenge(&mut reader, &mut writer).await;
+        writer.write_all(b"!!!not-base64!!!\r\n").await.unwrap();
+        read_reply(&mut reader, "501").await;
+        let _ = request_challenge(&mut reader, &mut writer).await;
+        let no_separator = BASE64_STANDARD.encode("nospace");
+        writer
+            .write_all(format!("{}\r\n", no_separator).as_bytes())
+            .await
+            .unwrap();
+        read_reply(&mut reader, "501").await;
+
+        // Cancelling AUTH LOGIN mid-exchange behaves the same way.
+        writer.write_all(b"AUTH LOGIN\r\n").await.unwrap();
+        read_reply(&mut reader, "334").await;
+        writer.write_all(b"*\r\n").await.unwrap();
+        read_reply(&mut reader, "501").await;
+
+        // A second attempt gets a fresh challenge; the right digest succeeds.
+        let challenge2 = request_challenge(&mut reader, &mut writer).await;
+        assert_ne!(challenge1, challenge2, "challenges must be unique");
+        let good = BASE64_STANDARD.encode(format!("alice {}", good_digest));
+        writer
+            .write_all(format!("{}\r\n", good).as_bytes())
+            .await
+            .unwrap();
+        read_reply(&mut reader, "235").await;
+
+        // The session is authenticated: mail commands are accepted.
+        writer
+            .write_all(b"MAIL FROM:<a@example.com>\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut reader, "250").await;
+
+        writer.write_all(b"QUIT\r\n").await.unwrap();
+        read_reply(&mut reader, "221").await;
+        drop(writer);
+        server_task.await.unwrap().unwrap();
+
+        // The callback saw exactly the username, wire challenges, and digests.
+        let attempts = callbacks.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].0, "alice");
+        assert_eq!(attempts[0].1, challenge1);
+        assert_eq!(attempts[0].2, "0".repeat(32));
+        assert_eq!(
+            attempts[1],
+            ("alice".to_string(), challenge2, good_digest.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_cram_md5_not_advertised_without_callback_support() {
+        // RecordingCallbacks keeps the default supports_cram_md5() == false.
+        let callbacks = Arc::new(RecordingCallbacks {
+            emails: StdMutex::new(Vec::new()),
+        });
+        let server = SmtpServer {
+            callbacks,
+            auth_enabled: true,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            cmd_timeout: Duration::from_secs(5),
+            data_timeout: Duration::from_secs(5),
+            hostname: "test.local".to_string(),
+        };
+
+        let (client, server_side) = tokio::io::duplex(4096);
+        let mut server_stream: Box<dyn SmtpStream> = Box::new(server_side);
+        let server_task =
+            tokio::spawn(async move { server.handle_client(&mut server_stream).await });
+
+        let (mut reader, mut writer) = tokio::io::split(client);
+        let mut buf = vec![0u8; 512];
+
+        let n = reader.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("220"));
+
+        writer.write_all(b"EHLO client.test\r\n").await.unwrap();
+        let n = reader.read(&mut buf).await.unwrap();
+        let ehlo_reply = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(ehlo_reply.contains("250-AUTH PLAIN LOGIN\r\n"));
+        assert!(!ehlo_reply.contains("CRAM-MD5"));
+
+        // Trying it anyway is rejected without breaking the session.
+        writer.write_all(b"AUTH CRAM-MD5\r\n").await.unwrap();
+        let n = reader.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("504"));
+
+        // Malformed AUTH PLAIN data gets a 501, and the session stays usable:
+        // a well-formed attempt afterwards succeeds (RecordingCallbacks
+        // accepts all credentials).
+        writer
+            .write_all(b"AUTH PLAIN !!!not-base64!!!\r\n")
+            .await
+            .unwrap();
+        let n = reader.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("501"));
+        let plain = BASE64_STANDARD.encode("\0user\0pass");
+        writer
+            .write_all(format!("AUTH PLAIN {}\r\n", plain).as_bytes())
+            .await
+            .unwrap();
+        let n = reader.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("235"));
+
+        writer.write_all(b"QUIT\r\n").await.unwrap();
+        let n = reader.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("221"));
+        drop(writer);
+        server_task.await.unwrap().unwrap();
     }
 }

@@ -31,6 +31,9 @@ tokio-rustls = { version = "0.26.0", features = [
     "ring",
 ], default-features = false }
 subtle = "2.6.1"
+# For CRAM-MD5 verification; both already in the tree as transitive deps.
+hmac = "0.12"
+md-5 = "0.10"
 tempfile = "3.13.0"
 pkcs8 = "0.10.0"
 tracing = "0.1"

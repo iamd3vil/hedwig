@@ -36,6 +36,10 @@ pub(crate) enum SmtpCommand {
     AuthUsername(String),
     /// Password input during AUTH LOGIN
     AuthPassword(String),
+    /// Initial AUTH CRAM-MD5 command
+    AuthCramMd5,
+    /// Client response to a CRAM-MD5 challenge (base64 of "username digest")
+    AuthCramMd5Response(String),
     /// MAIL FROM command with email address and ESMTP parameters
     MailFrom(MailFromCommand),
     /// RCPT TO command with email address
@@ -56,6 +60,7 @@ pub(crate) fn parse_command(input: &str, state: &SessionState) -> Result<SmtpCom
     let parse_result: IResult<&str, SmtpCommand> = match state {
         SessionState::AuthenticatingUsername => parse_auth_username(input),
         SessionState::AuthenticatingPassword(_) => parse_auth_password(input),
+        SessionState::AuthenticatingCramMd5(_) => parse_auth_cram_md5_response(input),
         _ => parse_normal_command(input),
     };
 
@@ -81,10 +86,18 @@ fn parse_auth_password(input: &str) -> IResult<&str, SmtpCommand> {
     .parse(input)
 }
 
+fn parse_auth_cram_md5_response(input: &str) -> IResult<&str, SmtpCommand> {
+    map(take_while1(|c: char| c.is_ascii()), |s: &str| {
+        SmtpCommand::AuthCramMd5Response(s.to_string())
+    })
+    .parse(input)
+}
+
 fn parse_normal_command(input: &str) -> IResult<&str, SmtpCommand> {
     alt((
         parse_ehlo,
         parse_auth_plain,
+        parse_auth_cram_md5,
         parse_auth_login,
         parse_mail_from,
         parse_rcpt_to,
@@ -118,6 +131,10 @@ fn parse_auth_plain(input: &str) -> IResult<&str, SmtpCommand> {
 
 fn parse_auth_login(input: &str) -> IResult<&str, SmtpCommand> {
     map(tag_no_case("AUTH LOGIN"), |_| SmtpCommand::AuthLogin).parse(input)
+}
+
+fn parse_auth_cram_md5(input: &str) -> IResult<&str, SmtpCommand> {
+    map(tag_no_case("AUTH CRAM-MD5"), |_| SmtpCommand::AuthCramMd5).parse(input)
 }
 
 fn parse_mail_from(input: &str) -> IResult<&str, SmtpCommand> {
@@ -295,6 +312,27 @@ mod tests {
             .unwrap(),
             SmtpCommand::AuthPassword("cGFzc3dvcmQ=".to_string())
         );
+
+        // Test AUTH CRAM-MD5, case-insensitively
+        assert_eq!(
+            parse_command("AUTH CRAM-MD5", &SessionState::Greeted).unwrap(),
+            SmtpCommand::AuthCramMd5
+        );
+        assert_eq!(
+            parse_command("auth cram-md5", &SessionState::Greeted).unwrap(),
+            SmtpCommand::AuthCramMd5
+        );
+
+        // The challenge response is only parsed while awaiting it
+        assert_eq!(
+            parse_command(
+                "dXNlciBhYmMxMjM=",
+                &SessionState::AuthenticatingCramMd5("<1.2@host>".to_string())
+            )
+            .unwrap(),
+            SmtpCommand::AuthCramMd5Response("dXNlciBhYmMxMjM=".to_string())
+        );
+        assert!(parse_command("dXNlciBhYmMxMjM=", &SessionState::Greeted).is_err());
     }
 
     #[test]
