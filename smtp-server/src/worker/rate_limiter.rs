@@ -24,7 +24,7 @@
 //!
 //! let config = RateLimitConfig {
 //!     enabled: true,
-//!     default_limit: 60,  // 60 emails per minute
+//!     default_limit: None,
 //!     domain_limits,
 //! };
 //!
@@ -54,24 +54,15 @@ use tokio::sync::RwLock;
 ///
 /// This structure defines the rate limiting behavior for outbound email delivery.
 /// Rate limits are expressed in emails per minute.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RateLimitConfig {
     /// Enable or disable rate limiting globally.
     pub enabled: bool,
-    /// Default rate limit applied to all domains (emails per minute).
-    pub default_limit: u32,
-    /// Domain-specific rate limits that override the default (emails per minute).
+    /// Optional fallback limit for domains without a domain-specific limit.
+    /// When absent, unconfigured domains are not rate limited.
+    pub default_limit: Option<u32>,
+    /// Domain-specific rate limits that override the optional fallback.
     pub domain_limits: HashMap<String, u32>,
-}
-
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            default_limit: 60, // 60 emails per minute by default
-            domain_limits: HashMap::new(),
-        }
-    }
 }
 
 /// Token bucket implementation for rate limiting.
@@ -156,6 +147,7 @@ impl TokenBucket {
 ///
 /// The RateLimiter maintains a collection of token buckets, one for each domain,
 /// and enforces rate limits when checking before sending emails.
+#[derive(Clone)]
 pub struct RateLimiter {
     config: RateLimitConfig,
     /// Thread-safe storage for per-domain token buckets
@@ -187,12 +179,15 @@ impl RateLimiter {
             return RateLimitResult::Allowed;
         }
 
-        let limit = self
+        let Some(limit) = self
             .config
             .domain_limits
             .get(domain)
             .copied()
-            .unwrap_or(self.config.default_limit);
+            .or(self.config.default_limit)
+        else {
+            return RateLimitResult::Allowed;
+        };
 
         let mut buckets = self.buckets.write().await;
         let bucket = buckets
@@ -231,7 +226,7 @@ mod tests {
     async fn test_rate_limiter_disabled() {
         let config = RateLimitConfig {
             enabled: false,
-            default_limit: 1,
+            default_limit: Some(1),
             domain_limits: HashMap::new(),
         };
 
@@ -248,7 +243,7 @@ mod tests {
     async fn test_rate_limiter_default_limit() {
         let config = RateLimitConfig {
             enabled: true,
-            default_limit: 2,
+            default_limit: Some(2),
             domain_limits: HashMap::new(),
         };
 
@@ -276,7 +271,7 @@ mod tests {
 
         let config = RateLimitConfig {
             enabled: true,
-            default_limit: 2,
+            default_limit: Some(2),
             domain_limits,
         };
 
@@ -307,6 +302,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clones_share_domain_buckets() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enabled: true,
+            default_limit: Some(1),
+            domain_limits: HashMap::new(),
+        });
+        let other_worker = limiter.clone();
+
+        assert!(matches!(
+            limiter.check_rate_limit("example.com").await,
+            RateLimitResult::Allowed
+        ));
+        assert!(matches!(
+            other_worker.check_rate_limit("example.com").await,
+            RateLimitResult::RateLimited { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_unconfigured_domain_allowed_without_default_limit() {
+        let mut domain_limits = HashMap::new();
+        domain_limits.insert("limited.com".to_string(), 1);
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enabled: true,
+            default_limit: None,
+            domain_limits,
+        });
+
+        for _ in 0..10 {
+            assert!(matches!(
+                limiter.check_rate_limit("unconfigured.com").await,
+                RateLimitResult::Allowed
+            ));
+        }
+
+        assert!(matches!(
+            limiter.check_rate_limit("limited.com").await,
+            RateLimitResult::Allowed
+        ));
+        assert!(matches!(
+            limiter.check_rate_limit("limited.com").await,
+            RateLimitResult::RateLimited { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn test_token_bucket_refill() {
         let mut bucket = TokenBucket::new(2, 120); // 2 tokens per minute
 
@@ -327,7 +368,7 @@ mod tests {
     async fn test_different_domains_independent_limits() {
         let config = RateLimitConfig {
             enabled: true,
-            default_limit: 1,
+            default_limit: Some(1),
             domain_limits: HashMap::new(),
         };
 

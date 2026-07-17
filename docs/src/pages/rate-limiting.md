@@ -8,25 +8,31 @@ description: Configure per-domain rate limiting.
 
 Hedwig supports per-domain rate limiting using a token bucket algorithm.
 
-## Basic configuration
-
-```toml
-[server.rate_limits]
-enabled = true
-default_limit = 60  # emails per minute for all domains
-```
+All workers share one set of domain token buckets, so configured limits apply process-wide rather than once per worker.
 
 ## Domain-specific limits
 
 ```toml
 [server.rate_limits]
 enabled = true
-default_limit = 60
 
 [server.rate_limits.domain_limits]
 "gmail.com" = 30
 "outlook.com" = 25
 "internal.com" = 200
+```
+
+When `default_limit` is omitted, only domains listed under `domain_limits` are rate limited. All other domains are unrestricted.
+
+## Default limit for unconfigured domains
+
+```toml
+[server.rate_limits]
+enabled = true
+default_limit = 60  # emails per minute for unconfigured domains
+
+[server.rate_limits.domain_limits]
+"gmail.com" = 30    # overrides the default
 ```
 
 Benefits:

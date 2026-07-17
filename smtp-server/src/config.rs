@@ -229,7 +229,7 @@ impl CfgRateLimits {
     pub fn to_rate_limit_config(&self) -> crate::worker::rate_limiter::RateLimitConfig {
         crate::worker::rate_limiter::RateLimitConfig {
             enabled: self.enabled,
-            default_limit: self.default_limit.unwrap_or(60), // 60 emails per minute default
+            default_limit: self.default_limit,
             domain_limits: self.domain_limits.clone().unwrap_or_default(),
         }
     }

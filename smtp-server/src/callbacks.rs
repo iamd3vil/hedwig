@@ -199,6 +199,7 @@ impl Callbacks {
             smtp_pool_manager,
             resolver,
             Arc::clone(&mta_sts_resolver),
+            rate_limit_config,
         );
 
         for worker_index in 0..worker_count {
@@ -208,7 +209,6 @@ impl Callbacks {
             let worker_resources = worker_resources.clone();
             let worker_config = worker::WorkerConfig {
                 disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
-                rate_limit_config: rate_limit_config.clone(),
             };
             let mut worker = Worker::new(
                 receiver_channel,

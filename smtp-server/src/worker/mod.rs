@@ -99,7 +99,6 @@ pub enum DkimSignerType {
 
 pub struct WorkerConfig {
     pub disable_outbound: bool,
-    pub rate_limit_config: RateLimitConfig,
 }
 
 #[derive(Clone)]
@@ -108,6 +107,7 @@ pub(crate) struct WorkerResources {
     pool: Arc<PoolManager>,
     resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
     mta_sts: Arc<MtaStsResolver>,
+    rate_limiter: RateLimiter,
 }
 
 impl WorkerResources {
@@ -116,12 +116,14 @@ impl WorkerResources {
         pool: Arc<PoolManager>,
         resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
         mta_sts: Arc<MtaStsResolver>,
+        rate_limit_config: RateLimitConfig,
     ) -> Self {
         Self {
             mx_cache,
             pool,
             resolver,
             mta_sts,
+            rate_limiter: RateLimiter::new(rate_limit_config),
         }
     }
 }
@@ -182,6 +184,7 @@ impl Worker {
             pool,
             resolver,
             mta_sts,
+            rate_limiter,
         } = resources;
 
         Ok(Worker {
@@ -194,7 +197,7 @@ impl Worker {
             initial_delay: Duration::from_secs(60),
             max_delay: Duration::from_secs(60 * 60 * 24),
             dkim_signer,
-            rate_limiter: RateLimiter::new(config.rate_limit_config),
+            rate_limiter,
             mta_sts,
         })
     }
