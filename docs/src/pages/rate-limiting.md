@@ -24,6 +24,8 @@ enabled = true
 
 When `default_limit` is omitted, only domains listed under `domain_limits` are rate limited. All other domains are unrestricted.
 
+Setting `default_limit = 0` has the same effect as omitting it. A zero domain-specific limit also leaves that domain unrestricted.
+
 ## Default limit for unconfigured domains
 
 ```toml

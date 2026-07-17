@@ -59,7 +59,7 @@ pub struct RateLimitConfig {
     /// Enable or disable rate limiting globally.
     pub enabled: bool,
     /// Optional fallback limit for domains without a domain-specific limit.
-    /// When absent, unconfigured domains are not rate limited.
+    /// When absent or zero, unconfigured domains are not rate limited.
     pub default_limit: Option<u32>,
     /// Domain-specific rate limits that override the optional fallback.
     pub domain_limits: HashMap<String, u32>,
@@ -188,6 +188,10 @@ impl RateLimiter {
         else {
             return RateLimitResult::Allowed;
         };
+
+        if limit == 0 {
+            return RateLimitResult::Allowed;
+        }
 
         let mut buckets = self.buckets.write().await;
         let bucket = buckets
@@ -327,6 +331,33 @@ mod tests {
         let limiter = RateLimiter::new(RateLimitConfig {
             enabled: true,
             default_limit: None,
+            domain_limits,
+        });
+
+        for _ in 0..10 {
+            assert!(matches!(
+                limiter.check_rate_limit("unconfigured.com").await,
+                RateLimitResult::Allowed
+            ));
+        }
+
+        assert!(matches!(
+            limiter.check_rate_limit("limited.com").await,
+            RateLimitResult::Allowed
+        ));
+        assert!(matches!(
+            limiter.check_rate_limit("limited.com").await,
+            RateLimitResult::RateLimited { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_zero_default_limit_allows_unconfigured_domains() {
+        let mut domain_limits = HashMap::new();
+        domain_limits.insert("limited.com".to_string(), 1);
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enabled: true,
+            default_limit: Some(0),
             domain_limits,
         });
 
