@@ -189,27 +189,33 @@ impl Callbacks {
             smtp_pool_max_size = smtp_pool.max_size,
             "configured outbound SMTP pool"
         );
+        let smtp_pool_manager = Arc::new(worker::PoolManager::new(
+            smtp_pool,
+            cfg.server.outbound_local.unwrap_or(false),
+            helo_hostname,
+        ));
+        let worker_resources = worker::WorkerResources::new(
+            mx_cache,
+            smtp_pool_manager,
+            resolver,
+            Arc::clone(&mta_sts_resolver),
+        );
 
         for worker_index in 0..worker_count {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
             let dkim = cfg.server.dkim.clone();
-            let mx_cache = mx_cache.clone();
+            let worker_resources = worker_resources.clone();
             let worker_config = worker::WorkerConfig {
                 disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
-                outbound_local: cfg.server.outbound_local.unwrap_or(false),
-                helo_hostname: helo_hostname.clone(),
-                smtp_pool: smtp_pool.clone(),
                 rate_limit_config: rate_limit_config.clone(),
             };
             let mut worker = Worker::new(
                 receiver_channel,
                 storage_cloned,
                 &dkim,
-                mx_cache,
                 worker_config,
-                resolver.clone(),
-                mta_sts_resolver.clone(),
+                worker_resources,
             )
             .await
             .wrap_err_with(|| format!("failed to create worker {worker_index}"))?;
@@ -1119,10 +1125,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_callbacks_new_with_workers() {
-        // Test Callbacks::new with workers enabled (lines 90-97, 99-101)
+    async fn test_callbacks_new_with_shared_pool_workers() {
+        // Multiple workers must initialize around the shared outbound pool.
         let mut cfg = create_test_config();
-        cfg.server.workers = Some(1);
+        cfg.server.workers = Some(2);
         // Keep DKIM disabled here; DKIM key parsing is covered by worker tests.
         cfg.server.dkim = None;
 
@@ -1133,6 +1139,7 @@ mod tests {
             Callbacks::new(storage, sender, receiver, cfg)
                 .await
                 .expect("callbacks should initialize");
+        assert_eq!(worker_handles.len(), 2);
         for handle in worker_handles {
             // Abort so the spawned worker does not keep running past the test lifetime.
             handle.abort();

@@ -11,13 +11,18 @@
 #     cargo run --release -- --config /app/dev/config.test-throttle.toml
 
 [server]
-workers = 1
+workers = 4
 disable_outbound = false
 # outbound_local = true makes the SMTP transport plaintext (no TLS), which
 # matches our fake-throttle and mailpit setups (mailpit advertises STARTTLS
 # but the fake-throttle doesn't).
 outbound_local = true
 helo_hostname = "hedwig.local"
+
+[server.smtp]
+cache_size = 10
+min_idle = 0
+max_size = 4
 
 [[server.listeners]]
 addr = "0.0.0.0:2525"

@@ -294,7 +294,7 @@ async fn run_server(config_path: &str) -> Result<()> {
     info!("MTA-STS policy enforcement enabled");
 
     // Limit concurrent inbound connections to prevent resource exhaustion.
-    let max_connections = cfg.server.max_connections.unwrap_or(1000);
+    let max_connections = cfg.server.max_connections.unwrap_or(10_000);
     let conn_semaphore = Arc::new(Semaphore::new(max_connections));
 
     // Create listeners for each configured address

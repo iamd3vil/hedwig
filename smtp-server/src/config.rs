@@ -126,11 +126,11 @@ pub struct CfgAuth {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct CfgSmtp {
-    /// Number of per-domain SMTP transports to keep in the outer cache.
+    /// Number of destination MX transports to keep in the process-wide cache.
     pub cache_size: Option<u64>,
-    /// Minimum number of idle connections per destination SMTP transport.
+    /// Minimum number of idle connections in each process-wide destination MX pool.
     pub min_idle: Option<u32>,
-    /// Maximum number of pooled connections per destination SMTP transport.
+    /// Maximum number of connections in each process-wide destination MX pool.
     pub max_size: Option<u32>,
 }
 

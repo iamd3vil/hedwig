@@ -40,10 +40,12 @@ Set `hostname` to the name clients should see when they connect to Hedwig (typic
 
 ```toml
 [server.smtp]
-cache_size = 100  # Number of destination SMTP transports to cache (default: 100)
-min_idle = 2      # Minimum idle connections per destination SMTP pool (default: 2)
-max_size = 10     # Maximum connections per destination SMTP pool (default: 10)
+cache_size = 100  # Process-wide cache of destination MX transports (default: 100)
+min_idle = 2      # Minimum idle connections per MX pool, shared by all workers (default: 2)
+max_size = 10     # Maximum connections per MX pool, shared by all workers (default: 10)
 ```
+
+All workers share this cache and its per-MX connection pools, so these limits are process-wide rather than multiplied by the worker count.
 
 For new or low-volume senders, keep `min_idle` and `max_size` small so strict receivers do not see unnecessary parallel connections. The legacy `server.pool_size` setting is still accepted as a fallback for `server.smtp.cache_size`.
 

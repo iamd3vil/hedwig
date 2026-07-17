@@ -20,7 +20,7 @@ use rustls_pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
 // use pool::SmtpClientPool;
 use memchr::memmem;
 use moka::future::Cache;
-use pool::PoolManager;
+pub(crate) use pool::PoolManager;
 pub use pool::{
     SmtpPoolConfig, DEFAULT_SMTP_CACHE_SIZE, DEFAULT_SMTP_POOL_MAX_SIZE, DEFAULT_SMTP_POOL_MIN_IDLE,
 };
@@ -99,10 +99,31 @@ pub enum DkimSignerType {
 
 pub struct WorkerConfig {
     pub disable_outbound: bool,
-    pub outbound_local: bool,
-    pub helo_hostname: Option<String>,
-    pub smtp_pool: SmtpPoolConfig,
     pub rate_limit_config: RateLimitConfig,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkerResources {
+    mx_cache: Cache<String, MxLookup>,
+    pool: Arc<PoolManager>,
+    resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
+    mta_sts: Arc<MtaStsResolver>,
+}
+
+impl WorkerResources {
+    pub(crate) fn new(
+        mx_cache: Cache<String, MxLookup>,
+        pool: Arc<PoolManager>,
+        resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
+        mta_sts: Arc<MtaStsResolver>,
+    ) -> Self {
+        Self {
+            mx_cache,
+            pool,
+            resolver,
+            mta_sts,
+        }
+    }
 }
 
 pub struct Worker {
@@ -110,7 +131,7 @@ pub struct Worker {
     storage: Arc<dyn Storage>,
     resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
 
-    pool: PoolManager,
+    pool: Arc<PoolManager>,
     dkim_signer: Option<DkimSignerType>,
 
     // MX Cache
@@ -137,17 +158,10 @@ impl Worker {
         channel: Receiver<Job>,
         storage: Arc<dyn Storage>,
         dkim: &Option<CfgDKIM>,
-        mx_cache: Cache<String, MxLookup>,
         config: WorkerConfig,
-        resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
-        mta_sts: Arc<MtaStsResolver>,
+        resources: WorkerResources,
     ) -> Result<Self> {
         info!("Initializing SMTP worker");
-        let pool = PoolManager::new(
-            config.smtp_pool.clone(),
-            config.outbound_local,
-            config.helo_hostname.clone(),
-        );
 
         // Create DKIM signer if dkim is enabled.
         let dkim_signer = match dkim {
@@ -162,6 +176,13 @@ impl Worker {
                 Some(signer)
             }
         };
+
+        let WorkerResources {
+            mx_cache,
+            pool,
+            resolver,
+            mta_sts,
+        } = resources;
 
         Ok(Worker {
             channel,

@@ -36,7 +36,7 @@ Configurable via `server.cmd_timeout` (default: `5m`) and `server.data_timeout` 
 
 **Status:** Fixed in `74b8602`.
 
-Configurable via `server.max_connections` (default: 1000). Uses `tokio::sync::Semaphore` in the accept loop. When at capacity, responds with `421 4.7.0 Too many connections, try again later` and closes immediately.
+Configurable via `server.max_connections` (default: 10000). Uses `tokio::sync::Semaphore` in the accept loop. When at capacity, responds with `421 4.7.0 Too many connections, try again later` and closes immediately.
 
 ---
 
