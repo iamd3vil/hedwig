@@ -90,6 +90,12 @@ pub struct EmailMetadata {
     pub last_attempt: SystemTime,
     pub next_attempt: SystemTime,
     pub msg_id: String,
+    /// The SMTP response (or enforcement error) from the most recent failed
+    /// attempt, so the final exhaustion bounce can report why the message
+    /// kept deferring. `default` keeps meta files written by older versions
+    /// deserializable.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 pub enum DkimSignerType {
@@ -317,6 +323,10 @@ impl Worker {
                 "email delivery"
             );
             self.storage.delete(&job.job_id, Status::Queued).await?;
+            self.storage
+                .delete_meta(&job.job_id)
+                .await
+                .wrap_err("deleting meta file")?;
             metrics::queue_depth_dec();
             metrics::email_dropped();
             return Ok(());
@@ -358,7 +368,7 @@ impl Worker {
                         attempt = %(job.attempts + 1),
                         "email delivery"
                     );
-                    self.defer_email(job).await?;
+                    self.defer_email(job, "MTA-STS enforcement failure").await?;
                     return Ok(());
                 }
 
@@ -391,7 +401,7 @@ impl Worker {
                             attempt = %(job.attempts + 1),
                             "email delivery"
                         );
-                        self.defer_email(job).await?;
+                        self.defer_email(job, &smtp_response).await?;
                         Ok(())
                     }
                     SendOutcome::Bounce => {
@@ -412,6 +422,12 @@ impl Worker {
                             .mv(&job.job_id, &job.job_id, Status::Queued, Status::Bounced)
                             .await
                             .wrap_err("moving from queued to bounced")?;
+                        // A retried job still has its deferred metadata on
+                        // disk; bounce is terminal, so remove it.
+                        self.storage
+                            .delete_meta(&job.job_id)
+                            .await
+                            .wrap_err("deleting meta file")?;
                         metrics::queue_depth_dec();
                         metrics::email_bounced();
                         Ok(())
@@ -421,7 +437,7 @@ impl Worker {
         }
     }
 
-    async fn defer_email(&self, job: &Job) -> Result<()> {
+    async fn defer_email(&self, job: &Job, smtp_response: &str) -> Result<()> {
         let delay = self.initial_delay * (2_u32.pow(job.attempts));
         let delay = std::cmp::min(delay, self.max_delay);
 
@@ -437,6 +453,7 @@ impl Worker {
             attempts: job.attempts + 1,
             last_attempt: SystemTime::now(),
             next_attempt: SystemTime::now() + delay,
+            last_error: Some(smtp_response.to_string()),
         };
 
         self.storage

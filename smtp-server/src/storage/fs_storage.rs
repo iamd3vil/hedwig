@@ -262,10 +262,49 @@ impl FileSystemStorage {
             let age = now
                 .duration_since(metadata.last_attempt)
                 .unwrap_or_default();
-            if age >= retention {
-                self.delete(&metadata.msg_id, Status::Deferred).await?;
-                self.delete_meta(&metadata.msg_id).await?;
+            if age < retention {
+                continue;
             }
+
+            let msg_id = &metadata.msg_id;
+
+            // A body in queued/ means the message is mid-retry and the
+            // meta is its only durable attempt count — leave both alone.
+            if fs::metadata(self.file_path(msg_id, &Status::Queued))
+                .await
+                .is_ok()
+            {
+                continue;
+            }
+
+            // Workers run concurrently with cleanup: the message can be
+            // requeued or re-deferred (fresh meta) between the snapshot
+            // above and the deletes below. Re-read the meta and only act if
+            // it is unchanged — a differing or missing meta means the retry
+            // machinery touched the message and it is no longer expired.
+            match self.get_meta(msg_id).await? {
+                Some(current) if current.last_attempt == metadata.last_attempt => {}
+                _ => continue,
+            }
+
+            // Delete the body first and let its prior existence decide the
+            // meta's fate: if the body was already gone, the message either
+            // just moved to queued/ (mid-retry — keep the counter) or the
+            // meta is a stray from a crash (drop it).
+            let body_path = self.file_path(msg_id, &Status::Deferred);
+            match fs::remove_file(&body_path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if fs::metadata(self.file_path(msg_id, &Status::Queued))
+                        .await
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                }
+                Err(e) => return Err(e).into_diagnostic(),
+            }
+            self.delete_meta(msg_id).await?;
         }
 
         let cutoff = Self::cutoff_time(retention);
@@ -378,7 +417,13 @@ impl Storage for FileSystemStorage {
     async fn put_meta(&self, key: &str, meta: &EmailMetadata) -> Result<()> {
         let path = self.meta_file_path(key);
         let json = serde_json::to_string(meta).into_diagnostic()?;
-        fs::write(&path, json).await.into_diagnostic()?;
+        // The meta is the durable retry counter; an in-place `fs::write`
+        // truncates first, so a crash mid-write would corrupt it and reset
+        // the attempt count on restart. Write-then-rename keeps the update
+        // atomic on the same filesystem.
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, json).await.into_diagnostic()?;
+        fs::rename(&tmp_path, &path).await.into_diagnostic()?;
         Ok(())
     }
 
@@ -569,6 +614,7 @@ mod tests {
             attempts: 1,
             last_attempt: SystemTime::now(),
             next_attempt: SystemTime::now() + Duration::from_secs(300), // 5 minutes in the future
+            last_error: None,
         }
     }
 
@@ -762,6 +808,7 @@ mod tests {
             attempts: 3,
             last_attempt: SystemTime::now() - Duration::from_secs(3600),
             next_attempt: SystemTime::now() - Duration::from_secs(300),
+            last_error: None,
         };
         storage.put_meta("deferred_old", &meta).await.unwrap();
 
@@ -778,6 +825,62 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(storage.get_meta("deferred_old").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_deferred_keeps_inflight_retry() {
+        let (storage, _temp) = create_test_storage().await;
+
+        // Body is mid-retry in queued/, meta (the durable attempt count) is
+        // past retention. Cleanup must not touch either.
+        let email = create_test_email("inflight");
+        storage.put(email, Status::Queued).await.unwrap();
+        let meta = EmailMetadata {
+            msg_id: "inflight".to_string(),
+            attempts: 4,
+            last_attempt: SystemTime::now() - Duration::from_secs(3600),
+            next_attempt: SystemTime::now() - Duration::from_secs(300),
+            last_error: None,
+        };
+        storage.put_meta("inflight", &meta).await.unwrap();
+
+        let cleanup_config = CleanupConfig {
+            deferred_retention: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        storage.cleanup(&cleanup_config).await.unwrap();
+
+        assert!(storage
+            .get("inflight", Status::Queued)
+            .await
+            .unwrap()
+            .is_some());
+        let kept = storage.get_meta("inflight").await.unwrap();
+        assert_eq!(kept.unwrap().attempts, 4);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_deferred_removes_stray_meta() {
+        let (storage, _temp) = create_test_storage().await;
+
+        // Meta past retention with a body in neither deferred/ nor queued/ —
+        // a stray left by a crash. Cleanup must remove it.
+        let meta = EmailMetadata {
+            msg_id: "stray".to_string(),
+            attempts: 2,
+            last_attempt: SystemTime::now() - Duration::from_secs(3600),
+            next_attempt: SystemTime::now() - Duration::from_secs(300),
+            last_error: None,
+        };
+        storage.put_meta("stray", &meta).await.unwrap();
+
+        let cleanup_config = CleanupConfig {
+            deferred_retention: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        storage.cleanup(&cleanup_config).await.unwrap();
+
+        assert!(storage.get_meta("stray").await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -261,7 +261,18 @@ async fn run_server(config_path: &str) -> Result<()> {
             "replaying queued jobs to workers"
         );
         for msg_id in queued_jobs {
-            let job = Job::new(msg_id, 0);
+            // A message that was mid-retry when we stopped still has its
+            // deferred metadata; seed the attempt count from it so restarts
+            // don't grant a fresh set of retries.
+            let attempts = match storage.get_meta(&msg_id).await {
+                Ok(Some(meta)) => meta.attempts,
+                Ok(None) => 0,
+                Err(e) => {
+                    warn!(msg_id = %msg_id, "error reading meta during replay, assuming attempt 0: {:#}", e);
+                    0
+                }
+            };
+            let job = Job::new(msg_id, attempts);
             sender_channel
                 .send(job)
                 .await

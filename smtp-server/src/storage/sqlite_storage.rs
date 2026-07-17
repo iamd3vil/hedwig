@@ -162,6 +162,7 @@ impl SqliteStorage {
                 attempts     INTEGER NOT NULL DEFAULT 0,
                 last_attempt INTEGER,
                 next_attempt INTEGER,
+                last_error   TEXT,
                 created_at   INTEGER NOT NULL,
                 updated_at   INTEGER NOT NULL
             )",
@@ -299,11 +300,12 @@ async fn process_write_batch(
                     .unwrap_or_default()
                     .as_millis() as i64;
                 if let Err(e) = sqlx::query(
-                    "UPDATE emails SET attempts = ?, last_attempt = ?, next_attempt = ?, updated_at = ? WHERE message_id = ?",
+                    "UPDATE emails SET attempts = ?, last_attempt = ?, next_attempt = ?, last_error = ?, updated_at = ? WHERE message_id = ?",
                 )
                 .bind(meta.attempts as i64)
                 .bind(last_attempt)
                 .bind(next_attempt)
+                .bind(&meta.last_error)
                 .bind(now)
                 .bind(&key)
                 .execute(&mut *tx)
@@ -341,7 +343,7 @@ async fn process_write_batch(
             ShardWriteOp::DeleteMeta { key, responder } => {
                 responders.push(responder);
                 if let Err(e) = sqlx::query(
-                    "UPDATE emails SET attempts = 0, last_attempt = NULL, next_attempt = NULL, updated_at = ? WHERE message_id = ?",
+                    "UPDATE emails SET attempts = 0, last_attempt = NULL, next_attempt = NULL, last_error = NULL, updated_at = ? WHERE message_id = ?",
                 )
                 .bind(now)
                 .bind(&key)
@@ -555,6 +557,7 @@ impl Storage for SqliteStorage {
                     attempts: meta.attempts,
                     last_attempt: meta.last_attempt,
                     next_attempt: meta.next_attempt,
+                    last_error: meta.last_error.clone(),
                 },
                 responder: tx,
             })
@@ -694,8 +697,8 @@ impl Storage for SqliteStorage {
         let shard = self.shard_for(key);
         let pool = &self.read_pools[shard];
 
-        let row = sqlx::query_as::<_, (String, i64, Option<i64>, Option<i64>)>(
-            "SELECT message_id, attempts, last_attempt, next_attempt \
+        let row = sqlx::query_as::<_, (String, i64, Option<i64>, Option<i64>, Option<String>)>(
+            "SELECT message_id, attempts, last_attempt, next_attempt, last_error \
              FROM emails WHERE message_id = ?",
         )
         .bind(key)
@@ -705,7 +708,7 @@ impl Storage for SqliteStorage {
 
         match row {
             None => Ok(None),
-            Some((msg_id, attempts, last_ms, next_ms)) => {
+            Some((msg_id, attempts, last_ms, next_ms, last_error)) => {
                 use std::time::{Duration as StdDuration, UNIX_EPOCH};
                 let last_attempt = last_ms
                     .map(|ms| UNIX_EPOCH + StdDuration::from_millis(ms as u64))
@@ -718,6 +721,7 @@ impl Storage for SqliteStorage {
                     attempts: attempts as u32,
                     last_attempt,
                     next_attempt,
+                    last_error,
                 }))
             }
         }
@@ -770,15 +774,15 @@ impl Storage for SqliteStorage {
             use std::time::{Duration as StdDuration, UNIX_EPOCH};
 
             for pool in &pools {
-                let rows = sqlx::query_as::<_, (String, i64, Option<i64>, Option<i64>)>(
-                    "SELECT message_id, attempts, last_attempt, next_attempt \
+                let rows = sqlx::query_as::<_, (String, i64, Option<i64>, Option<i64>, Option<String>)>(
+                    "SELECT message_id, attempts, last_attempt, next_attempt, last_error \
                      FROM emails WHERE status = 1",
                 )
                 .fetch_all(pool)
                 .await
                 .into_diagnostic()?;
 
-                for (msg_id, attempts, last_ms, next_ms) in rows {
+                for (msg_id, attempts, last_ms, next_ms, last_error) in rows {
                     let last_attempt = last_ms
                         .map(|ms| UNIX_EPOCH + StdDuration::from_millis(ms as u64))
                         .unwrap_or(UNIX_EPOCH);
@@ -790,6 +794,7 @@ impl Storage for SqliteStorage {
                         attempts: attempts as u32,
                         last_attempt,
                         next_attempt,
+                        last_error,
                     };
                 }
             }
@@ -951,6 +956,7 @@ mod tests {
             attempts: 3,
             last_attempt: now,
             next_attempt: now + Duration::from_secs(300),
+            last_error: Some("transient error (421): 4.7.0 throttled".to_string()),
         };
         storage.put_meta("msg_meta", &meta).await.unwrap();
 
@@ -959,6 +965,10 @@ mod tests {
         let retrieved = result.unwrap();
         assert_eq!(retrieved.msg_id, "msg_meta");
         assert_eq!(retrieved.attempts, 3);
+        assert_eq!(
+            retrieved.last_error.as_deref(),
+            Some("transient error (421): 4.7.0 throttled")
+        );
 
         // Nonexistent key → None
         let result = storage.get_meta("nonexistent").await.unwrap();
@@ -978,6 +988,7 @@ mod tests {
             attempts: 2,
             last_attempt: now,
             next_attempt: now + Duration::from_secs(60),
+            last_error: None,
         };
         storage.put_meta("msg_delmeta", &meta).await.unwrap();
 
@@ -1039,12 +1050,14 @@ mod tests {
             attempts: 1,
             last_attempt: now,
             next_attempt: now + Duration::from_secs(60),
+            last_error: None,
         };
         let meta2 = crate::worker::EmailMetadata {
             msg_id: "msg_lm2".to_string(),
             attempts: 2,
             last_attempt: now,
             next_attempt: now + Duration::from_secs(120),
+            last_error: None,
         };
         storage.put_meta("msg_lm1", &meta1).await.unwrap();
         storage.put_meta("msg_lm2", &meta2).await.unwrap();
