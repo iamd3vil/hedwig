@@ -2,7 +2,7 @@
 
 > Covers the server as of the `log-queue` branch. The durable log queue is the
 > default subject; the legacy filesystem path is described where it
-> differs. Design rationale lives in [PLAN.md](PLAN.md); this document describes
+> differs. Design rationale lives in [the log-queue plan](docs/plans/2026-07-20-durable-log-queue.md); this document describes
 > what is actually built and where.
 
 ## 1. The big picture
@@ -457,7 +457,7 @@ writers flush, and then renames `queued/`/`deferred/` to timestamped
 
 ## 11. Measured behavior
 
-Same machine, 1 KiB messages, 16 connections (see PLAN.md §27 for the full
+Same machine, 1 KiB messages, 16 connections (see docs/plans/2026-07-20-durable-log-queue.md §27 for the full
 plan; these are the two headline experiments):
 
 | Scenario | fs backend | log backend |

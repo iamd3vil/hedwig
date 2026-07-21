@@ -1,5 +1,5 @@
 //! One-time, restart-safe migration from the legacy filesystem spool to the
-//! log queue (PLAN.md §23 "Migration from the current filesystem spool").
+//! log queue (docs/plans/2026-07-20-durable-log-queue.md §23 "Migration from the current filesystem spool").
 //!
 //! Unlike `queue_cli`, this module WRITES to the new spool: it takes the
 //! exclusive spool lock (refusing to run if another process — including a

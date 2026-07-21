@@ -1,4 +1,4 @@
-//! Queue inspection and migration CLI (`hedwig queue …`, PLAN.md §25
+//! Queue inspection and migration CLI (`hedwig queue …`, docs/plans/2026-07-20-durable-log-queue.md §25
 //! "Operator tooling" and §23 "Migration from the current filesystem
 //! spool").
 //!
@@ -48,7 +48,7 @@ enum QueueCommand {
     /// Show per-shard and per-segment storage statistics
     Stats(StatsArgs),
     /// One-time migration from the legacy filesystem spool to the log queue
-    /// (PLAN.md §23). WRITES to the spool; stop the server first.
+    /// (docs/plans/2026-07-20-durable-log-queue.md §23). WRITES to the spool; stop the server first.
     Migrate(MigrateArgs),
 }
 
