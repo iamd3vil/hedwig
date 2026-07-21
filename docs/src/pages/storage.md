@@ -8,7 +8,7 @@ description: Configure filesystem storage and retention policies.
 
 ```toml
 [storage]
-storage_type = "fs"                      # Storage type: "fs" (filesystem)
+storage_type = "log"                     # "log" (default) or "fs" (legacy filesystem)
 base_path = "/var/spool/hedwig"         # Base directory for email storage
 
 [storage.cleanup]
@@ -23,7 +23,8 @@ interval = "1h"                          # Run the cleanup task hourly
 
 ## Log queue backend
 
-`storage_type = "log"` selects the durable log queue: complete messages are
+`storage_type = "log"` — the default when `storage_type` is omitted —
+selects the durable log queue: complete messages are
 stored in segmented append-only logs under `<base_path>/spool/`, and SMTP
 `250 OK` is returned as soon as the record is written — inbound acceptance
 is bounded by disk append throughput, not by outbound delivery speed.

@@ -132,6 +132,9 @@ async fn run_server(config_path: &str) -> Result<()> {
     // durable append log; a filesystem store remains as the bounced-message
     // archive (with the usual retention cleanup).
     let is_log_backend = cfg.storage.storage_type == "log";
+    if is_log_backend {
+        warn_about_unmigrated_legacy_spool(&cfg.storage.base_path);
+    }
     let storage: Arc<dyn Storage> = if is_log_backend {
         Arc::new(
             FileSystemStorage::new(cfg.storage.base_path.clone())
@@ -634,6 +637,28 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The log backend never reads the legacy one-file-per-message spool; mail
+/// sitting there is preserved but undelivered until `hedwig queue migrate`
+/// runs. Make that state loud at startup instead of silently ignoring it.
+fn warn_about_unmigrated_legacy_spool(base_path: &str) {
+    let mut counts = Vec::new();
+    for dir in ["queued", "deferred"] {
+        let path = std::path::Path::new(base_path).join(dir);
+        let n = std::fs::read_dir(&path)
+            .map(|entries| entries.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        if n > 0 {
+            counts.push(format!("{n} entries in {}", path.display()));
+        }
+    }
+    if !counts.is_empty() {
+        warn!(
+            "unmigrated legacy spool detected ({}); this mail is preserved but will NOT be              delivered until you stop the server and run `hedwig queue migrate --config <config>`",
+            counts.join(", ")
+        );
+    }
 }
 
 async fn get_storage_type(cfg: &CfgStorage) -> Result<Arc<dyn Storage>> {

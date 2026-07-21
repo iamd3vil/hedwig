@@ -78,7 +78,7 @@ key_type = "rsa"                             # "rsa" or "ed25519"
 
 # Storage configuration
 [storage]
-storage_type = "fs"         # "fs" for filesystem, "log" for the durable log queue
+storage_type = "log"        # "log" (durable log queue, default) or "fs" (legacy one file per message)
 base_path = "/var/lib/hedwig/mail"
 
 # Optional retention policy for local spool cleanup

@@ -72,6 +72,9 @@ pub struct CfgFilter {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CfgStorage {
+    /// "log" (durable log queue, the default) or "fs" (legacy one file per
+    /// message).
+    #[serde(default = "default_storage_type")]
     pub storage_type: String,
     pub base_path: String,
     #[serde(default)]
@@ -332,6 +335,11 @@ fn default_cleanup_interval() -> Duration {
     Duration::from_secs(60 * 60)
 }
 
+/// The durable log queue is the default backend.
+fn default_storage_type() -> String {
+    "log".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +362,20 @@ mod tests {
             .build()
             .expect("build config");
         settings.try_deserialize().expect("deserialize config")
+    }
+
+    #[test]
+    fn storage_type_defaults_to_log() {
+        let cfg = parse(
+            r#"
+            [server]
+            listeners = []
+
+            [storage]
+            base_path = "/tmp/hedwig-test-spool"
+        "#,
+        );
+        assert_eq!(cfg.storage.storage_type, "log");
     }
 
     #[test]

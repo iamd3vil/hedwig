@@ -49,7 +49,7 @@ storage::
     bounced_retention: "7d"
     deferred_retention: "2d"
     interval: "1h"
-  storage_type: "fs"
+  storage_type: "log"
 
 filters::
   - ::
