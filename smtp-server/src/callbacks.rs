@@ -40,12 +40,23 @@ fn cram_md5_digest(password: &str, challenge: &str) -> String {
         .collect()
 }
 
+/// The log-queue acceptance path: SMTP DATA appends to the durable log and
+/// acknowledges on page-cache write completion, never waiting for workers.
+pub struct LogQueueTap {
+    pub append: crate::logqueue::writer::AppendHandle,
+    pub spool_root: std::path::PathBuf,
+    pub disk_reserve_bytes: u64,
+}
+
 /// The Callbacks struct holds the configuration, storage, and sender channel.
 pub struct Callbacks {
     cfg: Cfg,
     auth_mapping: Mutex<HashMap<String, String>>,
     storage: Arc<dyn Storage>,
     sender_channel: async_channel::Sender<worker::Job>,
+    /// `Some` when the log-queue backend is active: DATA goes to the append
+    /// log and the legacy storage/channel path is bypassed.
+    log_queue: Option<LogQueueTap>,
 }
 
 /// Extracts the lowercased domain from an SMTP path like `<user@example.com>`.
@@ -147,61 +158,10 @@ impl Callbacks {
         receiver_channel: async_channel::Receiver<Job>,
         cfg: Cfg,
     ) -> miette::Result<(Self, Vec<JoinHandle<()>>, Arc<MtaStsResolver>)> {
-        let expiry = MXExpiry;
-        let mx_cache: Cache<_, _> = Cache::builder()
-            .max_capacity(10000)
-            .expire_after(expiry)
-            .build();
+        let (worker_resources, mta_sts_resolver) = build_worker_resources(&cfg)?;
 
-        // Create a shared DNS resolver for workers and MTA-STS.
-        let resolver = TokioAsyncResolver::tokio_from_system_conf()
-            .into_diagnostic()
-            .wrap_err("failed to create DNS resolver")?;
-
-        // Create the shared MTA-STS resolver.
-        let mta_sts_fetcher = MtaStsFetcher::new(resolver.clone());
-        let mta_sts_resolver = Arc::new(MtaStsResolver::new(mta_sts_fetcher));
-
-        // Start workers.
         let worker_count = cfg.server.workers.unwrap_or(1).max(1);
-        let rate_limit_config = cfg
-            .server
-            .rate_limits
-            .as_ref()
-            .map(|rl| rl.to_rate_limit_config())
-            .unwrap_or_default();
-
         let mut worker_handles = Vec::new();
-        let helo_hostname = cfg.server.helo_hostname.clone();
-        if let Some(name) = helo_hostname.as_deref() {
-            if !name.contains('.') {
-                warn!(
-                    helo_hostname = %name,
-                    "configured HELO/EHLO hostname does not look like a public FQDN"
-                );
-            }
-        }
-
-        let smtp_pool = build_smtp_pool_config(&cfg);
-        info!(
-            smtp_cache_size = smtp_pool.cache_size,
-            smtp_pool_min_idle = smtp_pool.min_idle,
-            smtp_pool_max_size = smtp_pool.max_size,
-            "configured outbound SMTP pool"
-        );
-        let smtp_pool_manager = Arc::new(worker::PoolManager::new(
-            smtp_pool,
-            cfg.server.outbound_local.unwrap_or(false),
-            helo_hostname,
-        ));
-        let worker_resources = worker::WorkerResources::new(
-            mx_cache,
-            smtp_pool_manager,
-            resolver,
-            Arc::clone(&mta_sts_resolver),
-            rate_limit_config,
-        );
-
         for worker_index in 0..worker_count {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
@@ -239,13 +199,90 @@ impl Callbacks {
             sender_channel,
             cfg,
             auth_mapping: Mutex::new(auth_mapping),
+            log_queue: None,
         };
 
         Ok((callbacks, worker_handles, mta_sts_resolver))
     }
 
+    /// Creates callbacks for the log-queue backend. No legacy workers are
+    /// spawned and the job channel is inert; the caller wires the returned
+    /// [`worker::WorkerResources`] into log workers instead. `storage` is
+    /// used only as the bounced-message archive.
+    pub async fn new_log(
+        storage: Arc<dyn Storage>,
+        tap: LogQueueTap,
+        cfg: Cfg,
+    ) -> miette::Result<(Self, worker::WorkerResources, Arc<MtaStsResolver>)> {
+        let (worker_resources, mta_sts_resolver) = build_worker_resources(&cfg)?;
+
+        let mut auth_mapping = HashMap::new();
+        if let Some(auth) = &cfg.server.auth {
+            for auth in auth.iter() {
+                auth_mapping.insert(auth.username.clone(), auth.password.clone());
+            }
+        }
+
+        // The legacy channel field is inert on this path.
+        let (sender_channel, _) = async_channel::bounded(1);
+        let callbacks = Callbacks {
+            storage,
+            sender_channel,
+            cfg,
+            auth_mapping: Mutex::new(auth_mapping),
+            log_queue: Some(tap),
+        };
+        Ok((callbacks, worker_resources, mta_sts_resolver))
+    }
+
+    /// Log-queue DATA path: check the disk reserve, then append and wait
+    /// only for page-cache write completion (PLAN §28 phase 8). Worker and
+    /// dispatcher capacity never gate acceptance.
+    async fn process_email_log(&self, tap: &LogQueueTap, email: Email) -> Result<(), SmtpError> {
+        if tap.disk_reserve_bytes > 0 {
+            match crate::logqueue::spool::disk_free_bytes(&tap.spool_root) {
+                Ok(free) if free < tap.disk_reserve_bytes => {
+                    warn!(
+                        free_bytes = free,
+                        reserve_bytes = tap.disk_reserve_bytes,
+                        "disk reserve reached; rejecting message"
+                    );
+                    return Err(SmtpError::Transient {
+                        message: "4.3.1 insufficient system storage".into(),
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // Fail open: a broken statvfs must not stop mail flow.
+                    warn!(error = %e, "disk reserve check failed");
+                }
+            }
+        }
+
+        let message_id = crate::logqueue::MessageId::from_ulid(Ulid::new());
+        let msg = crate::logqueue::writer::AppendMessage {
+            message_id,
+            enqueue_ms: Utc::now().timestamp_millis(),
+            generation: 0,
+            sender: email.from,
+            recipients: email.to,
+            body: bytes::Bytes::from(email.body.into_bytes()),
+        };
+        tap.append.append(msg).await.map_err(|e| {
+            warn!(error = %e, "append to log queue failed");
+            SmtpError::Transient {
+                message: "4.3.0 queue write failed, try again later".into(),
+            }
+        })?;
+        metrics::email_received();
+        Ok(())
+    }
+
     /// Processes an email by parsing it, storing it, and sending it to a worker.
     async fn process_email(&self, email: Email) -> Result<(), SmtpError> {
+        if let Some(tap) = &self.log_queue {
+            return self.process_email_log(tap, email).await;
+        }
         let ulid = Ulid::new().to_string();
         // We are using ulid as the message id instead of message_id from the email.
         // The issue is we can't depend on the email client to provide a unique message id.
@@ -279,6 +316,68 @@ impl Callbacks {
             })?;
         Ok(())
     }
+}
+
+/// Builds the delivery resources shared by every worker flavor: MX cache,
+/// DNS resolver, MTA-STS resolver, outbound SMTP pool, and the process-wide
+/// rate limiter.
+fn build_worker_resources(
+    cfg: &Cfg,
+) -> miette::Result<(worker::WorkerResources, Arc<MtaStsResolver>)> {
+    let expiry = MXExpiry;
+    let mx_cache: Cache<_, _> = Cache::builder()
+        .max_capacity(10000)
+        .expire_after(expiry)
+        .build();
+
+    // Create a shared DNS resolver for workers and MTA-STS.
+    let resolver = TokioAsyncResolver::tokio_from_system_conf()
+        .into_diagnostic()
+        .wrap_err("failed to create DNS resolver")?;
+
+    // Create the shared MTA-STS resolver.
+    let mta_sts_fetcher = MtaStsFetcher::new(resolver.clone());
+    let mta_sts_resolver = Arc::new(MtaStsResolver::new(mta_sts_fetcher));
+
+    let rate_limit_config = cfg
+        .server
+        .rate_limits
+        .as_ref()
+        .map(|rl| rl.to_rate_limit_config())
+        .unwrap_or_default();
+
+    let helo_hostname = cfg.server.helo_hostname.clone();
+    if let Some(name) = helo_hostname.as_deref() {
+        if !name.contains('.') {
+            warn!(
+                helo_hostname = %name,
+                "configured HELO/EHLO hostname does not look like a public FQDN"
+            );
+        }
+    }
+
+    let smtp_pool = build_smtp_pool_config(cfg);
+    info!(
+        smtp_cache_size = smtp_pool.cache_size,
+        smtp_pool_min_idle = smtp_pool.min_idle,
+        smtp_pool_max_size = smtp_pool.max_size,
+        "configured outbound SMTP pool"
+    );
+    let smtp_pool_manager = Arc::new(worker::PoolManager::new(
+        smtp_pool,
+        cfg.server.outbound_local.unwrap_or(false),
+        helo_hostname,
+    ));
+    Ok((
+        worker::WorkerResources::new(
+            mx_cache,
+            smtp_pool_manager,
+            resolver,
+            Arc::clone(&mta_sts_resolver),
+            rate_limit_config,
+        ),
+        mta_sts_resolver,
+    ))
 }
 
 fn build_smtp_pool_config(cfg: &Cfg) -> worker::SmtpPoolConfig {
