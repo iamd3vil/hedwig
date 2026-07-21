@@ -8,8 +8,8 @@ use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use once_cell::sync::Lazy;
 use prometheus::{
     register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
-    register_int_gauge, Encoder, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    TextEncoder,
+    register_int_gauge, register_int_gauge_vec, Encoder, Histogram, HistogramVec, IntCounter,
+    IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
 use tracing::{error, info, warn};
 
@@ -31,6 +31,30 @@ struct MetricsHandles {
     mta_sts_policy_fetch: IntCounterVec,
     mta_sts_enforcement: IntCounterVec,
     mta_sts_cache_size: IntGauge,
+    // --- Log queue: admission ---
+    logqueue_append_duration: HistogramVec,
+    logqueue_pending_append_bytes: IntGauge,
+    logqueue_records_appended: IntCounterVec,
+    logqueue_bytes_appended: IntCounterVec,
+    logqueue_append_errors: IntCounter,
+    logqueue_active_segment_bytes: IntGaugeVec,
+    logqueue_segment_rotations: IntCounterVec,
+    // --- Log queue: dispatcher ---
+    logqueue_ready_jobs: IntGauge,
+    logqueue_deferred_jobs: IntGauge,
+    logqueue_inflight_jobs: IntGauge,
+    logqueue_dispatcher_lag_records: IntGaugeVec,
+    logqueue_oldest_ready_age_seconds: IntGauge,
+    logqueue_oldest_deferred_age_seconds: IntGauge,
+    // --- Log queue: storage and GC ---
+    logqueue_live_bytes: IntGauge,
+    logqueue_dead_bytes: IntGauge,
+    logqueue_sealed_segments: IntGauge,
+    logqueue_segments_deleted: IntCounter,
+    logqueue_compactions: IntCounterVec,
+    logqueue_compaction_bytes: IntCounterVec,
+    logqueue_relocations: IntCounter,
+    logqueue_disk_free_bytes: IntGauge,
 }
 
 /// Global registry for all metrics exposed by the server.
@@ -122,6 +146,120 @@ static METRICS: Lazy<MetricsHandles> = Lazy::new(|| MetricsHandles {
         "Number of MTA-STS policies currently cached."
     )
     .expect("register hedwig_mta_sts_cache_size gauge"),
+    logqueue_append_duration: register_histogram_vec!(
+        "logqueue_append_duration_seconds",
+        "Latency of log-queue append operations, labelled by shard.",
+        &["shard"],
+        vec![0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+    )
+    .expect("register logqueue_append_duration_seconds histogram vec"),
+    logqueue_pending_append_bytes: register_int_gauge!(
+        "logqueue_pending_append_bytes",
+        "Number of bytes currently pending append to the log queue."
+    )
+    .expect("register logqueue_pending_append_bytes gauge"),
+    logqueue_records_appended: register_int_counter_vec!(
+        "logqueue_records_appended_total",
+        "Total number of records appended to the log queue, labelled by shard.",
+        &["shard"]
+    )
+    .expect("register logqueue_records_appended_total counter vec"),
+    logqueue_bytes_appended: register_int_counter_vec!(
+        "logqueue_bytes_appended_total",
+        "Total number of bytes appended to the log queue, labelled by shard.",
+        &["shard"]
+    )
+    .expect("register logqueue_bytes_appended_total counter vec"),
+    logqueue_append_errors: register_int_counter!(
+        "logqueue_append_errors_total",
+        "Total number of log-queue append errors."
+    )
+    .expect("register logqueue_append_errors_total counter"),
+    logqueue_active_segment_bytes: register_int_gauge_vec!(
+        "logqueue_active_segment_bytes",
+        "Size in bytes of the active log-queue segment, labelled by shard.",
+        &["shard"]
+    )
+    .expect("register logqueue_active_segment_bytes gauge vec"),
+    logqueue_segment_rotations: register_int_counter_vec!(
+        "logqueue_segment_rotations_total",
+        "Total number of log-queue segment rotations, labelled by shard.",
+        &["shard"]
+    )
+    .expect("register logqueue_segment_rotations_total counter vec"),
+    logqueue_ready_jobs: register_int_gauge!(
+        "logqueue_ready_jobs",
+        "Number of log-queue jobs currently ready for dispatch."
+    )
+    .expect("register logqueue_ready_jobs gauge"),
+    logqueue_deferred_jobs: register_int_gauge!(
+        "logqueue_deferred_jobs",
+        "Number of log-queue jobs currently deferred for retry."
+    )
+    .expect("register logqueue_deferred_jobs gauge"),
+    logqueue_inflight_jobs: register_int_gauge!(
+        "logqueue_inflight_jobs",
+        "Number of log-queue jobs currently in flight."
+    )
+    .expect("register logqueue_inflight_jobs gauge"),
+    logqueue_dispatcher_lag_records: register_int_gauge_vec!(
+        "logqueue_dispatcher_lag_records",
+        "Number of records the dispatcher's discovery cursor lags behind the committed head, labelled by shard.",
+        &["shard"]
+    )
+    .expect("register logqueue_dispatcher_lag_records gauge vec"),
+    logqueue_oldest_ready_age_seconds: register_int_gauge!(
+        "logqueue_oldest_ready_age_seconds",
+        "Age in seconds of the oldest ready log-queue job."
+    )
+    .expect("register logqueue_oldest_ready_age_seconds gauge"),
+    logqueue_oldest_deferred_age_seconds: register_int_gauge!(
+        "logqueue_oldest_deferred_age_seconds",
+        "Age in seconds of the oldest deferred log-queue job."
+    )
+    .expect("register logqueue_oldest_deferred_age_seconds gauge"),
+    logqueue_live_bytes: register_int_gauge!(
+        "logqueue_live_bytes",
+        "Total live bytes across all log-queue segments."
+    )
+    .expect("register logqueue_live_bytes gauge"),
+    logqueue_dead_bytes: register_int_gauge!(
+        "logqueue_dead_bytes",
+        "Total dead (reclaimable) bytes across all log-queue segments."
+    )
+    .expect("register logqueue_dead_bytes gauge"),
+    logqueue_sealed_segments: register_int_gauge!(
+        "logqueue_sealed_segments",
+        "Number of sealed log-queue segments currently on disk."
+    )
+    .expect("register logqueue_sealed_segments gauge"),
+    logqueue_segments_deleted: register_int_counter!(
+        "logqueue_segments_deleted_total",
+        "Total number of log-queue segments deleted after garbage collection."
+    )
+    .expect("register logqueue_segments_deleted_total counter"),
+    logqueue_compactions: register_int_counter_vec!(
+        "logqueue_compactions_total",
+        "Total number of log-queue compactions, labelled by outcome (started/completed/failed).",
+        &["outcome"]
+    )
+    .expect("register logqueue_compactions_total counter vec"),
+    logqueue_compaction_bytes: register_int_counter_vec!(
+        "logqueue_compaction_bytes_total",
+        "Total bytes processed by log-queue compaction, labelled by direction (read/written).",
+        &["direction"]
+    )
+    .expect("register logqueue_compaction_bytes_total counter vec"),
+    logqueue_relocations: register_int_counter!(
+        "logqueue_relocations_total",
+        "Total number of log-queue record relocations performed during compaction."
+    )
+    .expect("register logqueue_relocations_total counter"),
+    logqueue_disk_free_bytes: register_int_gauge!(
+        "logqueue_disk_free_bytes",
+        "Free disk space in bytes available to the log queue."
+    )
+    .expect("register logqueue_disk_free_bytes gauge"),
 });
 
 const STATUS_SUCCESS: &str = "success";
@@ -298,6 +436,194 @@ pub fn mta_sts_cache_size_set(size: u64) {
     METRICS.mta_sts_cache_size.set(size as i64);
 }
 
+const COMPACTION_STARTED: &str = "started";
+const COMPACTION_COMPLETED: &str = "completed";
+const COMPACTION_FAILED: &str = "failed";
+const COMPACTION_READ: &str = "read";
+const COMPACTION_WRITTEN: &str = "written";
+
+/// Formats a shard index as the label value used by log-queue metrics.
+fn shard_label(shard: u16) -> String {
+    shard.to_string()
+}
+
+/// Records the duration of a log-queue append operation for a shard.
+#[allow(dead_code)]
+pub fn logqueue_append_duration_observe(shard: u16, duration: Duration) {
+    METRICS
+        .logqueue_append_duration
+        .with_label_values(&[shard_label(shard).as_str()])
+        .observe(duration.as_secs_f64());
+}
+
+/// Sets the number of bytes currently pending append to the log queue.
+#[allow(dead_code)]
+pub fn logqueue_pending_append_bytes_set(bytes: u64) {
+    METRICS.logqueue_pending_append_bytes.set(bytes as i64);
+}
+
+/// Adds to the count of records appended to a shard.
+#[allow(dead_code)]
+pub fn logqueue_records_appended(shard: u16, count: u64) {
+    METRICS
+        .logqueue_records_appended
+        .with_label_values(&[shard_label(shard).as_str()])
+        .inc_by(count);
+}
+
+/// Adds to the count of bytes appended to a shard.
+#[allow(dead_code)]
+pub fn logqueue_bytes_appended(shard: u16, bytes: u64) {
+    METRICS
+        .logqueue_bytes_appended
+        .with_label_values(&[shard_label(shard).as_str()])
+        .inc_by(bytes);
+}
+
+/// Records a log-queue append error.
+#[allow(dead_code)]
+pub fn logqueue_append_error() {
+    METRICS.logqueue_append_errors.inc();
+}
+
+/// Sets the active segment size in bytes for a shard.
+#[allow(dead_code)]
+pub fn logqueue_active_segment_bytes_set(shard: u16, bytes: u64) {
+    METRICS
+        .logqueue_active_segment_bytes
+        .with_label_values(&[shard_label(shard).as_str()])
+        .set(bytes as i64);
+}
+
+/// Records a log-queue segment rotation for a shard.
+#[allow(dead_code)]
+pub fn logqueue_segment_rotation(shard: u16) {
+    METRICS
+        .logqueue_segment_rotations
+        .with_label_values(&[shard_label(shard).as_str()])
+        .inc();
+}
+
+/// Sets the number of jobs currently ready for dispatch.
+#[allow(dead_code)]
+pub fn logqueue_ready_jobs_set(count: i64) {
+    METRICS.logqueue_ready_jobs.set(count);
+}
+
+/// Sets the number of jobs currently deferred for retry.
+#[allow(dead_code)]
+pub fn logqueue_deferred_jobs_set(count: i64) {
+    METRICS.logqueue_deferred_jobs.set(count);
+}
+
+/// Sets the number of jobs currently in flight.
+#[allow(dead_code)]
+pub fn logqueue_inflight_jobs_set(count: i64) {
+    METRICS.logqueue_inflight_jobs.set(count);
+}
+
+/// Sets the dispatcher's lag in records behind the committed head for a shard.
+#[allow(dead_code)]
+pub fn logqueue_dispatcher_lag_records_set(shard: u16, lag: i64) {
+    METRICS
+        .logqueue_dispatcher_lag_records
+        .with_label_values(&[shard_label(shard).as_str()])
+        .set(lag);
+}
+
+/// Sets the age in seconds of the oldest ready job.
+#[allow(dead_code)]
+pub fn logqueue_oldest_ready_age_seconds_set(seconds: i64) {
+    METRICS.logqueue_oldest_ready_age_seconds.set(seconds);
+}
+
+/// Sets the age in seconds of the oldest deferred job.
+#[allow(dead_code)]
+pub fn logqueue_oldest_deferred_age_seconds_set(seconds: i64) {
+    METRICS.logqueue_oldest_deferred_age_seconds.set(seconds);
+}
+
+/// Sets the total live bytes across all log-queue segments.
+#[allow(dead_code)]
+pub fn logqueue_live_bytes_set(bytes: u64) {
+    METRICS.logqueue_live_bytes.set(bytes as i64);
+}
+
+/// Sets the total dead (reclaimable) bytes across all log-queue segments.
+#[allow(dead_code)]
+pub fn logqueue_dead_bytes_set(bytes: u64) {
+    METRICS.logqueue_dead_bytes.set(bytes as i64);
+}
+
+/// Sets the number of sealed segments currently on disk.
+#[allow(dead_code)]
+pub fn logqueue_sealed_segments_set(count: i64) {
+    METRICS.logqueue_sealed_segments.set(count);
+}
+
+/// Adds to the count of segments deleted after garbage collection.
+#[allow(dead_code)]
+pub fn logqueue_segments_deleted(count: u64) {
+    METRICS.logqueue_segments_deleted.inc_by(count);
+}
+
+/// Records that a compaction started.
+#[allow(dead_code)]
+pub fn logqueue_compaction_started() {
+    METRICS
+        .logqueue_compactions
+        .with_label_values(&[COMPACTION_STARTED])
+        .inc();
+}
+
+/// Records that a compaction completed successfully.
+#[allow(dead_code)]
+pub fn logqueue_compaction_completed() {
+    METRICS
+        .logqueue_compactions
+        .with_label_values(&[COMPACTION_COMPLETED])
+        .inc();
+}
+
+/// Records that a compaction failed.
+#[allow(dead_code)]
+pub fn logqueue_compaction_failed() {
+    METRICS
+        .logqueue_compactions
+        .with_label_values(&[COMPACTION_FAILED])
+        .inc();
+}
+
+/// Adds to the count of bytes read by compaction.
+#[allow(dead_code)]
+pub fn logqueue_compaction_bytes_read(bytes: u64) {
+    METRICS
+        .logqueue_compaction_bytes
+        .with_label_values(&[COMPACTION_READ])
+        .inc_by(bytes);
+}
+
+/// Adds to the count of bytes written by compaction.
+#[allow(dead_code)]
+pub fn logqueue_compaction_bytes_written(bytes: u64) {
+    METRICS
+        .logqueue_compaction_bytes
+        .with_label_values(&[COMPACTION_WRITTEN])
+        .inc_by(bytes);
+}
+
+/// Adds to the count of records relocated during compaction.
+#[allow(dead_code)]
+pub fn logqueue_relocations(count: u64) {
+    METRICS.logqueue_relocations.inc_by(count);
+}
+
+/// Sets the free disk space in bytes available to the log queue.
+#[allow(dead_code)]
+pub fn logqueue_disk_free_bytes_set(bytes: u64) {
+    METRICS.logqueue_disk_free_bytes.set(bytes as i64);
+}
+
 /// Spawns the HTTP server that exposes Prometheus-compatible metrics.
 pub fn spawn_metrics_server(addr: SocketAddr) {
     info!(%addr, "starting metrics endpoint");
@@ -466,5 +792,44 @@ mod tests {
         let before_dropped = METRICS.emails_dropped.get();
         email_dropped();
         assert_eq!(METRICS.emails_dropped.get(), before_dropped + 1);
+    }
+
+    #[test]
+    fn logqueue_metrics_do_not_panic() {
+        // Registration conflicts would panic via the Lazy initializer, so simply
+        // exercising each wrapper once is enough to catch duplicate/mismatched
+        // metric registrations.
+        logqueue_append_duration_observe(0, Duration::from_millis(5));
+        logqueue_pending_append_bytes_set(1024);
+        logqueue_records_appended(0, 3);
+        logqueue_bytes_appended(0, 4096);
+        logqueue_append_error();
+        logqueue_active_segment_bytes_set(0, 8192);
+        logqueue_segment_rotation(0);
+
+        logqueue_ready_jobs_set(5);
+        logqueue_deferred_jobs_set(2);
+        logqueue_inflight_jobs_set(1);
+        logqueue_dispatcher_lag_records_set(0, 7);
+        logqueue_oldest_ready_age_seconds_set(30);
+        logqueue_oldest_deferred_age_seconds_set(60);
+
+        logqueue_live_bytes_set(1_000_000);
+        logqueue_dead_bytes_set(2_000);
+        logqueue_sealed_segments_set(4);
+        logqueue_segments_deleted(1);
+        logqueue_compaction_started();
+        logqueue_compaction_completed();
+        logqueue_compaction_failed();
+        logqueue_compaction_bytes_read(512);
+        logqueue_compaction_bytes_written(256);
+        logqueue_disk_free_bytes_set(10_000_000_000);
+
+        // Counters are process-global and other tests in this binary bump
+        // them concurrently, so assert deltas rather than absolute values.
+        let before = METRICS.logqueue_relocations.get();
+        logqueue_relocations(1);
+        assert!(METRICS.logqueue_relocations.get() >= before + 1);
+        assert!(METRICS.logqueue_append_errors.get() >= 1);
     }
 }
