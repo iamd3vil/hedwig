@@ -509,6 +509,7 @@ impl Dispatcher {
                     self.discover_all();
                     self.retry_pending_persists();
                     self.maybe_checkpoint();
+                    self.sweep_dead_segments();
                     self.maybe_start_compaction();
                     self.drive_compaction().await;
                     self.publish_metrics();
@@ -1016,6 +1017,24 @@ impl Dispatcher {
         }
         crate::metrics::logqueue_segments_deleted(1);
         tracing::info!(shard = self.shards[shard_idx].shard, segment, "deleted fully dead segment");
+    }
+
+    /// Sweep backstop for event-driven deletion (PLAN §17.1): a segment
+    /// whose last record went terminal before the dispatcher had observed
+    /// the seal (total_bytes still unknown at that moment) misses its
+    /// deletion event; catch it on the safety tick.
+    fn sweep_dead_segments(&mut self) {
+        for shard_idx in 0..self.shards.len() {
+            let dead: Vec<u64> = self.shards[shard_idx]
+                .stats
+                .iter()
+                .filter(|(_, s)| s.total_bytes > 0 && s.dead_bytes >= s.total_bytes)
+                .map(|(seg, _)| *seg)
+                .collect();
+            for segment in dead {
+                self.maybe_delete_segment(shard_idx, segment);
+            }
+        }
     }
 
     /// Pick a compaction candidate if none is running (one at a time
