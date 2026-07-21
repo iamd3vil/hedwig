@@ -22,6 +22,7 @@ mod callbacks;
 mod config;
 mod dkim;
 mod health;
+mod logqueue;
 mod metrics;
 mod mta_sts;
 mod storage;
