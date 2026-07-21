@@ -74,26 +74,6 @@ pub enum StateEntry {
     },
 }
 
-impl StateEntry {
-    pub fn id(&self) -> MessageId {
-        match self {
-            StateEntry::Deferred { id, .. }
-            | StateEntry::Delivered { id, .. }
-            | StateEntry::Bounced { id, .. }
-            | StateEntry::Relocated { id, .. } => *id,
-        }
-    }
-
-    pub fn location(&self) -> JobLocation {
-        match self {
-            StateEntry::Deferred { location, .. }
-            | StateEntry::Delivered { location, .. }
-            | StateEntry::Bounced { location, .. } => *location,
-            StateEntry::Relocated { new, .. } => *new,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Minimal binary codec shared by journal entries and checkpoints.
 
@@ -864,7 +844,6 @@ impl RecoveredState {
 /// meant to run on the shard's writer task.
 pub struct ShardStateStore {
     dir: PathBuf,
-    shard: u16,
     journal: JournalWriter,
     /// Bytes appended to journals since the last checkpoint (drives the
     /// caller's checkpoint cadence).
@@ -961,7 +940,6 @@ impl ShardStateStore {
         Ok((
             Self {
                 dir: shard_dir.to_path_buf(),
-                shard,
                 journal,
                 bytes_since_checkpoint: bytes_replayed,
             },
@@ -1038,16 +1016,6 @@ impl ShardStateStore {
             }
         }
         Ok(())
-    }
-
-    /// Directory this store writes to (for running the checkpoint-file step
-    /// on a blocking task).
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    pub fn shard(&self) -> u16 {
-        self.shard
     }
 }
 

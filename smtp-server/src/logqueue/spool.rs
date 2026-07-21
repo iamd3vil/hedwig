@@ -21,7 +21,6 @@ pub const ENVELOPE_ALLOWANCE: u64 = 1024 * 1024;
 /// recovery, tail truncation, migration, and append writers must all sit
 /// behind this. Independent Hedwig processes must use distinct spool roots.
 pub struct Spool {
-    root: PathBuf,
     shards: Vec<ShardDir>,
     /// Lock is released when the file handle drops.
     _lock: File,
@@ -68,7 +67,6 @@ impl Spool {
         }
 
         Ok(Self {
-            root,
             shards,
             _lock: lock,
         })
@@ -115,10 +113,6 @@ impl Spool {
             }
             Err(e) => Err(QueueError::io(&path, e)),
         }
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     pub fn shard_count(&self) -> u16 {

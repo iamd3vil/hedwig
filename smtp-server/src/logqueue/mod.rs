@@ -1,13 +1,10 @@
 //! Durable segmented append-only log queue.
 //!
-//! This module implements the storage layer described in PLAN.md: sharded,
-//! segmented append-only payload logs holding complete messages, with
-//! delivery state tracked separately. It is not yet wired into the serving
-//! path; it lands incrementally alongside the legacy spool backends.
-
-// Remove once the log backend is selectable and consumed by the server
-// (implementation phases 7-8).
-#![allow(dead_code)]
+//! This module implements the storage layer described in
+//! docs/plans/2026-07-20-durable-log-queue.md: sharded, segmented
+//! append-only payload logs holding complete messages, with delivery state
+//! tracked separately. Selected with `storage_type = "log"` (the default);
+//! the legacy filesystem spool remains available as `"fs"`.
 
 pub mod dispatcher;
 pub mod record;

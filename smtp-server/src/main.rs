@@ -47,7 +47,7 @@ enum Commands {
     Server,
     /// Generate DKIM keys
     DkimGenerate(dkim::DkimGenerateArgs),
-    /// Inspect a log-queue spool, read-only (see PLAN.md §25)
+    /// Inspect a log-queue spool, read-only (see docs/plans/2026-07-20-durable-log-queue.md §25)
     Queue(queue_cli::QueueArgs),
 }
 
@@ -308,7 +308,6 @@ async fn run_server(config_path: &str) -> Result<()> {
             worker_resources.rate_limiter(),
         ));
         let dispatcher_config = logqueue::dispatcher::DispatcherConfig {
-            max_record_len,
             checkpoint_interval_bytes: qcfg.checkpoint_interval_bytes(),
             compaction_dead_ratio: qcfg.compaction_dead_ratio(),
             compaction_min_age: qcfg.compaction_min_age(),

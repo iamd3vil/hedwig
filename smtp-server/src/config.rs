@@ -184,11 +184,8 @@ pub struct CfgCleanup {
     pub interval: Duration,
 }
 
-/// Configuration for the durable append-log mail queue (see PLAN.md).
-///
-/// Not yet consumed by the server (the log-queue backend is not wired into
-/// the serving path); remove the `allow(dead_code)` once it is.
-#[allow(dead_code)]
+/// Configuration for the durable append-log mail queue (see
+/// docs/plans/2026-07-20-durable-log-queue.md).
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct CfgQueue {
     /// Number of shards / concurrent append writers (default: 1).
@@ -202,15 +199,12 @@ pub struct CfgQueue {
     /// Minimum age of a sealed segment before it is eligible for compaction (default: 60s).
     #[serde(default, with = "humantime_serde::option")]
     pub compaction_min_age: Option<Duration>,
-    /// Maximum number of compactions allowed to run concurrently (default: 1).
-    pub max_concurrent_compactions: Option<usize>,
     /// Minimum free disk space required to accept new mail (default: 1 GiB).
     pub disk_reserve_bytes: Option<u64>,
     /// Bytes of appended data between durability checkpoints (default: 8 MiB).
     pub checkpoint_interval_bytes: Option<u64>,
 }
 
-#[allow(dead_code)]
 impl CfgQueue {
     pub fn append_writers(&self) -> u16 {
         self.append_writers.unwrap_or(1)
@@ -230,10 +224,6 @@ impl CfgQueue {
 
     pub fn compaction_min_age(&self) -> Duration {
         self.compaction_min_age.unwrap_or(Duration::from_secs(60))
-    }
-
-    pub fn max_concurrent_compactions(&self) -> usize {
-        self.max_concurrent_compactions.unwrap_or(1)
     }
 
     pub fn disk_reserve_bytes(&self) -> u64 {
@@ -389,7 +379,6 @@ mod tests {
         assert_eq!(queue.segment_target_bytes(), 64 * 1024 * 1024);
         assert_eq!(queue.compaction_dead_ratio(), 0.50);
         assert_eq!(queue.compaction_min_age(), Duration::from_secs(60));
-        assert_eq!(queue.max_concurrent_compactions(), 1);
         assert_eq!(queue.disk_reserve_bytes(), 1024 * 1024 * 1024);
         assert_eq!(queue.checkpoint_interval_bytes(), 8 * 1024 * 1024);
     }
@@ -404,7 +393,6 @@ mod tests {
             segment_target_bytes = 16777216
             compaction_dead_ratio = 0.75
             compaction_min_age = "30s"
-            max_concurrent_compactions = 2
             disk_reserve_bytes = 2147483648
             checkpoint_interval_bytes = 4194304
             "#
@@ -416,7 +404,6 @@ mod tests {
         assert_eq!(queue.segment_target_bytes(), 16_777_216);
         assert_eq!(queue.compaction_dead_ratio(), 0.75);
         assert_eq!(queue.compaction_min_age(), Duration::from_secs(30));
-        assert_eq!(queue.max_concurrent_compactions(), 2);
         assert_eq!(queue.disk_reserve_bytes(), 2_147_483_648);
         assert_eq!(queue.checkpoint_interval_bytes(), 4_194_304);
     }

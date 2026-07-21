@@ -30,7 +30,12 @@ pub trait RateGate: Send + Sync {
     fn check(&self, domain: &str) -> Option<Duration>;
 }
 
-/// Allows everything; used when rate limits are disabled.
+/// Allows everything. The server always installs [`LimiterGate`]
+/// (which itself allows everything when rate limits are disabled), so this
+/// exists for tests and embedding.
+///
+/// [`LimiterGate`]: crate::worker::log_worker::LimiterGate
+#[allow(dead_code)]
 pub struct NoRateGate;
 
 impl RateGate for NoRateGate {
@@ -41,10 +46,6 @@ impl RateGate for NoRateGate {
 
 #[derive(Debug, Clone)]
 pub struct DispatcherConfig {
-    /// Admission-time bound, used only for diagnostics here. All scans of
-    /// existing records use the format's absolute [`record::MAX_RECORD_LEN`]
-    /// so a config reduction never orphans previously accepted mail.
-    pub max_record_len: u32,
     /// Discovery backpressure: stop advancing cursors while this many jobs
     /// are tracked in memory. The log holds everything beyond it.
     pub max_tracked_jobs: usize,
@@ -61,7 +62,6 @@ pub struct DispatcherConfig {
 impl Default for DispatcherConfig {
     fn default() -> Self {
         Self {
-            max_record_len: super::record::MAX_RECORD_LEN,
             max_tracked_jobs: 100_000,
             safety_tick: Duration::from_millis(500),
             checkpoint_interval_bytes: 8 * 1024 * 1024,
@@ -157,7 +157,6 @@ type ClaimWaiter = oneshot::Sender<Option<Claim>>;
 pub struct DispatcherHandle {
     claim_tx: mpsc::Sender<ClaimWaiter>,
     shard_dirs: Arc<Vec<PathBuf>>,
-    max_record_len: u32,
 }
 
 impl DispatcherHandle {
@@ -240,12 +239,6 @@ impl ShardRuntime {
         }
         Ok(self.readers.get(&segment).unwrap())
     }
-
-    fn is_tombstoned(&self, segment: u64, id: &MessageId) -> bool {
-        self.tombstones
-            .get(&segment)
-            .is_some_and(|s| s.contains(id))
-    }
 }
 
 fn now_ms() -> i64 {
@@ -302,7 +295,6 @@ impl Dispatcher {
         let handle = DispatcherHandle {
             claim_tx,
             shard_dirs,
-            max_record_len: config.max_record_len,
         };
 
         let mut dispatcher = Dispatcher {

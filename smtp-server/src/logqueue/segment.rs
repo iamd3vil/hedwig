@@ -116,6 +116,9 @@ impl ActiveSegment {
         self.next_ordinal
     }
 
+    /// Only exercised by tests today, but part of the segment's public
+    /// surface alongside `segment()`/`len()`.
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -142,6 +145,8 @@ impl ActiveSegment {
 
     /// Seal this segment: rename `.open` to `.log`. Returns the sealed path
     /// and final committed length. The file is immutable afterwards.
+    /// (Consuming variant of `seal_in_place`; only tests use it today.)
+    #[allow(dead_code)]
     pub fn seal(self) -> Result<(PathBuf, u64), QueueError> {
         self.seal_in_place()
     }
@@ -174,10 +179,6 @@ impl SegmentReader {
         let path = path.into();
         let file = File::open(&path).map_err(|e| QueueError::io(&path, e))?;
         Ok(Self { file, path })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), QueueError> {

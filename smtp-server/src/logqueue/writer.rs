@@ -171,6 +171,8 @@ impl AppendHandle {
         Arc::clone(&self.shards[shard as usize].shared)
     }
 
+    /// Only exercised by tests today.
+    #[allow(dead_code)]
     pub fn shard_count(&self) -> u16 {
         self.shards.len() as u16
     }
