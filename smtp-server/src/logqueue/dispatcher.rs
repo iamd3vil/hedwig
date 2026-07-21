@@ -30,14 +30,13 @@ pub trait RateGate: Send + Sync {
     fn check(&self, domain: &str) -> Option<Duration>;
 }
 
-/// Allows everything. The server always installs [`LimiterGate`]
-/// (which itself allows everything when rate limits are disabled), so this
-/// exists for tests and embedding.
-///
-/// [`LimiterGate`]: crate::worker::log_worker::LimiterGate
-#[allow(dead_code)]
+/// Allows everything. The server always installs `LimiterGate` (which
+/// itself allows everything when rate limits are disabled); tests use this
+/// to bypass gating entirely.
+#[cfg(test)]
 pub struct NoRateGate;
 
+#[cfg(test)]
 impl RateGate for NoRateGate {
     fn check(&self, _domain: &str) -> Option<Duration> {
         None
@@ -1204,6 +1203,17 @@ impl Dispatcher {
         let mut total = 0u64;
         let mut sealed = 0i64;
         for shard in &self.shards {
+            // Discovery lag: committed bytes the cursor has not scanned yet.
+            let mut lag = 0u64;
+            let (cursor_seg, cursor_off) = shard.cursor.unwrap_or((0, 0));
+            for head in shard.shared.chain() {
+                if head.segment > cursor_seg {
+                    lag += head.committed;
+                } else if head.segment == cursor_seg {
+                    lag += head.committed.saturating_sub(cursor_off);
+                }
+            }
+            crate::metrics::logqueue_dispatcher_lag_bytes_set(shard.shard, lag as i64);
             for stats in shard.stats.values() {
                 dead += stats.dead_bytes;
                 if stats.total_bytes > 0 {

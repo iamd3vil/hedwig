@@ -262,7 +262,6 @@ impl CfgQueue {
 impl Cfg {
     /// The resolved queue configuration, defaulted if the `[queue]` section
     /// is absent from the loaded configuration.
-    #[allow(dead_code)]
     pub fn queue(&self) -> CfgQueue {
         self.queue.clone().unwrap_or_default()
     }

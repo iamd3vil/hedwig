@@ -116,9 +116,7 @@ impl ActiveSegment {
         self.next_ordinal
     }
 
-    /// Only exercised by tests today, but part of the segment's public
-    /// surface alongside `segment()`/`len()`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -144,16 +142,9 @@ impl ActiveSegment {
     }
 
     /// Seal this segment: rename `.open` to `.log`. Returns the sealed path
-    /// and final committed length. The file is immutable afterwards.
-    /// (Consuming variant of `seal_in_place`; only tests use it today.)
-    #[allow(dead_code)]
-    pub fn seal(self) -> Result<(PathBuf, u64), QueueError> {
-        self.seal_in_place()
-    }
-
-    /// Non-consuming seal, for callers that must seal the current segment
-    /// before they can construct its replacement. The caller must not
-    /// append afterwards.
+    /// and final committed length. The file is immutable afterwards; the
+    /// caller must not append through this handle again (the writer swaps
+    /// in a fresh segment, or tests drop it).
     pub fn seal_in_place(&self) -> Result<(PathBuf, u64), QueueError> {
         let sealed = self
             .path
@@ -551,7 +542,7 @@ mod tests {
         assert_eq!(body, b"second body");
 
         // Seal, then read through the sealed file.
-        let (sealed_path, len) = seg.seal().unwrap();
+        let (sealed_path, len) = seg.seal_in_place().unwrap();
         assert!(!active_path.exists());
         assert_eq!(len, std::fs::metadata(&sealed_path).unwrap().len());
         let reader = SegmentReader::open(&sealed_path).unwrap();
@@ -572,7 +563,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (seg, offsets) = fill_segment(dir.path(), 1, &[b"a", b"bb", b"ccc", b"dddd"]);
         let committed = seg.len();
-        let (sealed, _) = seg.seal().unwrap();
+        let (sealed, _) = seg.seal_in_place().unwrap();
 
         let reader = SegmentReader::open(&sealed).unwrap();
         let mut seen = Vec::new();
@@ -672,7 +663,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (seg, offsets) = fill_segment(dir.path(), 1, &[b"aaaa", b"bbbb", b"cccc"]);
         let committed = seg.len();
-        let (sealed, _) = seg.seal().unwrap();
+        let (sealed, _) = seg.seal_in_place().unwrap();
 
         // Corrupt the middle record's header region.
         let f = OpenOptions::new().write(true).open(&sealed).unwrap();

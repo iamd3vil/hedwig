@@ -171,8 +171,7 @@ impl AppendHandle {
         Arc::clone(&self.shards[shard as usize].shared)
     }
 
-    /// Only exercised by tests today.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn shard_count(&self) -> u16 {
         self.shards.len() as u16
     }
@@ -218,6 +217,9 @@ impl AppendHandle {
             .acquire_many_owned(permits)
             .await
             .expect("admission semaphore is never closed");
+        crate::metrics::logqueue_pending_append_bytes_set(
+            self.pending_limit - self.pending_bytes.available_permits() as u64,
+        );
 
         let (tx, rx) = oneshot::channel();
         self.shards[shard as usize]

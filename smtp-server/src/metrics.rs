@@ -43,7 +43,7 @@ struct MetricsHandles {
     logqueue_ready_jobs: IntGauge,
     logqueue_deferred_jobs: IntGauge,
     logqueue_inflight_jobs: IntGauge,
-    logqueue_dispatcher_lag_records: IntGaugeVec,
+    logqueue_dispatcher_lag_bytes: IntGaugeVec,
     logqueue_oldest_ready_age_seconds: IntGauge,
     logqueue_oldest_deferred_age_seconds: IntGauge,
     // --- Log queue: storage and GC ---
@@ -202,12 +202,12 @@ static METRICS: Lazy<MetricsHandles> = Lazy::new(|| MetricsHandles {
         "Number of log-queue jobs currently in flight."
     )
     .expect("register logqueue_inflight_jobs gauge"),
-    logqueue_dispatcher_lag_records: register_int_gauge_vec!(
-        "logqueue_dispatcher_lag_records",
-        "Number of records the dispatcher's discovery cursor lags behind the committed head, labelled by shard.",
+    logqueue_dispatcher_lag_bytes: register_int_gauge_vec!(
+        "logqueue_dispatcher_lag_bytes",
+        "Committed log bytes the dispatcher's discovery cursor has not yet scanned, labelled by shard.",
         &["shard"]
     )
-    .expect("register logqueue_dispatcher_lag_records gauge vec"),
+    .expect("register logqueue_dispatcher_lag_bytes gauge vec"),
     logqueue_oldest_ready_age_seconds: register_int_gauge!(
         "logqueue_oldest_ready_age_seconds",
         "Age in seconds of the oldest ready log-queue job."
@@ -448,7 +448,6 @@ fn shard_label(shard: u16) -> String {
 }
 
 /// Records the duration of a log-queue append operation for a shard.
-#[allow(dead_code)]
 pub fn logqueue_append_duration_observe(shard: u16, duration: Duration) {
     METRICS
         .logqueue_append_duration
@@ -457,13 +456,11 @@ pub fn logqueue_append_duration_observe(shard: u16, duration: Duration) {
 }
 
 /// Sets the number of bytes currently pending append to the log queue.
-#[allow(dead_code)]
 pub fn logqueue_pending_append_bytes_set(bytes: u64) {
     METRICS.logqueue_pending_append_bytes.set(bytes as i64);
 }
 
 /// Adds to the count of records appended to a shard.
-#[allow(dead_code)]
 pub fn logqueue_records_appended(shard: u16, count: u64) {
     METRICS
         .logqueue_records_appended
@@ -472,7 +469,6 @@ pub fn logqueue_records_appended(shard: u16, count: u64) {
 }
 
 /// Adds to the count of bytes appended to a shard.
-#[allow(dead_code)]
 pub fn logqueue_bytes_appended(shard: u16, bytes: u64) {
     METRICS
         .logqueue_bytes_appended
@@ -481,13 +477,11 @@ pub fn logqueue_bytes_appended(shard: u16, bytes: u64) {
 }
 
 /// Records a log-queue append error.
-#[allow(dead_code)]
 pub fn logqueue_append_error() {
     METRICS.logqueue_append_errors.inc();
 }
 
 /// Sets the active segment size in bytes for a shard.
-#[allow(dead_code)]
 pub fn logqueue_active_segment_bytes_set(shard: u16, bytes: u64) {
     METRICS
         .logqueue_active_segment_bytes
@@ -496,7 +490,6 @@ pub fn logqueue_active_segment_bytes_set(shard: u16, bytes: u64) {
 }
 
 /// Records a log-queue segment rotation for a shard.
-#[allow(dead_code)]
 pub fn logqueue_segment_rotation(shard: u16) {
     METRICS
         .logqueue_segment_rotations
@@ -505,70 +498,59 @@ pub fn logqueue_segment_rotation(shard: u16) {
 }
 
 /// Sets the number of jobs currently ready for dispatch.
-#[allow(dead_code)]
 pub fn logqueue_ready_jobs_set(count: i64) {
     METRICS.logqueue_ready_jobs.set(count);
 }
 
 /// Sets the number of jobs currently deferred for retry.
-#[allow(dead_code)]
 pub fn logqueue_deferred_jobs_set(count: i64) {
     METRICS.logqueue_deferred_jobs.set(count);
 }
 
 /// Sets the number of jobs currently in flight.
-#[allow(dead_code)]
 pub fn logqueue_inflight_jobs_set(count: i64) {
     METRICS.logqueue_inflight_jobs.set(count);
 }
 
-/// Sets the dispatcher's lag in records behind the committed head for a shard.
-#[allow(dead_code)]
-pub fn logqueue_dispatcher_lag_records_set(shard: u16, lag: i64) {
+/// Sets the dispatcher's discovery lag in bytes for a shard.
+pub fn logqueue_dispatcher_lag_bytes_set(shard: u16, lag: i64) {
     METRICS
-        .logqueue_dispatcher_lag_records
+        .logqueue_dispatcher_lag_bytes
         .with_label_values(&[shard_label(shard).as_str()])
         .set(lag);
 }
 
 /// Sets the age in seconds of the oldest ready job.
-#[allow(dead_code)]
 pub fn logqueue_oldest_ready_age_seconds_set(seconds: i64) {
     METRICS.logqueue_oldest_ready_age_seconds.set(seconds);
 }
 
 /// Sets the age in seconds of the oldest deferred job.
-#[allow(dead_code)]
 pub fn logqueue_oldest_deferred_age_seconds_set(seconds: i64) {
     METRICS.logqueue_oldest_deferred_age_seconds.set(seconds);
 }
 
 /// Sets the total live bytes across all log-queue segments.
-#[allow(dead_code)]
 pub fn logqueue_live_bytes_set(bytes: u64) {
     METRICS.logqueue_live_bytes.set(bytes as i64);
 }
 
 /// Sets the total dead (reclaimable) bytes across all log-queue segments.
-#[allow(dead_code)]
 pub fn logqueue_dead_bytes_set(bytes: u64) {
     METRICS.logqueue_dead_bytes.set(bytes as i64);
 }
 
 /// Sets the number of sealed segments currently on disk.
-#[allow(dead_code)]
 pub fn logqueue_sealed_segments_set(count: i64) {
     METRICS.logqueue_sealed_segments.set(count);
 }
 
 /// Adds to the count of segments deleted after garbage collection.
-#[allow(dead_code)]
 pub fn logqueue_segments_deleted(count: u64) {
     METRICS.logqueue_segments_deleted.inc_by(count);
 }
 
 /// Records that a compaction started.
-#[allow(dead_code)]
 pub fn logqueue_compaction_started() {
     METRICS
         .logqueue_compactions
@@ -577,7 +559,6 @@ pub fn logqueue_compaction_started() {
 }
 
 /// Records that a compaction completed successfully.
-#[allow(dead_code)]
 pub fn logqueue_compaction_completed() {
     METRICS
         .logqueue_compactions
@@ -586,7 +567,6 @@ pub fn logqueue_compaction_completed() {
 }
 
 /// Records that a compaction failed.
-#[allow(dead_code)]
 pub fn logqueue_compaction_failed() {
     METRICS
         .logqueue_compactions
@@ -595,7 +575,6 @@ pub fn logqueue_compaction_failed() {
 }
 
 /// Adds to the count of bytes read by compaction.
-#[allow(dead_code)]
 pub fn logqueue_compaction_bytes_read(bytes: u64) {
     METRICS
         .logqueue_compaction_bytes
@@ -604,7 +583,6 @@ pub fn logqueue_compaction_bytes_read(bytes: u64) {
 }
 
 /// Adds to the count of bytes written by compaction.
-#[allow(dead_code)]
 pub fn logqueue_compaction_bytes_written(bytes: u64) {
     METRICS
         .logqueue_compaction_bytes
@@ -613,13 +591,11 @@ pub fn logqueue_compaction_bytes_written(bytes: u64) {
 }
 
 /// Adds to the count of records relocated during compaction.
-#[allow(dead_code)]
 pub fn logqueue_relocations(count: u64) {
     METRICS.logqueue_relocations.inc_by(count);
 }
 
 /// Sets the free disk space in bytes available to the log queue.
-#[allow(dead_code)]
 pub fn logqueue_disk_free_bytes_set(bytes: u64) {
     METRICS.logqueue_disk_free_bytes.set(bytes as i64);
 }
@@ -818,7 +794,7 @@ mod tests {
         logqueue_ready_jobs_set(5);
         logqueue_deferred_jobs_set(2);
         logqueue_inflight_jobs_set(1);
-        logqueue_dispatcher_lag_records_set(0, 7);
+        logqueue_dispatcher_lag_bytes_set(0, 7);
         logqueue_oldest_ready_age_seconds_set(30);
         logqueue_oldest_deferred_age_seconds_set(60);
 
