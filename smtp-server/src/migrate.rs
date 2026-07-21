@@ -10,7 +10,7 @@
 //!
 //! There is no lock on the legacy filesystem spool itself, so the operator
 //! must ensure no other process (in particular a `hedwig` server still
-//! running against the old `fs`/`sqlite` config) is mutating it while this
+//! running against the old `fs` config) is mutating it while this
 //! runs.
 //!
 //! Restart-safety: re-running after a crash or a failed run is safe. Already

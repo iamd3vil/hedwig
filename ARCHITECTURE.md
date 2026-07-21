@@ -1,8 +1,8 @@
 # Hedwig Architecture
 
 > Covers the server as of the `log-queue` branch. The durable log queue is the
-> default subject; the legacy filesystem/SQLite paths are described where they
-> differ. Design rationale lives in [PLAN.md](PLAN.md); this document describes
+> default subject; the legacy filesystem path is described where it
+> differs. Design rationale lives in [PLAN.md](PLAN.md); this document describes
 > what is actually built and where.
 
 ## 1. The big picture
@@ -47,7 +47,7 @@ flowchart LR
     D -->|persist-then-apply| S0
 ```
 
-With `storage_type = "fs"` or `"sqlite"` the old path is used instead:
+With `storage_type = "fs"` the old path is used instead:
 `storage.put()` → bounded `async_channel` → channel workers → periodic
 deferred-directory scans. That path is untouched and is why the log queue is
 a separate, selectable backend (`storage_type = "log"`).

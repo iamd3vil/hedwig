@@ -55,7 +55,7 @@ throughput — slow or stalled outbound cannot block it.
 - Inspect a live spool with `hedwig queue list|show|stats`; migrate a legacy
   spool with `hedwig queue migrate`.
 
-### Legacy queue (`storage_type = "fs"` or `"sqlite"`)
+### Legacy queue (`storage_type = "fs"`)
 
 ```
 SMTP listeners → callbacks → storage (one file/row per message)
@@ -65,7 +65,7 @@ SMTP listeners → callbacks → storage (one file/row per message)
                           workers consume jobs
 ```
 
-One file (or row) per message plus a bounded channel between acceptance and
+One file per message plus a bounded channel between acceptance and
 workers. Acceptance waits for a channel slot, so sustained slow outbound
 eventually backpressures inbound. Deferred messages are re-queued by a
 periodic scan. This path is unchanged and remains the default.
