@@ -703,6 +703,7 @@ mod tests {
                 sqlite: None,
             },
             filters,
+            queue: None,
         };
 
         let (sender_channel, receiver_channel) = async_channel::unbounded::<worker::Job>();
@@ -1578,6 +1579,7 @@ mod tests {
                 sqlite: None,
             },
             filters: None,
+            queue: None,
         }
     }
 

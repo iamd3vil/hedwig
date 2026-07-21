@@ -101,6 +101,17 @@ bounced_retention = "7d"
 deferred_retention = "2d"
 interval = "1h"
 
+# Optional durable append-log mail queue (not yet wired into the serving path)
+# [queue]
+# append_writers = 1             # Number of shards / concurrent append writers (default: 1)
+# pending_append_bytes = 134217728    # Pending (not-yet-durable) append bytes before backpressure (default: 128 MiB)
+# segment_target_bytes = 67108864     # Target size of each active segment file, per shard (default: 64 MiB)
+# compaction_dead_ratio = 0.50        # Dead-byte fraction in a sealed segment that makes it compaction-eligible (default: 0.50)
+# compaction_min_age = "60s"          # Minimum age of a sealed segment before compaction eligibility (default: 60s)
+# max_concurrent_compactions = 1      # Maximum compactions allowed to run concurrently (default: 1)
+# disk_reserve_bytes = 1073741824     # Minimum free disk space required to accept new mail (default: 1 GiB)
+# checkpoint_interval_bytes = 8388608 # Bytes of appended data between durability checkpoints (default: 8 MiB)
+
 # Optional email filters
 [[filters]]
 type = "from_domain_filter"
