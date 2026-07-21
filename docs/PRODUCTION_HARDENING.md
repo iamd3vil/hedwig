@@ -50,9 +50,9 @@ Production deployments should set `server.helo_hostname` to the public FQDN for 
 
 ## 🟡 Important
 
-### 6. ~~Filesystem storage lacks durability guarantees~~ → Addressed (SQLite backend)
+### 6. ~~Filesystem storage lacks durability guarantees~~ → Addressed (log-queue backend)
 
-**Status:** Addressed via `SqliteStorage` backend (`storage_type = "sqlite"`). SQLite transactions provide atomic writes — no partial writes, no fsync gaps. See `docs/specs/2026-03-29-sqlite-storage-design.md`.
+**Status:** Addressed via the durable log queue (`storage_type = "log"`): checksummed append-only records with torn-tail recovery, and fsync barriers at every destructive boundary. (Previously addressed by the SQLite backend, since removed.) See `ARCHITECTURE.md`.
 
 **Problem:** `fs_storage.rs` uses `tokio::fs::write()` directly — no temp-file + rename, no fsync. On crash or power loss:
 - Partially written files can corrupt the queue
@@ -70,9 +70,9 @@ Production deployments should set `server.helo_hostname` to the public FQDN for 
 
 ---
 
-### 7. ~~Filesystem storage doesn't scale to millions of files~~ → Addressed (SQLite backend)
+### 7. ~~Filesystem storage doesn't scale to millions of files~~ → Addressed (log-queue backend)
 
-**Status:** Addressed via `SqliteStorage` backend. Sharded SQLite databases with indexed queries replace flat directory walks. See `docs/specs/2026-03-29-sqlite-storage-design.md`.
+**Status:** Addressed via the log queue: segmented append-only storage keeps file count proportional to live backlog, with no per-message files and no directory scans. (Previously addressed by the SQLite backend, since removed.)
 
 **Problem:** Flat directories (`queued/`, `deferred/`, `bounced/`) with millions of files means very slow `readdir()` calls. Startup replay and cleanup become directory-walk bound. ext4 performance degrades significantly past ~100K files per directory.
 

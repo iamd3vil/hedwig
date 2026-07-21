@@ -30,6 +30,7 @@ pub struct Cfg {
     pub server: CfgServer,
     pub storage: CfgStorage,
     pub filters: Option<Vec<CfgFilter>>,
+    pub queue: Option<CfgQueue>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -71,18 +72,13 @@ pub struct CfgFilter {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CfgStorage {
+    /// "log" (durable log queue, the default) or "fs" (legacy one file per
+    /// message).
+    #[serde(default = "default_storage_type")]
     pub storage_type: String,
     pub base_path: String,
     #[serde(default)]
     pub cleanup: Option<CfgCleanup>,
-    /// Number of SQLite shards (default: 16). Only used when storage_type = "sqlite".
-    pub num_shards: Option<usize>,
-    /// Max writes per batch (default: 100). Only used when storage_type = "sqlite".
-    pub batch_size: Option<usize>,
-    /// Max wait to fill a batch in ms (default: 5). Only used when storage_type = "sqlite".
-    pub batch_timeout_ms: Option<u64>,
-    /// SQLite-specific tuning. Only used when storage_type = "sqlite".
-    pub sqlite: Option<CfgSqlite>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -177,18 +173,6 @@ pub struct CfgRateLimits {
     pub domain_limits: Option<HashMap<String, u32>>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct CfgSqlite {
-    /// SQLite synchronous mode: OFF | NORMAL | FULL (default: NORMAL)
-    pub synchronous: Option<String>,
-    /// Total cache size in MB across all shards (default: 1600)
-    pub cache_size_mb: Option<i32>,
-    /// SQLite busy timeout in ms (default: 5000)
-    pub busy_timeout_ms: Option<u64>,
-    /// Read connections per shard (default: 10)
-    pub pool_max_connections: Option<u32>,
-}
-
 /// Configuration for on-disk spool cleanup.
 #[derive(Debug, Deserialize, Clone)]
 pub struct CfgCleanup {
@@ -200,7 +184,88 @@ pub struct CfgCleanup {
     pub interval: Duration,
 }
 
+/// Configuration for the durable append-log mail queue (see
+/// docs/plans/2026-07-20-durable-log-queue.md).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct CfgQueue {
+    /// Number of shards / concurrent append writers (default: 1).
+    pub append_writers: Option<u16>,
+    /// Bytes of pending (not-yet-durable) append data allowed before backpressure (default: 128 MiB).
+    pub pending_append_bytes: Option<u64>,
+    /// Target size of each active segment file, per shard (default: 64 MiB).
+    pub segment_target_bytes: Option<u64>,
+    /// Fraction of dead bytes in a sealed segment that makes it eligible for compaction (default: 0.50).
+    pub compaction_dead_ratio: Option<f64>,
+    /// Minimum age of a sealed segment before it is eligible for compaction (default: 60s).
+    #[serde(default, with = "humantime_serde::option")]
+    pub compaction_min_age: Option<Duration>,
+    /// Minimum free disk space required to accept new mail (default: 1 GiB).
+    pub disk_reserve_bytes: Option<u64>,
+    /// Bytes of appended data between durability checkpoints (default: 8 MiB).
+    pub checkpoint_interval_bytes: Option<u64>,
+}
+
+impl CfgQueue {
+    pub fn append_writers(&self) -> u16 {
+        self.append_writers.unwrap_or(1)
+    }
+
+    pub fn pending_append_bytes(&self) -> u64 {
+        self.pending_append_bytes.unwrap_or(128 * 1024 * 1024)
+    }
+
+    pub fn segment_target_bytes(&self) -> u64 {
+        self.segment_target_bytes.unwrap_or(64 * 1024 * 1024)
+    }
+
+    pub fn compaction_dead_ratio(&self) -> f64 {
+        self.compaction_dead_ratio.unwrap_or(0.50)
+    }
+
+    pub fn compaction_min_age(&self) -> Duration {
+        self.compaction_min_age.unwrap_or(Duration::from_secs(60))
+    }
+
+    pub fn disk_reserve_bytes(&self) -> u64 {
+        self.disk_reserve_bytes.unwrap_or(1024 * 1024 * 1024)
+    }
+
+    pub fn checkpoint_interval_bytes(&self) -> u64 {
+        self.checkpoint_interval_bytes.unwrap_or(8 * 1024 * 1024)
+    }
+
+    /// Validate the resolved configuration. `max_message_size` is the
+    /// server's configured (or defaulted) maximum message size in bytes,
+    /// since the segment target must be able to hold one worst-case record.
+    pub fn validate(&self, max_message_size: usize) -> miette::Result<()> {
+        if self.append_writers() < 1 {
+            return Err(miette::miette!("queue.append_writers must be at least 1"));
+        }
+
+        let ratio = self.compaction_dead_ratio();
+        if !(ratio > 0.0 && ratio < 1.0) {
+            return Err(miette::miette!(
+                "queue.compaction_dead_ratio must be between 0.0 and 1.0 (exclusive), got {ratio}"
+            ));
+        }
+
+        crate::logqueue::spool::check_segment_sizing(
+            self.segment_target_bytes(),
+            max_message_size as u64,
+        )
+        .map_err(miette::Report::new)?;
+
+        Ok(())
+    }
+}
+
 impl Cfg {
+    /// The resolved queue configuration, defaulted if the `[queue]` section
+    /// is absent from the loaded configuration.
+    pub fn queue(&self) -> CfgQueue {
+        self.queue.clone().unwrap_or_default()
+    }
+
     pub fn load(cfg_path: &str) -> Result<Self> {
         let path = Path::new(cfg_path);
 
@@ -257,4 +322,112 @@ impl CfgStorage {
 /// Default cleanup interval used when the configuration omits an explicit value (1 hour).
 fn default_cleanup_interval() -> Duration {
     Duration::from_secs(60 * 60)
+}
+
+/// The durable log queue is the default backend.
+fn default_storage_type() -> String {
+    "log".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::FileFormat;
+
+    /// Smallest configuration that satisfies every required (non-`Option`)
+    /// field on `Cfg`, so tests can focus on the `[queue]` section alone.
+    const MINIMAL_CFG: &str = r#"
+        [server]
+        listeners = []
+
+        [storage]
+        storage_type = "fs"
+        base_path = "/tmp/hedwig-test-spool"
+    "#;
+
+    fn parse(toml: &str) -> Cfg {
+        let settings = Config::builder()
+            .add_source(File::from_str(toml, FileFormat::Toml))
+            .build()
+            .expect("build config");
+        settings.try_deserialize().expect("deserialize config")
+    }
+
+    #[test]
+    fn storage_type_defaults_to_log() {
+        let cfg = parse(
+            r#"
+            [server]
+            listeners = []
+
+            [storage]
+            base_path = "/tmp/hedwig-test-spool"
+        "#,
+        );
+        assert_eq!(cfg.storage.storage_type, "log");
+    }
+
+    #[test]
+    fn queue_defaults_when_section_absent() {
+        let cfg = parse(MINIMAL_CFG);
+        assert!(cfg.queue.is_none());
+
+        let queue = cfg.queue();
+        assert_eq!(queue.append_writers(), 1);
+        assert_eq!(queue.pending_append_bytes(), 128 * 1024 * 1024);
+        assert_eq!(queue.segment_target_bytes(), 64 * 1024 * 1024);
+        assert_eq!(queue.compaction_dead_ratio(), 0.50);
+        assert_eq!(queue.compaction_min_age(), Duration::from_secs(60));
+        assert_eq!(queue.disk_reserve_bytes(), 1024 * 1024 * 1024);
+        assert_eq!(queue.checkpoint_interval_bytes(), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn queue_section_parses_from_toml() {
+        let toml = format!(
+            r#"{MINIMAL_CFG}
+            [queue]
+            append_writers = 4
+            pending_append_bytes = 1048576
+            segment_target_bytes = 16777216
+            compaction_dead_ratio = 0.75
+            compaction_min_age = "30s"
+            disk_reserve_bytes = 2147483648
+            checkpoint_interval_bytes = 4194304
+            "#
+        );
+        let cfg = parse(&toml);
+        let queue = cfg.queue.expect("queue section present");
+        assert_eq!(queue.append_writers(), 4);
+        assert_eq!(queue.pending_append_bytes(), 1_048_576);
+        assert_eq!(queue.segment_target_bytes(), 16_777_216);
+        assert_eq!(queue.compaction_dead_ratio(), 0.75);
+        assert_eq!(queue.compaction_min_age(), Duration::from_secs(30));
+        assert_eq!(queue.disk_reserve_bytes(), 2_147_483_648);
+        assert_eq!(queue.checkpoint_interval_bytes(), 4_194_304);
+    }
+
+    #[test]
+    fn validate_accepts_defaults() {
+        let queue = CfgQueue::default();
+        assert!(queue.validate(25 * 1024 * 1024).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_dead_ratio_out_of_range() {
+        let queue = CfgQueue {
+            compaction_dead_ratio: Some(1.5),
+            ..CfgQueue::default()
+        };
+        assert!(queue.validate(25 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_segment_smaller_than_max_message_size() {
+        let queue = CfgQueue {
+            segment_target_bytes: Some(1024),
+            ..CfgQueue::default()
+        };
+        assert!(queue.validate(25 * 1024 * 1024).is_err());
+    }
 }
