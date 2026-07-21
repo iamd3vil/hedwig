@@ -205,6 +205,36 @@ impl RateLimiter {
             RateLimitResult::RateLimited { retry_after: delay }
         }
     }
+
+    /// Non-consuming availability check used by the log-queue dispatcher to
+    /// gate claims: `None` when a token is available (or the domain is not
+    /// limited), otherwise roughly how long until one is. Never blocks — if
+    /// the bucket map is contended it optimistically allows, because the
+    /// worker's consuming check before transmission is authoritative.
+    pub fn peek_sync(&self, domain: &str) -> Option<Duration> {
+        if !self.config.enabled {
+            return None;
+        }
+        let limit = self
+            .config
+            .domain_limits
+            .get(domain)
+            .copied()
+            .or(self.config.default_limit)?;
+        if limit == 0 {
+            return None;
+        }
+        let mut buckets = self.buckets.try_write().ok()?;
+        let bucket = buckets
+            .entry(domain.to_string())
+            .or_insert_with(|| TokenBucket::new(limit, limit));
+        let wait = bucket.time_until_token_available();
+        if wait.is_zero() {
+            None
+        } else {
+            Some(wait)
+        }
+    }
 }
 
 /// Result of a rate limit check.
