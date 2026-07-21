@@ -24,7 +24,9 @@ mod dkim;
 mod health;
 mod logqueue;
 mod metrics;
+mod migrate;
 mod mta_sts;
+mod queue_cli;
 mod storage;
 mod worker;
 
@@ -45,6 +47,8 @@ enum Commands {
     Server,
     /// Generate DKIM keys
     DkimGenerate(dkim::DkimGenerateArgs),
+    /// Inspect a log-queue spool, read-only (see PLAN.md §25)
+    Queue(queue_cli::QueueArgs),
 }
 
 #[tokio::main]
@@ -60,6 +64,7 @@ async fn main() -> Result<()> {
         Commands::DkimGenerate(dkim_args) => {
             dkim::generate_dkim_keys(&args.config, dkim_args).await
         }
+        Commands::Queue(queue_args) => queue_cli::run(queue_args).await,
     }
 }
 
