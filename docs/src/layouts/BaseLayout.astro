@@ -17,6 +17,8 @@ const pathname = Astro.url.pathname;
     <title>{title}</title>
     <meta name="description" content={description} />
     <link rel="icon" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   </head>
   <body>
     <div class="ambient" aria-hidden="true"></div>
@@ -28,5 +30,19 @@ const pathname = Astro.url.pathname;
       </main>
       <Footer />
     </div>
+    <script is:inline>
+      const observer = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (entry.isIntersecting) {
+              entry.target.classList.add("in");
+              observer.unobserve(entry.target);
+            }
+          }
+        },
+        { threshold: 0.12 }
+      );
+      document.querySelectorAll(".fade-up").forEach((el) => observer.observe(el));
+    </script>
   </body>
 </html>

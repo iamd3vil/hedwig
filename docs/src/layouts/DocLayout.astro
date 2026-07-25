@@ -39,7 +39,6 @@ const groups = [
 <BaseLayout title={title} description={description}>
   <div class="container doc-shell">
     <aside class="doc-aside">
-      <h3>Docs</h3>
       {groups.map((group) => (
         <div class="doc-group">
           <div class="doc-group-title">{group.title}</div>
@@ -53,9 +52,9 @@ const groups = [
         </div>
       ))}
       <div class="callout">
-        <strong>Need a fast start?</strong>
+        <h3>Need a fast start?</h3>
         <p>Jump to the Quickstart and get a relay running in minutes.</p>
-        <a href="/quickstart">Open Quickstart</a>
+        <a href="/quickstart">Open Quickstart →</a>
       </div>
     </aside>
     <article class="doc-content">
