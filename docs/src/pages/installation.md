@@ -12,12 +12,12 @@ description: Build and install Hedwig from source.
 
 ## Install from GitHub Releases (recommended)
 
-Latest release: `v0.5.2`
+Latest release: `v0.9.0`
 
 Linux x86_64:
 
 ```bash
-curl -L -o hedwig.zip https://github.com/iamd3vil/hedwig/releases/download/v0.5.2/hedwig-v0.5.2-linux-x86_64.zip
+curl -L -o hedwig.zip https://github.com/iamd3vil/hedwig/releases/download/v0.9.0/hedwig-v0.9.0-linux-x86_64.zip
 unzip hedwig.zip
 chmod +x hedwig
 ```
@@ -25,7 +25,7 @@ chmod +x hedwig
 Checksums are available at:
 
 ```
-https://github.com/iamd3vil/hedwig/releases/download/v0.5.2/checksums.txt
+https://github.com/iamd3vil/hedwig/releases/download/v0.9.0/checksums.txt
 ```
 
 ## Build from source
