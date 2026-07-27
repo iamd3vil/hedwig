@@ -40,6 +40,7 @@ use crate::{
 };
 
 pub mod deferred_worker;
+pub mod log_worker;
 mod pool;
 pub mod rate_limiter;
 
@@ -117,6 +118,12 @@ pub(crate) struct WorkerResources {
 }
 
 impl WorkerResources {
+    /// The process-wide rate limiter (clones share the same buckets); used
+    /// by the log-queue dispatcher's dispatch-time gate.
+    pub(crate) fn rate_limiter(&self) -> RateLimiter {
+        self.rate_limiter.clone()
+    }
+
     pub(crate) fn new(
         mx_cache: Cache<String, MxLookup>,
         pool: Arc<PoolManager>,
@@ -515,22 +522,12 @@ impl Worker {
         Ok(new_email)
     }
 
-    async fn send_email<'b>(
-        &self,
-        to: &[String],
-        email: &'b Message<'b>,
-        body: &str,
-        ctx: &DeliveryContext<'b>,
-    ) -> Result<()> {
+    /// Strip Bcc headers and DKIM-sign (when configured), producing the
+    /// final outbound bytes.
+    fn sign_outbound(&self, body: &[u8]) -> Result<Vec<u8>> {
         let email_bytes_no_bcc =
-            Self::remove_bcc_header(body.as_bytes()).wrap_err("Failed to remove Bcc header")?;
-        let from = email
-            .from()
-            .and_then(|f| f.first())
-            .and_then(|f| f.address())
-            .ok_or_else(|| miette::miette!("Invalid from address"))?;
-        let signed_email;
-        let raw_email = match &self.dkim_signer {
+            Self::remove_bcc_header(body).wrap_err("Failed to remove Bcc header")?;
+        match &self.dkim_signer {
             Some(signer) => {
                 debug!("Signing email with DKIM");
                 let signature = match signer {
@@ -555,22 +552,24 @@ impl Worker {
                         header
                     }
                 };
-
-                signed_email = Self::insert_dkim_signature(&email_bytes_no_bcc, &signature)?;
-                signed_email.as_slice()
+                Self::insert_dkim_signature(&email_bytes_no_bcc, &signature)
             }
-            None => email_bytes_no_bcc.as_slice(),
-        };
+            None => Ok(email_bytes_no_bcc),
+        }
+    }
 
+    /// The union of envelope recipients and any Cc/Bcc addresses parsed out
+    /// of the message, deduplicated (historical behavior of `send_email`).
+    fn merge_recipients(to: &[String], email: &Message<'_>) -> Vec<String> {
         let to_iter = to.iter().map(|s| s.to_owned());
 
         let cc_iter = email
             .cc()
             .into_iter()
             .flat_map(|list| list.as_list())
-            .flatten() // Iterator yielding &Address for all addresses in the list(s)
-            .filter_map(|cc| cc.address()) // Iterator yielding &str
-            .map(|addr_str| addr_str.to_owned()); // Iterator
+            .flatten()
+            .filter_map(|cc| cc.address())
+            .map(|addr_str| addr_str.to_owned());
 
         let bcc_iter = email
             .bcc()
@@ -581,28 +580,400 @@ impl Worker {
             .map(|addr_str| addr_str.to_owned());
 
         let all_recipients: Vec<String> = to_iter.chain(cc_iter).chain(bcc_iter).collect();
-
-        // Remove any duplicates.
-        let all_recipients: Vec<String> = all_recipients
+        all_recipients
             .into_iter()
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
-            .collect();
+            .collect()
+    }
+
+    /// Attempt delivery of one recipient through its MX servers, applying
+    /// MTA-STS policy. Rate limiting and outcome logging stay with the
+    /// caller. `Err` is reserved for infrastructure failures (MX lookup,
+    /// transport pool); SMTP-level failures return `Failed` with the
+    /// classification made while the typed transport error is live.
+    async fn deliver_recipient(
+        &self,
+        raw_email: &[u8],
+        from: &str,
+        to_trimmed: &str,
+        parsed_email_id: &EmailAddress,
+    ) -> Result<RecipientDelivery> {
+        let domain = parsed_email_id.get_domain();
+        debug!(?parsed_email_id, "Looking up MX records");
+
+        let mx_lookup = self
+            .lookup_mx(domain)
+            .await
+            .wrap_err("looking up mx record")?;
+        if mx_lookup.iter().count() == 0 {
+            warn!(domain = ?domain, "No MX records found");
+            metrics::record_send_failure(domain);
+            return Ok(RecipientDelivery::Skipped("no MX records"));
+        }
+
+        // Sort mx according to preference in ascending order.
+        let mut mx = mx_lookup.iter().collect::<Vec<&MX>>();
+        // Shuffle first so the stable sort randomizes equal-preference MXes.
+        mx.shuffle(&mut rand::thread_rng());
+        mx.sort_by_key(|a| a.preference());
+
+        // Look up MTA-STS policy for the recipient domain.
+        let mta_sts_policy = self.mta_sts.get_policy(domain).await;
+        if let Some(ref policy) = mta_sts_policy {
+            debug!(domain = ?domain, mode = %policy.mode, "MTA-STS policy found");
+        }
+
+        let from_address: Address = from
+            .parse()
+            .map_err(|e| miette::miette!("invalid from address {from:?}: {e}"))?;
+        let to_address: Address = to_trimmed
+            .parse()
+            .map_err(|e| miette::miette!("invalid recipient address {to_trimmed:?}: {e}"))?;
+        let envelope = Envelope::new(Some(from_address), vec![to_address]).into_diagnostic()?;
+
+        // Track the most recent per-MX failure as a typed error. We classify
+        // here — while the live `lettre::transport::smtp::Error` is still
+        // accessible — rather than wrapping it in a `miette::Report` and
+        // trying to downcast later (which doesn't work; see the unit test
+        // `into_diagnostic_makes_original_error_unreachable`).
+        let mut last_error: Option<ClassifiedSendError> = None;
+        for mx_record in mx.iter() {
+            debug!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
+
+            let exchange = mx_record.exchange().to_string();
+
+            // MTA-STS: validate MX hostname against policy.
+            if let Some(ref policy) = mta_sts_policy {
+                let mx_valid = mta_sts_policy::mx_matches_policy(&exchange, policy);
+
+                match policy.mode {
+                    PolicyMode::Enforce => {
+                        if !mx_valid {
+                            warn!(
+                                domain = ?domain,
+                                mx = %exchange,
+                                "MTA-STS enforce: MX host does not match policy, skipping"
+                            );
+                            metrics::mta_sts_enforcement("enforce", "fail");
+                            continue;
+                        }
+                        metrics::mta_sts_enforcement("enforce", "pass");
+                    }
+                    PolicyMode::Testing => {
+                        if !mx_valid {
+                            warn!(
+                                domain = ?domain,
+                                mx = %exchange,
+                                "MTA-STS testing: MX host does not match policy (would be rejected in enforce mode)"
+                            );
+                            metrics::mta_sts_enforcement("testing", "fail");
+                        } else {
+                            metrics::mta_sts_enforcement("testing", "pass");
+                        }
+                    }
+                    PolicyMode::None => {}
+                }
+            }
+            let transport: AsyncSmtpTransport<Tokio1Executor> = self.pool.get(&exchange).await?;
+
+            let send_start = Instant::now();
+            match transport.send_raw(&envelope, raw_email).await {
+                Ok(response) => {
+                    metrics::record_send_success(domain, send_start.elapsed());
+                    let smtp_response = response.message().collect::<Vec<_>>().join(" ");
+                    return Ok(RecipientDelivery::Delivered {
+                        smtp_response: format!("{} {}", response.code(), smtp_response),
+                        exchange,
+                    });
+                }
+                Err(err) => {
+                    metrics::record_send_failure(domain);
+                    // Classify here, where `err` still has its concrete
+                    // lettre type. Build the response string up-front so
+                    // the wrapping for `Report` carries no live error.
+                    let outcome = classify_smtp_outcome(
+                        err.is_transient(),
+                        err.is_permanent(),
+                        err.status().map(u16::from),
+                    );
+                    let smtp_response = format!("sending raw message: {}", err);
+                    warn!(
+                        mx = %exchange,
+                        outcome = ?outcome,
+                        error = %smtp_response,
+                        "MX delivery attempt failed"
+                    );
+                    last_error = Some(ClassifiedSendError {
+                        outcome,
+                        smtp_response,
+                    });
+                }
+            }
+        }
+
+        // If MTA-STS enforce mode caused all MXes to be skipped by policy
+        // (no transport-level errors), report that specifically so callers
+        // defer instead of bouncing.
+        if let Some(ref policy) = mta_sts_policy {
+            if policy.mode == PolicyMode::Enforce && last_error.is_none() {
+                return Ok(RecipientDelivery::MtaStsBlocked);
+            }
+        }
+        if let Some(classified) = last_error {
+            return Ok(RecipientDelivery::Failed(classified));
+        }
+        metrics::record_send_failure(domain);
+        Ok(RecipientDelivery::Failed(ClassifiedSendError {
+            outcome: SendOutcome::Bounce,
+            smtp_response: "failed to send email through any MX server".to_string(),
+        }))
+    }
+
+    /// Deliver one log-queue claim and translate the result into a
+    /// [`JobOutcome`]. This is the log backend's counterpart to
+    /// `process_job`: recipients are tracked individually so a retry only
+    /// re-sends to those that have not accepted the message, and a
+    /// rate-limit loss is reported instead of slept on — the worker slot is
+    /// never parked.
+    pub(crate) async fn process_claim(
+        &self,
+        job: &crate::logqueue::dispatcher::DeliveryJob,
+        body: &[u8],
+    ) -> crate::logqueue::dispatcher::JobOutcome {
+        use crate::logqueue::dispatcher::JobOutcome;
+
+        let _job_guard = metrics::job_processing_guard();
+        let queued_at = chrono::DateTime::from_timestamp_millis(job.enqueue_ms);
+        let log_delivery = |status: &str, recipient: &str, smtp_response: &str, attempt: u32| {
+            let logged_at = Utc::now();
+            info!(
+                job_id = %job.message_id,
+                from_email = %strip_brackets(&job.sender),
+                recipient = %strip_brackets(recipient),
+                status = %status,
+                smtp_response = %smtp_response,
+                queued_at = %fmt_option_rfc3339(queued_at),
+                logged_at = %fmt_rfc3339(logged_at),
+                delay_ms = %fmt_option(calc_delay_ms(queued_at, logged_at)),
+                attempt = %attempt,
+                "email delivery"
+            );
+        };
+
+        let Some(msg) = MessageParser::default().parse(body) else {
+            error!(msg_id = %job.message_id, "Failed to parse email body");
+            return self
+                .bounce_claim(job, body, "unparseable message body".into())
+                .await;
+        };
+
+        if self.disable_outbound {
+            log_delivery("dropped", &job.recipients.join(","), "outbound disabled", job.attempts);
+            metrics::email_dropped();
+            return JobOutcome::Delivered {
+                response: "outbound disabled".into(),
+            };
+        }
+
+        // First attempt widens to Cc/Bcc like the legacy path; retries use
+        // exactly the persisted remaining set.
+        let recipients = if job.attempts == 0 {
+            Self::merge_recipients(&job.recipients, &msg)
+        } else {
+            job.recipients.clone()
+        };
+
+        let raw_email = match self.sign_outbound(body) {
+            Ok(raw) => raw,
+            Err(e) => {
+                return self
+                    .bounce_claim(job, body, format!("preparing outbound message: {e:#}"))
+                    .await;
+            }
+        };
+        let Some(from) = msg
+            .from()
+            .and_then(|f| f.first())
+            .and_then(|f| f.address())
+        else {
+            return self
+                .bounce_claim(job, body, "invalid from address".into())
+                .await;
+        };
+
+        let mut remaining: Vec<String> = Vec::new();
+        let mut rate_limited_wait: Option<Duration> = None;
+        let mut attempted = false;
+        let mut last_defer_error: Option<String> = None;
+        let mut bounce_reason: Option<String> = None;
+        let mut delivered_any = false;
+
+        for to in &recipients {
+            let to_trimmed = to.trim_matches(|c| c == '<' || c == '>');
+            let Some(parsed_email_id) = EmailAddress::parse(to_trimmed, None) else {
+                continue; // dropped, matching legacy behavior
+            };
+            let domain = parsed_email_id.get_domain();
+
+            match self.rate_limiter.check_rate_limit(domain).await {
+                RateLimitResult::Allowed => {}
+                RateLimitResult::RateLimited { retry_after } => {
+                    remaining.push(to.clone());
+                    rate_limited_wait =
+                        Some(rate_limited_wait.map_or(retry_after, |w: Duration| w.max(retry_after)));
+                    continue;
+                }
+            }
+
+            match self
+                .deliver_recipient(&raw_email, from, to_trimmed, &parsed_email_id)
+                .await
+            {
+                Ok(RecipientDelivery::Delivered { smtp_response, .. }) => {
+                    attempted = true;
+                    delivered_any = true;
+                    log_delivery("delivered", to_trimmed, &smtp_response, job.attempts);
+                }
+                Ok(RecipientDelivery::Skipped(reason)) => {
+                    attempted = true;
+                    debug!(to = ?to, reason, "recipient skipped");
+                }
+                Ok(RecipientDelivery::MtaStsBlocked) => {
+                    attempted = true;
+                    remaining.push(to.clone());
+                    last_defer_error = Some("MTA-STS enforcement failure".into());
+                    log_delivery(
+                        "deferred",
+                        to_trimmed,
+                        "MTA-STS enforcement failure",
+                        job.attempts + 1,
+                    );
+                }
+                Ok(RecipientDelivery::Failed(classified)) => {
+                    attempted = true;
+                    match classified.outcome {
+                        SendOutcome::Defer => {
+                            remaining.push(to.clone());
+                            log_delivery(
+                                "deferred",
+                                to_trimmed,
+                                &classified.smtp_response,
+                                job.attempts + 1,
+                            );
+                            last_defer_error = Some(classified.smtp_response);
+                        }
+                        SendOutcome::Bounce => {
+                            log_delivery(
+                                "bounced",
+                                to_trimmed,
+                                &classified.smtp_response,
+                                job.attempts,
+                            );
+                            bounce_reason = Some(classified.smtp_response);
+                        }
+                    }
+                }
+                Err(e) => {
+                    attempted = true;
+                    let response = format!("{e:#}");
+                    log_delivery("bounced", to_trimmed, &response, job.attempts);
+                    bounce_reason = Some(response);
+                }
+            }
+        }
+
+        if !remaining.is_empty() {
+            if !attempted {
+                if let Some(retry_after) = rate_limited_wait {
+                    // Pure rate-limit loss: not an attempt.
+                    return JobOutcome::RateLimited { retry_after };
+                }
+            }
+            let delay = std::cmp::min(
+                self.initial_delay * 2_u32.pow(job.attempts.min(24)),
+                self.max_delay,
+            );
+            metrics::email_deferred();
+            return JobOutcome::Deferred {
+                next_attempt_ms: Utc::now().timestamp_millis() + delay.as_millis() as i64,
+                remaining_recipients: remaining,
+                error: last_defer_error.unwrap_or_else(|| "rate limited".into()),
+            };
+        }
+
+        match bounce_reason {
+            Some(reason) if !delivered_any => self.bounce_claim(job, body, reason).await,
+            _ => {
+                metrics::email_sent();
+                JobOutcome::Delivered {
+                    response: "delivered".into(),
+                }
+            }
+        }
+    }
+
+    /// Terminal bounce for a claim that exhausted its retry budget.
+    pub(crate) async fn bounce_claim_for_retry_limit(
+        &self,
+        job: &crate::logqueue::dispatcher::DeliveryJob,
+        body: &[u8],
+    ) -> crate::logqueue::dispatcher::JobOutcome {
+        self.bounce_claim(job, body, "maximum retry attempts exceeded".into())
+            .await
+    }
+
+    /// Archive a bounced message to the bounce store (retention handled by
+    /// the storage cleanup task), then report the terminal outcome. Archive
+    /// failure is logged but never blocks the bounce: at-least-once applies
+    /// to delivery, not to the archive copy.
+    async fn bounce_claim(
+        &self,
+        job: &crate::logqueue::dispatcher::DeliveryJob,
+        body: &[u8],
+        reason: String,
+    ) -> crate::logqueue::dispatcher::JobOutcome {
+        let archived = StoredEmail {
+            message_id: job.message_id.to_string(),
+            from: job.sender.clone(),
+            to: job.recipients.clone(),
+            body: String::from_utf8_lossy(body).into_owned(),
+            queued_at: chrono::DateTime::from_timestamp_millis(job.enqueue_ms),
+        };
+        if let Err(e) = self.storage.put(archived, Status::Bounced).await {
+            error!(msg_id = %job.message_id, error = %e, "failed to archive bounced message");
+        }
+        metrics::email_bounced();
+        crate::logqueue::dispatcher::JobOutcome::Bounced { reason }
+    }
+
+    async fn send_email<'b>(
+        &self,
+        to: &[String],
+        email: &'b Message<'b>,
+        body: &str,
+        ctx: &DeliveryContext<'b>,
+    ) -> Result<()> {
+        let raw_email = self.sign_outbound(body.as_bytes())?;
+        let from = email
+            .from()
+            .and_then(|f| f.first())
+            .and_then(|f| f.address())
+            .ok_or_else(|| miette::miette!("Invalid from address"))?;
+
+        let all_recipients = Self::merge_recipients(to, email);
 
         // Parse to address for each.
         for to in all_recipients.iter() {
             info!(?to, ?from, "Attempting to send email");
             // Strip `<` and `>` from email address.
-            let to = to.trim_matches(|c| c == '<' || c == '>');
-            let parsed_email_id = EmailAddress::parse(to, None);
-            if parsed_email_id.is_none() {
+            let to_trimmed = to.trim_matches(|c| c == '<' || c == '>');
+            let Some(parsed_email_id) = EmailAddress::parse(to_trimmed, None) else {
                 continue;
-            }
-
-            let parsed_email_id = parsed_email_id.unwrap();
+            };
+            let domain = parsed_email_id.get_domain();
 
             // Check rate limit for this domain
-            let domain = parsed_email_id.get_domain();
             match self.rate_limiter.check_rate_limit(domain).await {
                 RateLimitResult::Allowed => {
                     debug!(domain = ?domain, "Rate limit check passed");
@@ -617,177 +988,49 @@ impl Worker {
                 }
             }
 
-            debug!(?parsed_email_id, "Looking up MX records");
-
-            // Resolve MX record for domain.
-            let mx_lookup = self
-                .lookup_mx(parsed_email_id.get_domain())
-                .await
-                .wrap_err("looking up mx record")?;
-            if mx_lookup.iter().count() == 0 {
-                warn!(domain = ?parsed_email_id.get_domain(), "No MX records found");
-                metrics::record_send_failure(parsed_email_id.get_domain());
-                continue;
-            }
-
-            // Sort mx according to preference in ascending order.
-            let mut mx = mx_lookup.iter().collect::<Vec<&MX>>();
-
-            // Shuffle first so the stable sort randomizes equal-preference MXes.
-            mx.shuffle(&mut rand::thread_rng());
-            mx.sort_by_key(|a| a.preference());
-
-            // Look up MTA-STS policy for the recipient domain.
-            let mta_sts_policy = self.mta_sts.get_policy(domain).await;
-            if let Some(ref policy) = mta_sts_policy {
-                debug!(domain = ?domain, mode = %policy.mode, "MTA-STS policy found");
-            }
-
-            let from: String = email
-                .from()
-                .unwrap()
-                .first()
-                .unwrap()
-                .address()
-                .as_ref()
-                .unwrap()
-                .to_string();
-
-            let from_address: Address = from.as_str().parse().unwrap();
-            let to_address: Address = to.to_string().parse().unwrap();
-
-            let envelope = Envelope::new(Some(from_address), vec![to_address]).unwrap();
-
-            // Try each MX record in order of preference
-            let mut success = false;
-            // Track the most recent per-MX failure as a typed error. We classify
-            // here — while the live `lettre::transport::smtp::Error` is still
-            // accessible — rather than wrapping it in a `miette::Report` and
-            // trying to downcast later (which doesn't work; see the unit test
-            // `into_diagnostic_makes_original_error_unreachable`).
-            let mut last_error: Option<ClassifiedSendError> = None;
-            for mx_record in mx.iter() {
-                debug!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
-
-                let exchange = mx_record.exchange().to_string();
-
-                // MTA-STS: validate MX hostname against policy.
-                if let Some(ref policy) = mta_sts_policy {
-                    let mx_valid = mta_sts_policy::mx_matches_policy(&exchange, policy);
-
-                    match policy.mode {
-                        PolicyMode::Enforce => {
-                            if !mx_valid {
-                                warn!(
-                                    domain = ?domain,
-                                    mx = %exchange,
-                                    "MTA-STS enforce: MX host does not match policy, skipping"
-                                );
-                                metrics::mta_sts_enforcement("enforce", "fail");
-                                continue;
-                            }
-                            metrics::mta_sts_enforcement("enforce", "pass");
-                        }
-                        PolicyMode::Testing => {
-                            if !mx_valid {
-                                warn!(
-                                    domain = ?domain,
-                                    mx = %exchange,
-                                    "MTA-STS testing: MX host does not match policy (would be rejected in enforce mode)"
-                                );
-                                metrics::mta_sts_enforcement("testing", "fail");
-                            } else {
-                                metrics::mta_sts_enforcement("testing", "pass");
-                            }
-                        }
-                        PolicyMode::None => {}
-                    }
+            match self
+                .deliver_recipient(&raw_email, from, to_trimmed, &parsed_email_id)
+                .await?
+            {
+                RecipientDelivery::Delivered {
+                    smtp_response,
+                    exchange,
+                } => {
+                    let logged_at = Utc::now();
+                    let delay_ms = calc_delay_ms(ctx.stored_email.queued_at, logged_at);
+                    info!(
+                        job_id = %ctx.job_id,
+                        from_email = %strip_brackets(&ctx.stored_email.from),
+                        recipient = %strip_brackets(to_trimmed),
+                        subject = %fmt_option(ctx.subject),
+                        status = "delivered",
+                        smtp_response = %smtp_response,
+                        dest_ip = %exchange,
+                        queued_at = %fmt_option_rfc3339(ctx.stored_email.queued_at),
+                        logged_at = %fmt_rfc3339(logged_at),
+                        delay_ms = %fmt_option(delay_ms),
+                        attempt = %ctx.attempt,
+                        "email delivery"
+                    );
                 }
-                let transport: AsyncSmtpTransport<Tokio1Executor> =
-                    self.pool.get(&exchange).await?;
-
-                let send_start = Instant::now();
-                match transport.send_raw(&envelope, raw_email).await {
-                    Ok(response) => {
-                        metrics::record_send_success(
-                            parsed_email_id.get_domain(),
-                            send_start.elapsed(),
-                        );
-                        let smtp_response = response.message().collect::<Vec<_>>().join(" ");
-                        let logged_at = Utc::now();
-                        let delay_ms = calc_delay_ms(ctx.stored_email.queued_at, logged_at);
-                        info!(
-                            job_id = %ctx.job_id,
-                            from_email = %strip_brackets(&ctx.stored_email.from),
-                            recipient = %strip_brackets(to),
-                            subject = %fmt_option(ctx.subject),
-                            status = "delivered",
-                            smtp_response = %format!("{} {}", response.code(), smtp_response),
-                            dest_ip = %exchange,
-                            queued_at = %fmt_option_rfc3339(ctx.stored_email.queued_at),
-                            logged_at = %fmt_rfc3339(logged_at),
-                            delay_ms = %fmt_option(delay_ms),
-                            attempt = %ctx.attempt,
-                            "email delivery"
-                        );
-                        success = true;
-                        break;
-                    }
-                    Err(err) => {
-                        metrics::record_send_failure(parsed_email_id.get_domain());
-                        // Classify here, where `err` still has its concrete
-                        // lettre type. Build the response string up-front so
-                        // the wrapping for `Report` carries no live error.
-                        let outcome = classify_smtp_outcome(
-                            err.is_transient(),
-                            err.is_permanent(),
-                            err.status().map(u16::from),
-                        );
-                        let smtp_response = format!("sending raw message: {}", err);
-                        warn!(
-                            mx = %exchange,
-                            outcome = ?outcome,
-                            error = %smtp_response,
-                            "MX delivery attempt failed"
-                        );
-                        last_error = Some(ClassifiedSendError {
-                            outcome,
-                            smtp_response,
-                        });
-                    }
+                RecipientDelivery::Skipped(reason) => {
+                    debug!(to = ?to, reason, "recipient skipped");
                 }
-            }
-
-            if !success {
-                // If MTA-STS enforce mode caused all MXes to be skipped by policy
-                // (no transport-level errors), return a specific error so process_job
-                // defers instead of bouncing. If there was a transport error (last_error
-                // is Some), that means at least one MX passed policy validation but
-                // failed at SMTP level — use the normal error path.
-                if let Some(ref policy) = mta_sts_policy {
-                    if policy.mode == PolicyMode::Enforce && last_error.is_none() {
-                        error!(to = ?to, "MTA-STS enforce: all MX hosts failed policy validation");
-                        metrics::record_send_failure(parsed_email_id.get_domain());
-                        // Use `Report::new` (NOT `into_diagnostic`) so the typed
-                        // error survives downcast in `process_job`. Going through
-                        // `into_diagnostic` wraps it in miette's pub(crate)
-                        // DiagnosticError, making the type unreachable from the
-                        // caller — which would silently fall through to the
-                        // bounce arm, defeating the always-defer policy. See
-                        // `mta_sts_error_via_into_diagnostic_is_unreachable`.
-                        return Err(miette::Report::new(MtaStsEnforcementError {
-                            domain: domain.to_string(),
-                        }));
-                    }
+                RecipientDelivery::MtaStsBlocked => {
+                    error!(to = ?to, "MTA-STS enforce: all MX hosts failed policy validation");
+                    metrics::record_send_failure(domain);
+                    // Use `Report::new` (NOT `into_diagnostic`) so the typed
+                    // error survives downcast in `process_job`.
+                    return Err(miette::Report::new(MtaStsEnforcementError {
+                        domain: domain.to_string(),
+                    }));
                 }
-                error!(to = ?to, "Failed to send email through any MX server");
-                if let Some(classified) = last_error {
+                RecipientDelivery::Failed(classified) => {
+                    error!(to = ?to, "Failed to send email through any MX server");
                     // Use `Report::new` (NOT `into_diagnostic`) so the typed
                     // error survives downcast in `process_job`.
                     return Err(miette::Report::new(classified));
                 }
-                metrics::record_send_failure(parsed_email_id.get_domain());
-                bail!("failed to send email through any MX server");
             }
         }
         Ok(())
@@ -824,6 +1067,21 @@ impl Worker {
 
         ((400..500).contains(&code)) || ADDITIONAL_RETRYABLE_CODES.contains(&code)
     }
+}
+
+/// Result of attempting one recipient through its MX servers.
+pub(crate) enum RecipientDelivery {
+    Delivered {
+        /// Pre-formatted "code message" SMTP response.
+        smtp_response: String,
+        exchange: String,
+    },
+    /// Historically-silent skips: unparseable address, no MX records.
+    Skipped(&'static str),
+    /// MTA-STS enforce mode rejected every MX host.
+    MtaStsBlocked,
+    /// Transport-level failure through every usable MX.
+    Failed(ClassifiedSendError),
 }
 
 /// What `process_job` should do with a failed delivery attempt.

@@ -6,7 +6,7 @@ use mta_sts::refresher;
 use rustls::pki_types::CertificateDer;
 use smtp::{MaybeTlsStream, SmtpServer, SmtpStream};
 use std::sync::Arc;
-use storage::{fs_storage::FileSystemStorage, sqlite_storage::SqliteStorage, Status, Storage};
+use storage::{fs_storage::FileSystemStorage, Status, Storage};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -22,8 +22,11 @@ mod callbacks;
 mod config;
 mod dkim;
 mod health;
+mod logqueue;
 mod metrics;
+mod migrate;
 mod mta_sts;
+mod queue_cli;
 mod storage;
 mod worker;
 
@@ -44,6 +47,8 @@ enum Commands {
     Server,
     /// Generate DKIM keys
     DkimGenerate(dkim::DkimGenerateArgs),
+    /// Inspect a log-queue spool, read-only (see docs/plans/2026-07-20-durable-log-queue.md §25)
+    Queue(queue_cli::QueueArgs),
 }
 
 #[tokio::main]
@@ -59,6 +64,7 @@ async fn main() -> Result<()> {
         Commands::DkimGenerate(dkim_args) => {
             dkim::generate_dkim_keys(&args.config, dkim_args).await
         }
+        Commands::Queue(queue_args) => queue_cli::run(queue_args).await,
     }
 }
 
@@ -122,24 +128,46 @@ async fn run_server(config_path: &str) -> Result<()> {
     // Track JoinHandles for background tasks so we can await them during shutdown.
     let mut background_tasks: Vec<JoinHandle<()>> = Vec::new();
 
-    // Initialize storage.
-    let storage = get_storage_type(&cfg.storage)
-        .await
-        .wrap_err("error getting storage type")?;
+    // Initialize storage. The "log" backend replaces queue storage with the
+    // durable append log; a filesystem store remains as the bounced-message
+    // archive (with the usual retention cleanup).
+    let is_log_backend = cfg.storage.storage_type == "log";
+    if is_log_backend {
+        warn_about_unmigrated_legacy_spool(&cfg.storage.base_path);
+    }
+    let storage: Arc<dyn Storage> = if is_log_backend {
+        Arc::new(
+            FileSystemStorage::new(cfg.storage.base_path.clone())
+                .await
+                .wrap_err("error creating bounce archive storage")?,
+        )
+    } else {
+        get_storage_type(&cfg.storage)
+            .await
+            .wrap_err("error getting storage type")?
+    };
 
     // Capture the current queue depth before workers start consuming jobs.
+    // The log backend recovers its backlog through the dispatcher instead of
+    // feeding it through the bounded channel.
     let mut queued_jobs = Vec::new();
-    {
+    if !is_log_backend {
         let mut stream = storage.list(Status::Queued);
         while let Some(email) = stream.next().await {
             let email = email?;
             queued_jobs.push(email.message_id.clone());
         }
+        metrics::queue_depth_set(queued_jobs.len());
     }
-    metrics::queue_depth_set(queued_jobs.len());
 
     // Spawn periodic cleanup for any storage retention policy that has been configured.
-    let cleanup_config = cfg.storage.cleanup_config();
+    let mut cleanup_config = cfg.storage.cleanup_config();
+    if is_log_backend {
+        // On the log backend the fs store is only the bounce archive. Its
+        // deferred/ directory, if present, is an unmigrated legacy spool —
+        // retention cleanup must never delete live legacy mail.
+        cleanup_config.deferred_retention = None;
+    }
     if cleanup_config.is_enabled() {
         info!(
             deferred_ttl_seconds = cleanup_config
@@ -221,16 +249,117 @@ async fn run_server(config_path: &str) -> Result<()> {
 
     info!("Auth enabled: {}", auth_enabled);
 
-    let (callbacks, worker_handles, mta_sts_resolver) = callbacks::Callbacks::new(
-        Arc::clone(&storage),
-        sender_channel.clone(),
-        receiver_channel.clone(),
-        cfg.clone(),
-    )
-    .await
-    .wrap_err("failed to initialize SMTP callbacks and workers")?;
-
     let max_message_size = cfg.server.max_message_size.unwrap_or(25 * 1024 * 1024);
+
+    // Log-queue runtime pieces that outlive setup. The Spool must live
+    // until exit: dropping it releases the exclusive spool lock.
+    let mut log_runtime: Option<(logqueue::spool::Spool, logqueue::writer::LogWriters, JoinHandle<()>)> = None;
+
+    let (callbacks, worker_handles, mta_sts_resolver) = if is_log_backend {
+        let qcfg = cfg.queue();
+        qcfg.validate(max_message_size)
+            .wrap_err("invalid [queue] configuration")?;
+
+        let spool_root = std::path::Path::new(&cfg.storage.base_path).join("spool");
+        let spool = logqueue::spool::Spool::open(&spool_root, qcfg.append_writers())
+            .map_err(miette::Report::new)
+            .wrap_err("error opening log-queue spool")?;
+        let max_record_len = (max_message_size as u64
+            + logqueue::spool::ENVELOPE_ALLOWANCE
+            + logqueue::record::FIXED_HEADER_LEN as u64) as u32;
+        let writers = logqueue::writer::LogWriters::start(
+            &spool,
+            logqueue::writer::WriterConfig {
+                segment_target_bytes: qcfg.segment_target_bytes(),
+                max_record_len,
+                pending_append_bytes: qcfg.pending_append_bytes(),
+            },
+        )
+        .map_err(miette::Report::new)
+        .wrap_err("error starting append writers")?;
+
+        let mut shard_inits = Vec::new();
+        for shard_dir in spool.shards() {
+            let (store, recovered) = logqueue::state::ShardStateStore::recover(
+                shard_dir.path(),
+                shard_dir.shard(),
+            )
+            .map_err(miette::Report::new)
+            .wrap_err_with(|| format!("error recovering shard {}", shard_dir.shard()))?;
+            shard_inits.push(logqueue::dispatcher::ShardInit {
+                dir: shard_dir.path().to_path_buf(),
+                shared: writers.handle().shard_shared(shard_dir.shard()),
+                store,
+                recovered,
+            });
+        }
+
+        let tap = callbacks::LogQueueTap {
+            append: writers.handle(),
+            spool_root,
+            disk_reserve_bytes: qcfg.disk_reserve_bytes(),
+        };
+        let (callbacks, worker_resources, mta_sts_resolver) =
+            callbacks::Callbacks::new_log(Arc::clone(&storage), tap, cfg.clone())
+                .await
+                .wrap_err("failed to initialize SMTP callbacks (log backend)")?;
+
+        let gate = Arc::new(worker::log_worker::LimiterGate(
+            worker_resources.rate_limiter(),
+        ));
+        let dispatcher_config = logqueue::dispatcher::DispatcherConfig {
+            checkpoint_interval_bytes: qcfg.checkpoint_interval_bytes(),
+            compaction_dead_ratio: qcfg.compaction_dead_ratio(),
+            compaction_min_age: qcfg.compaction_min_age(),
+            ..Default::default()
+        };
+        let (dispatcher_handle, dispatcher_task) = logqueue::dispatcher::Dispatcher::start(
+            shard_inits,
+            writers.handle(),
+            gate,
+            dispatcher_config,
+            shutdown_token.clone(),
+        );
+
+        let worker_count = cfg.server.workers.unwrap_or(1).max(1);
+        let max_retries = cfg.server.max_retries.unwrap_or(5);
+        let mut handles = Vec::new();
+        for worker_index in 0..worker_count {
+            let delivery_worker = worker::Worker::new(
+                receiver_channel.clone(), // inert on the log path
+                Arc::clone(&storage),
+                &cfg.server.dkim.clone(),
+                worker::WorkerConfig {
+                    disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
+                },
+                worker_resources.clone(),
+            )
+            .await
+            .wrap_err_with(|| format!("failed to create log worker {worker_index}"))?;
+            let log_worker = worker::log_worker::LogWorker::new(
+                delivery_worker,
+                dispatcher_handle.clone(),
+                max_retries,
+            );
+            handles.push(tokio::spawn(log_worker.run()));
+        }
+        info!(
+            workers = worker_count,
+            shards = spool.shard_count(),
+            "log-queue backend active"
+        );
+        log_runtime = Some((spool, writers, dispatcher_task));
+        (callbacks, handles, mta_sts_resolver)
+    } else {
+        callbacks::Callbacks::new(
+            Arc::clone(&storage),
+            sender_channel.clone(),
+            receiver_channel.clone(),
+            cfg.clone(),
+        )
+        .await
+        .wrap_err("failed to initialize SMTP callbacks and workers")?
+    };
     let cmd_timeout = cfg
         .server
         .cmd_timeout
@@ -255,7 +384,10 @@ async fn run_server(config_path: &str) -> Result<()> {
         .with_hostname(smtp_hostname);
 
     // Replay any queued emails so workers process them immediately.
-    if !queued_jobs.is_empty() {
+    if is_log_backend {
+        // Backlog recovery already happened through checkpoints, journal
+        // replay, and dispatcher discovery; nothing goes through the channel.
+    } else if !queued_jobs.is_empty() {
         info!(
             queued = queued_jobs.len(),
             "replaying queued jobs to workers"
@@ -284,16 +416,19 @@ async fn run_server(config_path: &str) -> Result<()> {
         info!("no queued jobs found on startup");
     }
 
-    // Start the deferred worker (periodic retry loop).
-    let deferred_storage = Arc::clone(&storage);
-    let deferred_sender = sender_channel.clone();
-    let max_retries = cfg.server.max_retries;
-    let deferred_shutdown = shutdown_token.clone();
-    let deferred_handle = tokio::spawn(async move {
-        let worker = DeferredWorker::new(deferred_storage, deferred_sender, max_retries);
-        worker.run(deferred_shutdown).await;
-    });
-    background_tasks.push(deferred_handle);
+    // Start the deferred worker (periodic retry loop). The log backend
+    // schedules retries in the dispatcher's due-time heap instead.
+    if !is_log_backend {
+        let deferred_storage = Arc::clone(&storage);
+        let deferred_sender = sender_channel.clone();
+        let max_retries = cfg.server.max_retries;
+        let deferred_shutdown = shutdown_token.clone();
+        let deferred_handle = tokio::spawn(async move {
+            let worker = DeferredWorker::new(deferred_storage, deferred_sender, max_retries);
+            worker.run(deferred_shutdown).await;
+        });
+        background_tasks.push(deferred_handle);
+    }
 
     // Start the MTA-STS background policy refresher.
     let mta_sts_shutdown = shutdown_token.clone();
@@ -455,6 +590,18 @@ async fn run_server(config_path: &str) -> Result<()> {
         }
     }
 
+    // Log backend: the dispatcher has drained in-flight outcomes and written
+    // final checkpoints (it observes the same cancellation token); close
+    // append admission last so every accepted message is on disk.
+    if let Some((spool, writers, dispatcher_task)) = log_runtime {
+        if let Err(err) = dispatcher_task.await {
+            error!("dispatcher task failed during shutdown: {:?}", err);
+        }
+        writers.shutdown().await;
+        drop(spool); // releases the exclusive spool lock
+        info!("log queue flushed and stopped");
+    }
+
     info!("shutdown complete");
     Ok(())
 }
@@ -491,25 +638,32 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     Ok(())
 }
 
+/// The log backend never reads the legacy one-file-per-message spool; mail
+/// sitting there is preserved but undelivered until `hedwig queue migrate`
+/// runs. Make that state loud at startup instead of silently ignoring it.
+fn warn_about_unmigrated_legacy_spool(base_path: &str) {
+    let mut counts = Vec::new();
+    for dir in ["queued", "deferred"] {
+        let path = std::path::Path::new(base_path).join(dir);
+        let n = std::fs::read_dir(&path)
+            .map(|entries| entries.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        if n > 0 {
+            counts.push(format!("{n} entries in {}", path.display()));
+        }
+    }
+    if !counts.is_empty() {
+        warn!(
+            "unmigrated legacy spool detected ({}); this mail is preserved but will NOT be              delivered until you stop the server and run `hedwig queue migrate --config <config>`",
+            counts.join(", ")
+        );
+    }
+}
+
 async fn get_storage_type(cfg: &CfgStorage) -> Result<Arc<dyn Storage>> {
     match cfg.storage_type.as_ref() {
         "fs" => {
             let st = FileSystemStorage::new(cfg.base_path.clone()).await?;
-            Ok(Arc::new(st))
-        }
-        "sqlite" => {
-            let num_shards = cfg.num_shards.unwrap_or(16);
-            let batch_size = cfg.batch_size.unwrap_or(100);
-            let batch_timeout_ms = cfg.batch_timeout_ms.unwrap_or(5);
-            let sqlite_cfg = cfg.sqlite.clone().unwrap_or_default();
-            let st = SqliteStorage::new(
-                &cfg.base_path,
-                num_shards,
-                batch_size,
-                batch_timeout_ms,
-                &sqlite_cfg,
-            )
-            .await?;
             Ok(Arc::new(st))
         }
         _ => bail!("Unknown storage type: {}", cfg.storage_type),

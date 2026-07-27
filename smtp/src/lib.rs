@@ -150,6 +150,12 @@ pub enum SmtpError {
         span: SourceSpan,
     },
 
+    /// A temporary local failure (storage backpressure, disk reserve
+    /// reached). Reported to the client as `452` so it retries later.
+    #[error("Transient failure: {message}")]
+    #[diagnostic(code(smtp::transient))]
+    Transient { message: String },
+
     #[error("Mail rejected: {message}")]
     MailFromDenied { message: String },
 
@@ -371,6 +377,11 @@ impl SmtpServer {
                     SmtpError::RcptToDenied { message } => {
                         socket
                             .write_line(format!("550 {}", message).as_bytes())
+                            .await
+                    }
+                    SmtpError::Transient { message } => {
+                        socket
+                            .write_line(format!("452 {}\r\n", message).as_bytes())
                             .await
                     }
                     _ => socket.write_line(b"500 Internal server error\r\n").await,
