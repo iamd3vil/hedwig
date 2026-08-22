@@ -266,6 +266,10 @@ pub trait SmtpCallbacks: Send + Sync {
 
 /// Default maximum message size: 25 MiB.
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 25 * 1024 * 1024;
+/// Maximum recipients accepted per message (RFC 5321 requires supporting at
+/// least 100; this matches common MTA defaults). Bounding the envelope also
+/// bounds every derived delivery-state journal entry in the log queue.
+pub const MAX_RECIPIENTS: usize = 1000;
 /// End-of-DATA sequence: a lone dot on its own line.
 const DATA_TERMINATOR: &[u8] = b"\r\n.\r\n";
 
@@ -665,10 +669,17 @@ impl SmtpServer {
             }
             (SessionState::ReceivingMailFrom, SmtpCommand::RcptTo(to))
             | (SessionState::ReceivingRcptTo, SmtpCommand::RcptTo(to)) => {
-                self.callbacks.on_rcpt_to(&to).await?;
-                session.email.to.push(to); // Consider changing this to a Vec<String> to support multiple recipients
-                stream.write_line(b"250 OK\r\n").await?;
-                session.state = SessionState::ReceivingRcptTo;
+                if session.email.to.len() >= MAX_RECIPIENTS {
+                    // Transient per RFC 5321 §4.5.3.1.10: the client may
+                    // send the remaining recipients in a new transaction.
+                    stream.write_line(b"452 4.5.3 Too many recipients\r\n").await?;
+                    session.state = SessionState::ReceivingRcptTo;
+                } else {
+                    self.callbacks.on_rcpt_to(&to).await?;
+                    session.email.to.push(to);
+                    stream.write_line(b"250 OK\r\n").await?;
+                    session.state = SessionState::ReceivingRcptTo;
+                }
             }
             (SessionState::ReceivingRcptTo, SmtpCommand::MailFrom(from_command)) => {
                 // Start a new email transaction
@@ -1115,6 +1126,82 @@ mod tests {
         let emails = callbacks.emails.lock().unwrap();
         assert_eq!(emails.len(), 1);
         emails[0].body.clone()
+    }
+
+    #[tokio::test]
+    async fn recipient_count_is_capped_per_message() {
+        let callbacks = Arc::new(RecordingCallbacks {
+            emails: StdMutex::new(Vec::new()),
+        });
+        let server = SmtpServer {
+            callbacks: callbacks.clone(),
+            auth_enabled: false,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            cmd_timeout: Duration::from_secs(5),
+            data_timeout: Duration::from_secs(5),
+            hostname: "test.local".to_string(),
+        };
+
+        let (client, server_side) = tokio::io::duplex(4096);
+        let mut server_stream: Box<dyn SmtpStream> = Box::new(server_side);
+        let server_task =
+            tokio::spawn(async move { server.handle_client(&mut server_stream).await });
+        let (mut reader, mut writer) = tokio::io::split(client);
+
+        async fn read_reply<R: tokio::io::AsyncRead + Unpin>(
+            reader: &mut R,
+            expected: &str,
+        ) -> String {
+            let mut buf = vec![0u8; 512];
+            let n = reader.read(&mut buf).await.unwrap();
+            let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                reply.contains(expected),
+                "expected {expected:?}, got {reply:?}"
+            );
+            reply
+        }
+
+        read_reply(&mut reader, "220").await;
+        writer.write_all(b"EHLO client.test\r\n").await.unwrap();
+        read_reply(&mut reader, "250").await;
+        writer
+            .write_all(b"MAIL FROM:<a@example.com>\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut reader, "250").await;
+
+        // The first MAX_RECIPIENTS are accepted; the one after gets a 452
+        // transient and must NOT abort the session or the transaction.
+        for i in 0..MAX_RECIPIENTS {
+            writer
+                .write_all(format!("RCPT TO:<r{i}@example.org>\r\n").as_bytes())
+                .await
+                .unwrap();
+            read_reply(&mut reader, "250").await;
+        }
+        writer
+            .write_all(b"RCPT TO:<one-too-many@example.org>\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut reader, "452 4.5.3").await;
+
+        // The transaction still completes with the accepted recipients.
+        writer.write_all(b"DATA\r\n").await.unwrap();
+        read_reply(&mut reader, "354").await;
+        writer
+            .write_all(b"Subject: capped\r\n\r\nbody\r\n.\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut reader, "250").await;
+        writer.write_all(b"QUIT\r\n").await.unwrap();
+        drop(writer);
+        server_task.await.unwrap().unwrap();
+
+        let emails = callbacks.emails.lock().unwrap();
+        assert_eq!(emails.len(), 1);
+        assert_eq!(emails[0].to.len(), MAX_RECIPIENTS);
+        assert!(!emails[0].to.iter().any(|r| r.contains("one-too-many")));
     }
 
     #[tokio::test]
