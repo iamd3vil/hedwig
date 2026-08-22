@@ -109,7 +109,7 @@ pub struct WorkerConfig {
 }
 
 #[derive(Clone)]
-pub(crate) struct WorkerResources {
+pub struct WorkerResources {
     mx_cache: Cache<String, MxLookup>,
     pool: Arc<PoolManager>,
     resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
@@ -120,7 +120,7 @@ pub(crate) struct WorkerResources {
 impl WorkerResources {
     /// The process-wide rate limiter (clones share the same buckets); used
     /// by the log-queue dispatcher's dispatch-time gate.
-    pub(crate) fn rate_limiter(&self) -> RateLimiter {
+    pub fn rate_limiter(&self) -> RateLimiter {
         self.rate_limiter.clone()
     }
 

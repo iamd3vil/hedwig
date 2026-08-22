@@ -1,13 +1,14 @@
 use clap::Parser;
-use config::CfgStorage;
+use hedwig::config::CfgStorage;
+use hedwig::mta_sts::refresher;
+use hedwig::storage::{fs_storage::FileSystemStorage, Status, Storage};
+use hedwig::worker::{deferred_worker::DeferredWorker, Job};
+use hedwig::{callbacks, config, dkim, health, logqueue, metrics, queue_cli, worker};
 use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
-use mta_sts::refresher;
 use rustls::pki_types::CertificateDer;
 use smtp::{MaybeTlsStream, SmtpServer, SmtpStream};
 use std::sync::Arc;
-use storage::{fs_storage::FileSystemStorage, Status, Storage};
-use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -16,19 +17,6 @@ use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Level};
-use worker::{deferred_worker::DeferredWorker, Job};
-
-mod callbacks;
-mod config;
-mod dkim;
-mod health;
-mod logqueue;
-mod metrics;
-mod migrate;
-mod mta_sts;
-mod queue_cli;
-mod storage;
-mod worker;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -668,8 +656,4 @@ async fn get_storage_type(cfg: &CfgStorage) -> Result<Arc<dyn Storage>> {
         }
         _ => bail!("Unknown storage type: {}", cfg.storage_type),
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.ct_eq(b).into()
 }

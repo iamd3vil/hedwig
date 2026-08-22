@@ -14,10 +14,11 @@
 //!
 //! # Usage
 //!
-//! ```rust
-//! use crate::worker::rate_limiter::{RateLimiter, RateLimitConfig, RateLimitResult};
+//! ```rust,no_run
+//! use hedwig::worker::rate_limiter::{RateLimiter, RateLimitConfig, RateLimitResult};
 //! use std::collections::HashMap;
 //!
+//! # async fn example() {
 //! // Create configuration
 //! let mut domain_limits = HashMap::new();
 //! domain_limits.insert("gmail.com".to_string(), 30);
@@ -41,6 +42,7 @@
 //!         tokio::time::sleep(retry_after).await;
 //!     }
 //! }
+//! # }
 //! ```
 
 use std::{
