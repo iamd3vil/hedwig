@@ -244,6 +244,22 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Cap on error/reason strings persisted to the state journal. They come
+/// from remote SMTP responses; bounding them keeps every journal entry far
+/// below the replay size limit.
+const MAX_PERSISTED_ERROR_LEN: usize = 4096;
+
+fn truncate_persisted_error(mut s: String) -> String {
+    if s.len() > MAX_PERSISTED_ERROR_LEN {
+        let mut end = MAX_PERSISTED_ERROR_LEN;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
 /// Domain of an envelope recipient, tolerating angle brackets
 /// (`<user@example.com>`), normalized the same way the delivery worker
 /// does so the rate gate and the limiter share one bucket per domain.
@@ -723,7 +739,24 @@ impl Dispatcher {
             }
             let job = self.jobs.get(&id).expect("popped job exists");
             let (sender, all_recipients) = job.envelope.clone().expect("envelope just filled");
+            let location = job.location;
             let recipients = job.remaining.clone().unwrap_or(all_recipients);
+            if recipients.is_empty() {
+                // A recovered deferral/checkpoint with an empty remaining
+                // set: every recipient already accepted, nothing to send.
+                // Complete it instead of panicking on recipients[0] below.
+                tracing::warn!(message_id = %id,
+                    "job has no remaining recipients; recording as delivered");
+                self.persist_and_apply(
+                    location.shard as usize,
+                    StateEntry::Delivered {
+                        id,
+                        location,
+                        timestamp_ms: now_ms(),
+                    },
+                );
+                continue;
+            }
 
             // Dispatch-time rate gating: exhausted destinations stay queued
             // without consuming a worker slot. The due time is not a token —
@@ -851,8 +884,23 @@ impl Dispatcher {
                 id,
                 location,
                 timestamp_ms: now_ms(),
-                reason,
+                reason: truncate_persisted_error(reason),
             },
+            JobOutcome::Deferred {
+                remaining_recipients,
+                ..
+            } if remaining_recipients.is_empty() => {
+                // Nothing left to send: every recipient already accepted,
+                // so this is a completion, not a retry. Persisting an empty
+                // deferral would create a job that can never dispatch.
+                tracing::warn!(message_id = %id,
+                    "deferred outcome with no remaining recipients; recording as delivered");
+                StateEntry::Delivered {
+                    id,
+                    location,
+                    timestamp_ms: now_ms(),
+                }
+            }
             JobOutcome::Deferred {
                 next_attempt_ms,
                 remaining_recipients,
@@ -863,7 +911,7 @@ impl Dispatcher {
                 attempts: job.attempts + 1,
                 next_attempt_ms,
                 remaining_recipients,
-                last_error: error,
+                last_error: truncate_persisted_error(error),
             },
         };
 
@@ -1548,6 +1596,90 @@ mod tests {
         // After restart nothing is ready (the message really delivered) —
         // i.e. the stale Bounced didn't win.
         // (Verified by the state store directly.)
+    }
+
+    #[tokio::test]
+    async fn deferred_with_no_remaining_recipients_completes_terminally() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = start(
+            dir.path(),
+            Arc::new(NoRateGate),
+            DispatcherConfig::default(),
+        );
+        let append = h.writers.handle();
+        let loc = append.append(message(1, "r1@example.com")).await.unwrap();
+
+        let claim = h.handle.claim().await.unwrap();
+        let id = claim.job.message_id;
+        // A deferral with nothing left to send is a completion: it must be
+        // recorded terminal, never re-dispatched (and never panic the
+        // dispatcher on recipients[0]).
+        claim.report(JobOutcome::Deferred {
+            next_attempt_ms: now_ms() - 1_000, // already due
+            remaining_recipients: vec![],
+            error: "no-op deferral".into(),
+        });
+
+        let no_claim = tokio::time::timeout(Duration::from_millis(300), h.handle.claim()).await;
+        assert!(no_claim.is_err(), "empty deferral was re-dispatched");
+        stop(h).await;
+
+        let state = crate::logqueue::state::load_state_readonly(
+            &dir.path().join("spool").join("shard-0000"),
+        )
+        .unwrap();
+        assert!(state.is_terminal(loc.segment, &id));
+        assert!(state.ready.is_empty() && state.deferred.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovered_empty_deferral_completes_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let (id, loc);
+        {
+            let h = start(
+                dir.path(),
+                Arc::new(NoRateGate),
+                DispatcherConfig::default(),
+            );
+            let append = h.writers.handle();
+            loc = append.append(message(1, "r1@example.com")).await.unwrap();
+            let claim = h.handle.claim().await.unwrap();
+            id = claim.job.message_id;
+            drop(claim); // abandon; the job stays live across shutdown
+            stop(h).await;
+        }
+        // Craft an on-disk deferral with an empty remaining set (as an old
+        // version or corrupt tooling could have written): the dispatcher
+        // must complete it after recovery, not panic in try_dispatch.
+        {
+            let shard_dir = dir.path().join("spool").join("shard-0000");
+            let (mut store, _) =
+                crate::logqueue::state::ShardStateStore::recover(&shard_dir, 0).unwrap();
+            store
+                .append(&StateEntry::Deferred {
+                    id,
+                    location: loc,
+                    attempts: 1,
+                    next_attempt_ms: now_ms() - 1_000,
+                    remaining_recipients: vec![],
+                    last_error: "451".into(),
+                })
+                .unwrap();
+        }
+        let h = start(
+            dir.path(),
+            Arc::new(NoRateGate),
+            DispatcherConfig::default(),
+        );
+        let no_claim = tokio::time::timeout(Duration::from_millis(400), h.handle.claim()).await;
+        assert!(no_claim.is_err(), "empty deferral was dispatched");
+        stop(h).await;
+        let state = crate::logqueue::state::load_state_readonly(
+            &dir.path().join("spool").join("shard-0000"),
+        )
+        .unwrap();
+        assert!(state.is_terminal(loc.segment, &id));
     }
 
     struct BlockOnce {

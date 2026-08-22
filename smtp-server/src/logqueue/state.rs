@@ -29,7 +29,10 @@ const CHECKPOINT_VERSION: u16 = 1;
 
 /// Framing overhead per journal entry: length + crc.
 const ENTRY_FRAME: usize = 8;
-/// Sanity cap on one journal entry (a huge recipient list stays far below).
+/// Sanity cap on one journal entry, enforced symmetrically: replay rejects
+/// larger entries as corruption AND `append` refuses to write them. The
+/// writer's envelope allowance (1 MiB) plus the persisted-error cap keeps
+/// every legal entry far below this.
 const MAX_ENTRY_LEN: u32 = 16 * 1024 * 1024;
 
 /// Log sequence number: position in the shard's journal stream.
@@ -295,7 +298,10 @@ fn parse_journal_name(name: &str) -> Option<u64> {
     let digits = name
         .strip_prefix(JOURNAL_PREFIX)?
         .strip_suffix(&format!(".{JOURNAL_EXT}"))?;
-    if digits.len() != 12 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    // `journal_file_name` pads to a MINIMUM of 12 digits, so ordinals past
+    // 10^12 produce longer names; the parser must accept every name the
+    // formatter can emit or recovery would create files it cannot re-read.
+    if digits.len() < 12 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     digits.parse().ok()
@@ -705,9 +711,18 @@ fn load_checkpoint_file(dir: &Path) -> Result<Option<(Checkpoint, Lsn)>, QueueEr
             supported: CHECKPOINT_VERSION,
         });
     }
-    let payload_len = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
+    // The reserved field must be zero, like record flags: the header is not
+    // covered by the payload crc, and a future format may assign it meaning.
+    let reserved = u16::from_le_bytes(buf[6..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(corrupt(&format!("nonzero reserved field {reserved:#06x}")));
+    }
+    let payload_len = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     let crc = u32::from_le_bytes(buf[16..20].try_into().unwrap());
-    if buf.len() != 20 + payload_len {
+    // Compare in u64 with the header size subtracted (buf.len() >= 20 was
+    // checked above): `20 + payload_len` could overflow on a corrupt
+    // length field.
+    if buf.len() as u64 - 20 != payload_len {
         return Err(corrupt("length mismatch"));
     }
     let payload = &buf[20..];
@@ -951,6 +966,16 @@ impl ShardStateStore {
     /// applies the transition to in-memory state only after this returns.
     pub fn append(&mut self, entry: &StateEntry) -> Result<Lsn, QueueError> {
         let payload = encode_entry(entry);
+        // Replay treats anything above MAX_ENTRY_LEN as corruption, so an
+        // oversized entry must never reach the file: written, it would
+        // truncate replay at this point (silently discarding this entry and
+        // every later one) or hard-fail recovery of a rotated journal.
+        if payload.len() > MAX_ENTRY_LEN as usize {
+            return Err(QueueError::InvalidRecord(format!(
+                "state entry is {} bytes, exceeds the {MAX_ENTRY_LEN} byte replay limit",
+                payload.len()
+            )));
+        }
         let lsn = self.journal.append(&payload)?;
         self.bytes_since_checkpoint += (ENTRY_FRAME + payload.len()) as u64;
         Ok(lsn)
@@ -1066,11 +1091,20 @@ pub fn load_state_readonly(shard_dir: &Path) -> Result<RecoveredState, QueueErro
             w[0], w[1]
         )));
     }
-    if let (Some(&first), true) = (journals.first(), replay_from.journal > 0) {
-        if first != replay_from.journal {
+    if let Some(&first) = journals.first() {
+        // Mirror `ShardStateStore::recover` exactly: with no checkpoint the
+        // stream must be complete from journal 1, or the inspector would
+        // show state (derived from history with a missing prefix) that the
+        // server itself refuses to load.
+        let expected = if replay_from.journal > 0 {
+            replay_from.journal
+        } else {
+            1
+        };
+        if first != expected {
             return Err(QueueError::Layout(format!(
-                "checkpoint expects journal {} but oldest present is {first}",
-                replay_from.journal
+                "state journals must start at {expected} but oldest present is {first}; \
+                 refusing to inspect an incomplete journal stream"
             )));
         }
     }

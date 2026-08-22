@@ -208,6 +208,20 @@ impl AppendHandle {
                 limit: self.max_record_len as u64,
             });
         }
+        // The envelope must fit the fixed allowance regardless of body
+        // size: segment sizing is validated against it, and every derived
+        // state-journal entry (which persists remaining recipients) must
+        // stay below the journal replay limit. The SMTP recipient cap keeps
+        // real mail far under this; the check makes the queue safe on its
+        // own.
+        let envelope_len =
+            encoded_len as u64 - msg.body.len() as u64 - record::FIXED_HEADER_LEN as u64;
+        if envelope_len > super::spool::ENVELOPE_ALLOWANCE {
+            return Err(QueueError::InvalidRecord(format!(
+                "envelope is {envelope_len} bytes, exceeds the {} byte allowance",
+                super::spool::ENVELOPE_ALLOWANCE
+            )));
+        }
 
         // Acquire admission permits for the encoded size, clamped so one
         // huge record cannot exceed the whole semaphore (it then simply
@@ -657,6 +671,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, QueueError::RecordTooLarge { .. }));
+
+        writers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_envelope_is_rejected_up_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path().join("spool"), 1).unwrap();
+        let writers = LogWriters::start(&spool, config()).unwrap();
+        let handle = writers.handle();
+
+        // ~1.2 MiB of recipient addresses with a tiny body: over the
+        // envelope allowance even though the record easily fits a segment.
+        let mut msg = message(1, b"small body");
+        msg.recipients = (0..6000)
+            .map(|i| format!("r{i:05}-{}@example.com", "x".repeat(180)))
+            .collect();
+        let err = handle.append(msg).await.unwrap_err();
+        assert!(matches!(err, QueueError::InvalidRecord(_)), "got {err}");
+
+        // A large BODY with a normal envelope is still fine (the envelope
+        // cap must not constrain message size).
+        handle
+            .append(message(2, &vec![b'b'; 2 * 1024 * 1024]))
+            .await
+            .unwrap();
 
         writers.shutdown().await;
     }

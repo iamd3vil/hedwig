@@ -38,7 +38,9 @@ pub fn active_file_name(segment: u64) -> String {
 pub fn parse_file_name(name: &str) -> Option<(u64, SegmentKind)> {
     let rest = name.strip_prefix("segment-")?;
     let (digits, ext) = rest.split_once('.')?;
-    if digits.len() != 12 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    // The file-name formatters pad to a MINIMUM of 12 digits; ordinals past
+    // 10^12 produce longer names, which must still parse.
+    if digits.len() < 12 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let ordinal = digits.parse().ok()?;
@@ -108,6 +110,7 @@ impl ActiveSegment {
     }
 
     /// Committed length: every byte below this is a complete record.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
         self.len
     }

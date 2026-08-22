@@ -12,9 +12,10 @@ const LOCK_FILE: &str = ".lock";
 
 /// Fixed allowance for record overhead (header + envelope) on top of the
 /// message body when validating segment sizing. Generous relative to real
-/// envelopes; a record whose envelope exceeds it is rejected at append time
-/// by the writer's fits-in-one-segment check, so the invariant that a record
-/// never spans segments holds either way.
+/// envelopes (the SMTP layer caps recipients per message); the writer
+/// rejects any record whose envelope exceeds it, which both preserves the
+/// records-never-span-segments invariant and bounds every derived
+/// state-journal entry below the journal replay limit.
 pub const ENVELOPE_ALLOWANCE: u64 = 1024 * 1024;
 
 /// An opened spool root. Holds the exclusive OS-level lock for its lifetime:
