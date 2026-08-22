@@ -1,0 +1,57 @@
+[package]
+name = "hedwig-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+tempfile = "3"
+ulid = "1"
+hedwig = { path = ".." }
+
+# The fuzz crate is excluded from the parent workspace (see the root
+# Cargo.toml); it builds with its own lockfile under the nightly toolchain.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "record_decode"
+path = "fuzz_targets/record_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_roundtrip"
+path = "fuzz_targets/record_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tail_validation"
+path = "fuzz_targets/tail_validation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_recovery"
+path = "fuzz_targets/state_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gen_corpus"
+path = "src/bin/gen_corpus.rs"
+test = false
+doc = false
+bench = false

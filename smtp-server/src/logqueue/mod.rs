@@ -7,6 +7,8 @@
 //! the legacy filesystem spool remains available as `"fs"`.
 
 pub mod dispatcher;
+#[cfg(test)]
+mod fuzz_tests;
 pub mod record;
 pub mod segment;
 pub mod shard;
