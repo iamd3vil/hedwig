@@ -477,6 +477,13 @@ async fn run_server(config_path: &str) -> Result<()> {
                             }
                         };
 
+                        // Replies are small and written one batch per read;
+                        // Nagle would sit on them waiting for the delayed
+                        // ACK, adding up to 40ms per round trip.
+                        if let Err(e) = socket.set_nodelay(true) {
+                            debug!(%listener_addr, "could not set TCP_NODELAY: {}", e);
+                        }
+
                         // Enforce the connection limit. If we're at capacity, reject immediately.
                         let permit = match conn_semaphore.clone().try_acquire_owned() {
                             Ok(permit) => permit,
