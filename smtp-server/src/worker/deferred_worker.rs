@@ -85,18 +85,12 @@ impl DeferredWorker {
         let mut stream = self.storage.list_meta();
 
         while let Some(entry) = stream.next().await {
-            let entry = match entry {
+            // `list_meta` already read and deserialized the meta file; it is
+            // the metadata, so re-reading it with get_meta would be a second
+            // read plus JSON parse of the same file on every tick.
+            let metadata = match entry {
                 Ok(entry) => entry,
                 Err(_) => continue,
-            };
-
-            let metadata = match self.storage.get_meta(&entry.msg_id).await {
-                Ok(Some(metadata)) => metadata,
-                Ok(None) => continue,
-                Err(e) => {
-                    error!(msg_id = %entry.msg_id, "error reading deferred metadata: {:#}", e);
-                    continue;
-                }
             };
 
             // Skip if it's not time to retry yet
@@ -112,22 +106,33 @@ impl DeferredWorker {
             // left by a crash. Skip it — acting would make the `mv` below fail
             // with ENOENT. The retry path deletes the meta on final success or
             // bounce; true strays are removed by the storage cleanup task.
-            let email = match self.storage.get(&msg_id, Status::Deferred).await {
-                Ok(Some(email)) => email,
-                Ok(None) => continue,
-                Err(e) => {
-                    error!(msg_id = %msg_id, "error checking deferred body: {:#}", e);
-                    continue;
-                }
-            };
-
+            //
             // A failure on a single entry must not abort the rest of the scan,
             // otherwise one bad message blocks every later deferred job.
             let result = if metadata.attempts >= self.max_attempts {
-                // Handle permanent failure if max attempts reached
-                self.handle_permanent_failure(email, &metadata).await
+                // The exhaustion bounce is the one path that needs the body:
+                // it reports the message subject.
+                match self.storage.get(&msg_id, Status::Deferred).await {
+                    Ok(Some(email)) => self.handle_permanent_failure(email, &metadata).await,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        error!(msg_id = %msg_id, "error reading deferred body: {:#}", e);
+                        continue;
+                    }
+                }
             } else {
-                self.process_retry(metadata).await
+                // The retry path discards the body, so prove existence with a
+                // stat instead of reading (and decoding) the whole message.
+                // During an outage backlog the read version pulled the entire
+                // deferred spool off disk on every tick.
+                match self.storage.exists(&msg_id, Status::Deferred).await {
+                    Ok(true) => self.process_retry(metadata).await,
+                    Ok(false) => continue,
+                    Err(e) => {
+                        error!(msg_id = %msg_id, "error checking deferred body: {:#}", e);
+                        continue;
+                    }
+                }
             };
 
             if let Err(e) = result {
