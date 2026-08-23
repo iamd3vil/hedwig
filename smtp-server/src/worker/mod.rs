@@ -1355,6 +1355,29 @@ mod tests {
         );
     }
 
+    /// A dropped header in final position is the one case where the header
+    /// block's terminator has to be rebuilt: naively re-adding the newline
+    /// per kept line leaves a bare CR before the separator, which makes the
+    /// last header the start of a malformed line for the receiver.
+    #[test]
+    fn test_strip_outbound_headers_dropped_header_last() {
+        let raw_email = b"From: a@b.com\r\nTo: c@d.com\r\nBcc: e@f.com\r\n\r\nBody";
+        let expected = b"From: a@b.com\r\nTo: c@d.com\r\n\r\nBody";
+        let result = strip_bcc(raw_email).unwrap();
+        assert_eq!(
+            str::from_utf8(&result).unwrap(),
+            str::from_utf8(expected).unwrap(),
+            "no bare CR may survive where the dropped header used to be"
+        );
+        // Same shape with several trailing dropped headers.
+        let raw_email = b"From: a@b.com\r\nBcc: e@f.com\r\nBcc: g@h.com\r\n\r\nBody";
+        let expected = b"From: a@b.com\r\n\r\nBody";
+        assert_eq!(
+            str::from_utf8(&strip_bcc(raw_email).unwrap()).unwrap(),
+            str::from_utf8(expected).unwrap()
+        );
+    }
+
     #[test]
     fn test_strip_outbound_headers_bcc_absent() {
         let raw_email = b"From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n\r\nBody";

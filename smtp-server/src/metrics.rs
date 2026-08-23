@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -428,6 +428,11 @@ static SEND_DOMAINS: Lazy<RwLock<HashMap<&'static str, SendDomainCounters>>> =
     Lazy::new(|| RwLock::new(HashMap::with_capacity(MAX_SEND_DOMAIN_LABELS)));
 
 /// Counters for everything that did not win a label slot.
+/// Set once the label budget is spent. Without it, every delivery to a
+/// domain outside the budget would take the write lock below just to be
+/// turned away — the busiest case on a server with a long destination tail.
+static SEND_DOMAINS_SATURATED: AtomicBool = AtomicBool::new(false);
+
 static SEND_DOMAIN_OTHER: Lazy<SendDomainCounters> =
     Lazy::new(|| SendDomainCounters::for_label(DOMAIN_OTHER));
 
@@ -453,20 +458,26 @@ fn record_send_outcome(domain: &str, success: bool) {
     let mut buf = [0u8; MAX_DOMAIN_LEN];
     let normalized = normalize_domain_into(domain, &mut buf);
 
-    if let Ok(domains) = SEND_DOMAINS.read() {
-        if let Some(counters) = domains.get(normalized) {
-            counters.counter(success).inc();
-            return;
-        }
+    // A poisoned lock means some other thread panicked mid-update, not that
+    // the map is unusable: recover it rather than mis-attributing every
+    // later delivery to `other` for the life of the process.
+    let domains = SEND_DOMAINS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(counters) = domains.get(normalized) {
+        counters.counter(success).inc();
+        return;
     }
+    if SEND_DOMAINS_SATURATED.load(Ordering::Relaxed) {
+        drop(domains);
+        SEND_DOMAIN_OTHER.counter(success).inc();
+        return;
+    }
+    drop(domains);
 
-    let mut domains = match SEND_DOMAINS.write() {
-        Ok(domains) => domains,
-        Err(_) => {
-            SEND_DOMAIN_OTHER.counter(success).inc();
-            return;
-        }
-    };
+    let mut domains = SEND_DOMAINS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // Another thread may have admitted this domain between the two locks.
     if let Some(counters) = domains.get(normalized) {
@@ -475,6 +486,9 @@ fn record_send_outcome(domain: &str, success: bool) {
     }
 
     if normalized == DOMAIN_OTHER || domains.len() >= MAX_SEND_DOMAIN_LABELS {
+        if domains.len() >= MAX_SEND_DOMAIN_LABELS {
+            SEND_DOMAINS_SATURATED.store(true, Ordering::Relaxed);
+        }
         drop(domains);
         SEND_DOMAIN_OTHER.counter(success).inc();
         return;
