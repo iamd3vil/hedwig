@@ -65,6 +65,11 @@ const BUCKET_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 /// it the map keeps one bucket per distinct recipient domain forever.
 const SWEEP_THRESHOLD: usize = 1024;
 
+/// Minimum gap between sweeps of the same shard. A sweep is O(shard), so
+/// without this a flood of never-seen-again domains would make every miss
+/// rescan a shard whose entries are all too young to evict.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Configuration for rate limiting email sending.
 ///
 /// This structure defines the rate limiting behavior for outbound email delivery.
@@ -163,21 +168,33 @@ impl TokenBucket {
     }
 }
 
+/// One independently locked group of buckets.
+struct Shard {
+    buckets: HashMap<String, TokenBucket>,
+    /// When this shard last dropped idle buckets.
+    last_sweep: Instant,
+}
+
 /// Per-domain token buckets, split across independently locked shards.
 struct Buckets {
-    shards: Vec<Mutex<HashMap<String, TokenBucket>>>,
+    shards: Vec<Mutex<Shard>>,
 }
 
 impl Buckets {
     fn new() -> Self {
         Self {
             shards: (0..BUCKET_SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
+                .map(|_| {
+                    Mutex::new(Shard {
+                        buckets: HashMap::new(),
+                        last_sweep: Instant::now(),
+                    })
+                })
                 .collect(),
         }
     }
 
-    fn shard_for(&self, domain: &str) -> &Mutex<HashMap<String, TokenBucket>> {
+    fn shard_for(&self, domain: &str) -> &Mutex<Shard> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         domain.hash(&mut hasher);
         &self.shards[hasher.finish() as usize % self.shards.len()]
@@ -199,15 +216,21 @@ impl Buckets {
             .shard_for(domain)
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(bucket) = shard.get_mut(domain) {
-            bucket.last_seen = Instant::now();
+        let now = Instant::now();
+        if let Some(bucket) = shard.buckets.get_mut(domain) {
+            bucket.last_seen = now;
             return f(bucket);
         }
-        if shard.len() >= SWEEP_THRESHOLD {
-            let now = Instant::now();
-            shard.retain(|_, b| now.duration_since(b.last_seen) < BUCKET_IDLE_TTL);
+        if shard.buckets.len() >= SWEEP_THRESHOLD
+            && now.duration_since(shard.last_sweep) >= SWEEP_INTERVAL
+        {
+            shard
+                .buckets
+                .retain(|_, b| now.duration_since(b.last_seen) < BUCKET_IDLE_TTL);
+            shard.last_sweep = now;
         }
         let bucket = shard
+            .buckets
             .entry(domain.to_string())
             .or_insert_with(|| TokenBucket::new(limit, limit));
         f(bucket)
@@ -217,7 +240,7 @@ impl Buckets {
     fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|s| s.lock().expect("test locks are not poisoned").len())
+            .map(|s| s.lock().expect("test locks are not poisoned").buckets.len())
             .sum()
     }
 }
@@ -479,7 +502,9 @@ mod tests {
         for shard in &buckets.shards {
             let mut shard = shard.lock().unwrap();
             let now = Instant::now();
-            shard.retain(|_, b| now.duration_since(b.last_seen) < Duration::ZERO);
+            shard
+                .buckets
+                .retain(|_, b| now.duration_since(b.last_seen) < Duration::ZERO);
         }
         assert_eq!(buckets.len(), 0, "idle buckets must not accumulate");
     }
