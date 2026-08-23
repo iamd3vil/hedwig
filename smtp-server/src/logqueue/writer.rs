@@ -17,7 +17,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 
 use super::record::{self, RecordParams};
-use super::segment::{validate_active_tail, ActiveSegment};
+use super::segment::{validate_active_tail, ActiveSegment, PendingRecord};
 use super::shard::ShardDir;
 use super::spool::Spool;
 use super::{JobLocation, MessageId, QueueError};
@@ -445,7 +445,7 @@ impl ShardWriter {
 
         let active = self.active.as_mut().expect("rotate keeps an active segment");
         let ordinal = active.next_ordinal();
-        let encoded = record::encode(&RecordParams {
+        let params = RecordParams {
             message_id: req.msg.message_id,
             enqueue_ms: req.msg.enqueue_ms,
             generation: req.msg.generation,
@@ -453,14 +453,26 @@ impl ShardWriter {
             sender: &req.msg.sender,
             recipients: &req.msg.recipients,
             body: &req.msg.body,
-        })?;
-        debug_assert_eq!(encoded.len() as u32, req.encoded_len);
+        };
+        let sizes = record::encoded_sizes(&params)?;
+        debug_assert_eq!(sizes.record_len, req.encoded_len);
+        // Encode the header only and let the kernel gather it with the body:
+        // copying a multi-megabyte body into a contiguous buffer once per
+        // append buys nothing over a two-iovec write.
+        let header = record::encode_header(&params, sizes)?;
 
         let write_started = std::time::Instant::now();
-        let offset = active.append(&encoded)?;
+        let mut batch = active.append_batch(&[PendingRecord {
+            header: &header,
+            body: &req.msg.body,
+        }]);
+        if let Some(e) = batch.error {
+            return Err(e);
+        }
+        let offset = batch.offsets.pop().expect("committed record has an offset");
         crate::metrics::logqueue_append_duration_observe(shared.shard(), write_started.elapsed());
         crate::metrics::logqueue_records_appended(shared.shard(), 1);
-        crate::metrics::logqueue_bytes_appended(shared.shard(), encoded.len() as u64);
+        crate::metrics::logqueue_bytes_appended(shared.shard(), sizes.record_len as u64);
         crate::metrics::logqueue_active_segment_bytes_set(shared.shard(), active.len());
         let location = JobLocation {
             shard: shared.shard(),

@@ -5,7 +5,7 @@
 //! Records never span segments.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{IoSlice, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
@@ -50,6 +50,58 @@ pub fn parse_file_name(name: &str) -> Option<(u64, SegmentKind)> {
         _ => return None,
     };
     Some((ordinal, kind))
+}
+
+/// One record offered to [`ActiveSegment::append_batch`]: its encoded
+/// header and the body that header frames, kept apart so the body is never
+/// copied just to make the record contiguous.
+pub struct PendingRecord<'a> {
+    pub header: &'a [u8],
+    pub body: &'a [u8],
+}
+
+impl PendingRecord<'_> {
+    fn len(&self) -> u64 {
+        self.header.len() as u64 + self.body.len() as u64
+    }
+}
+
+/// Outcome of a batched append: the offsets of the leading records that were
+/// fully written, plus the error that stopped the batch. Records from
+/// `offsets.len()` onwards did not reach the file.
+pub struct BatchAppend {
+    pub offsets: Vec<u64>,
+    pub error: Option<QueueError>,
+}
+
+/// `write_all` for iovecs. `write_vectored` may consume only part of what it
+/// is offered, so advance and retry until nothing is left. Returns the bytes
+/// actually written and the error that stopped the loop, if any — the caller
+/// needs the count to know how much of the batch survived.
+///
+/// (`Write::write_all_vectored` would do this but is still unstable.)
+///
+/// Generic over the sink so the advance-and-retry arithmetic can be tested
+/// against a short-writing one; the only real caller passes `&File`.
+fn write_all_vectored<W: Write>(
+    mut sink: W,
+    slices: &mut [IoSlice<'_>],
+) -> (u64, Option<std::io::Error>) {
+    let mut written = 0u64;
+    let mut rest = &mut slices[..];
+    while !rest.is_empty() {
+        match sink.write_vectored(rest) {
+            // Refusing to make progress on a regular file would spin here.
+            Ok(0) => return (written, Some(std::io::ErrorKind::WriteZero.into())),
+            Ok(n) => {
+                written += n as u64;
+                IoSlice::advance_slices(&mut rest, n);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return (written, Some(e)),
+        }
+    }
+    (written, None)
 }
 
 /// The shard's current append target. All methods are synchronous; the
@@ -132,16 +184,76 @@ impl ActiveSegment {
     /// back so a retry (or seal) never leaves a torn record below the
     /// committed tail.
     pub fn append(&mut self, encoded: &[u8]) -> Result<u64, QueueError> {
-        let offset = self.len;
-        if let Err(e) = self.file.write_all(encoded) {
-            // Best effort: cut back to the committed tail. If this fails the
-            // tail validator will do the same at next startup.
-            let _ = self.file.set_len(offset);
-            return Err(QueueError::io(&self.path, e));
+        let mut batch = self.append_batch(&[PendingRecord {
+            header: encoded,
+            body: &[],
+        }]);
+        match batch.error {
+            Some(e) => Err(e),
+            None => Ok(batch.offsets.pop().expect("committed record has an offset")),
         }
-        self.len += encoded.len() as u64;
-        self.next_ordinal += 1;
-        Ok(offset)
+    }
+
+    /// Append several records in one vectored write. The records must have
+    /// been encoded with consecutive ordinals starting at
+    /// `self.next_ordinal()`.
+    ///
+    /// Same all-or-nothing contract as [`Self::append`], applied per record:
+    /// the returned offsets are those of the leading records that fully
+    /// reached the file, any torn remainder is truncated away, and `error`
+    /// says why the batch stopped. The committed length therefore always
+    /// lands on a record boundary, so a later append (or seal) can never
+    /// leave a partial record below it.
+    pub fn append_batch(&mut self, records: &[PendingRecord<'_>]) -> BatchAppend {
+        debug_assert!(!records.is_empty());
+        let mut slices = Vec::with_capacity(records.len() * 2);
+        for record in records {
+            slices.push(IoSlice::new(record.header));
+            // Skip empty bodies rather than spend an iovec on them.
+            if !record.body.is_empty() {
+                slices.push(IoSlice::new(record.body));
+            }
+        }
+        let (written, error) = write_all_vectored(&self.file, &mut slices);
+        self.commit_batch(records, written, error)
+    }
+
+    /// Account for a batch write that put `written` bytes into the file.
+    /// Split out from [`Self::append_batch`] so the torn-write path can be
+    /// tested without arranging a real short write.
+    fn commit_batch(
+        &mut self,
+        records: &[PendingRecord<'_>],
+        written: u64,
+        error: Option<std::io::Error>,
+    ) -> BatchAppend {
+        let start = self.len;
+        let mut committed = 0u64;
+        let mut offsets = Vec::with_capacity(records.len());
+        for record in records {
+            let end = committed + record.len();
+            if end > written {
+                break;
+            }
+            offsets.push(start + committed);
+            committed = end;
+        }
+        self.len = start + committed;
+        self.next_ordinal += offsets.len() as u32;
+
+        if committed < written {
+            // The kernel took a fraction of a record. Cut back to the last
+            // record boundary; O_APPEND then puts the next write at that
+            // new end of file. Best effort — if this fails the tail
+            // validator does the same at next startup.
+            let _ = self.file.set_len(self.len);
+        }
+        // A write that reported no error consumed every iovec we offered.
+        debug_assert!(error.is_some() || offsets.len() == records.len());
+        BatchAppend {
+            offsets,
+            error: error.map(|e| QueueError::io(&self.path, e)),
+        }
     }
 
     /// Seal this segment: rename `.open` to `.log`. Returns the sealed path
@@ -565,7 +677,9 @@ pub fn scan_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logqueue::record::{encode, RecordParams, MAX_RECORD_LEN};
+    use crate::logqueue::record::{
+        encode, encode_header, encoded_sizes, RecordParams, MAX_RECORD_LEN,
+    };
     use crate::logqueue::MessageId;
 
     fn record(ordinal: u32, body: &[u8]) -> Vec<u8> {
@@ -580,6 +694,30 @@ mod tests {
             body,
         })
         .unwrap()
+    }
+
+    /// The two halves the append path deals in: the encoded header and the
+    /// body it frames.
+    fn header_and_body(ordinal: u32, body: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let params = RecordParams {
+            message_id: MessageId::from_ulid(ulid::Ulid::from_parts(ordinal as u64, 42)),
+            enqueue_ms: 1_752_000_000_000 + ordinal as i64,
+            generation: 0,
+            ordinal,
+            sender: "sender@example.com",
+            recipients: &recipients,
+            body,
+        };
+        let sizes = encoded_sizes(&params).unwrap();
+        (encode_header(&params, sizes).unwrap(), body.to_vec())
+    }
+
+    fn pending(parts: &[(Vec<u8>, Vec<u8>)]) -> Vec<PendingRecord<'_>> {
+        parts
+            .iter()
+            .map(|(header, body)| PendingRecord { header, body })
+            .collect()
     }
 
     fn fill_segment(dir: &Path, segment: u64, bodies: &[&[u8]]) -> (ActiveSegment, Vec<u64>) {
@@ -629,6 +767,186 @@ mod tests {
         let (h, body) = reader.read_record_at(offsets[2], MAX_RECORD_LEN).unwrap();
         assert_eq!(h.ordinal, 2);
         assert_eq!(body, b"third");
+    }
+
+    #[test]
+    fn batched_append_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seg = ActiveSegment::create(dir.path(), 1).unwrap();
+        let bodies: [&[u8]; 4] = [b"first", b"", b"third body", &[b'z'; 9000]];
+        let parts: Vec<_> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, b)| header_and_body(i as u32, b))
+            .collect();
+        let records = pending(&parts);
+
+        let batch = seg.append_batch(&records);
+        assert!(batch.error.is_none());
+        assert_eq!(batch.offsets.len(), 4);
+        assert_eq!(seg.next_ordinal(), 4);
+
+        // Offsets must be dense and the committed length must be the sum.
+        let mut expected = 0u64;
+        for (offset, r) in batch.offsets.iter().zip(records.iter()) {
+            assert_eq!(*offset, expected);
+            expected += r.len();
+        }
+        assert_eq!(seg.len(), expected);
+
+        let path = seg.path().to_path_buf();
+        drop(seg);
+        let reader = SegmentReader::open(&path).unwrap();
+        for (i, (offset, body)) in batch.offsets.iter().zip(bodies.iter()).enumerate() {
+            let (h, read) = reader.read_record_at(*offset, MAX_RECORD_LEN).unwrap();
+            assert_eq!(h.ordinal, i as u32);
+            assert_eq!(read, *body);
+        }
+        let v = validate_active_tail(&path, MAX_RECORD_LEN).unwrap();
+        assert_eq!(v.records, 4);
+        assert_eq!(v.truncated_bytes, 0);
+        assert_eq!(v.committed_len, expected);
+    }
+
+    #[test]
+    fn torn_batch_write_commits_only_whole_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seg = ActiveSegment::create(dir.path(), 1).unwrap();
+        let first = seg.append(&record(0, b"already here")).unwrap();
+        assert_eq!(first, 0);
+        let committed_before = seg.len();
+
+        let parts: Vec<_> = (1..4u32)
+            .map(|i| header_and_body(i, format!("body {i}").as_bytes()))
+            .collect();
+        let records = pending(&parts);
+
+        // Put two whole records plus a fragment of the third in the file,
+        // then account for it as the failed write it stands in for.
+        let mut bytes = Vec::new();
+        for r in &records[..2] {
+            bytes.extend_from_slice(r.header);
+            bytes.extend_from_slice(r.body);
+        }
+        bytes.extend_from_slice(&records[2].header[..3]);
+        (&seg.file).write_all(&bytes).unwrap();
+        let batch = seg.commit_batch(
+            &records,
+            bytes.len() as u64,
+            Some(std::io::ErrorKind::StorageFull.into()),
+        );
+
+        assert!(matches!(batch.error, Some(QueueError::Io { .. })));
+        assert_eq!(batch.offsets.len(), 2);
+        assert_eq!(batch.offsets[0], committed_before);
+        assert_eq!(batch.offsets[1], committed_before + records[0].len());
+        let expected_len = committed_before + records[0].len() + records[1].len();
+        assert_eq!(seg.len(), expected_len);
+        assert_eq!(seg.next_ordinal(), 3);
+        // The fragment must be gone from the file, not merely uncommitted.
+        let path = seg.path().to_path_buf();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), expected_len);
+
+        // The next append lands exactly at the committed tail, and the
+        // segment still validates cleanly end to end.
+        let next = seg.append(&record(3, b"after the tear")).unwrap();
+        assert_eq!(next, expected_len);
+        drop(seg);
+        let v = validate_active_tail(&path, MAX_RECORD_LEN).unwrap();
+        assert_eq!(v.records, 4);
+        assert_eq!(v.truncated_bytes, 0);
+    }
+
+    #[test]
+    fn failed_batch_write_commits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seg = ActiveSegment::create(dir.path(), 1).unwrap();
+        seg.append(&record(0, b"already here")).unwrap();
+        let committed_before = seg.len();
+
+        let parts: Vec<_> = (1..3u32).map(|i| header_and_body(i, b"body")).collect();
+        let batch = seg.commit_batch(
+            &pending(&parts),
+            0,
+            Some(std::io::ErrorKind::StorageFull.into()),
+        );
+        assert!(batch.offsets.is_empty());
+        assert!(batch.error.is_some());
+        assert_eq!(seg.len(), committed_before);
+        assert_eq!(seg.next_ordinal(), 1);
+        assert_eq!(
+            std::fs::metadata(seg.path()).unwrap().len(),
+            committed_before
+        );
+    }
+
+    /// A sink that takes at most `chunk` bytes per call and refuses more
+    /// than `cap` in total, standing in for a short write.
+    struct ChokedSink {
+        taken: Vec<u8>,
+        chunk: usize,
+        cap: usize,
+    }
+
+    impl Write for ChokedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let room = self.cap.saturating_sub(self.taken.len());
+            if room == 0 {
+                return Err(std::io::ErrorKind::StorageFull.into());
+            }
+            let n = buf.len().min(self.chunk).min(room);
+            self.taken.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn short_writes_are_retried_until_the_batch_lands() {
+        let parts: Vec<_> = (0..3u32)
+            .map(|i| header_and_body(i, format!("body {i}").as_bytes()))
+            .collect();
+        let records = pending(&parts);
+        let total: u64 = records.iter().map(|r| r.len()).sum();
+        let mut expected = Vec::new();
+        for r in &records {
+            expected.extend_from_slice(r.header);
+            expected.extend_from_slice(r.body);
+        }
+
+        let mut slices: Vec<IoSlice<'_>> = records
+            .iter()
+            .flat_map(|r| [IoSlice::new(r.header), IoSlice::new(r.body)])
+            .collect();
+        let mut sink = ChokedSink {
+            taken: Vec::new(),
+            chunk: 7,
+            cap: usize::MAX,
+        };
+        let (written, error) = write_all_vectored(&mut sink, &mut slices);
+        assert!(error.is_none());
+        assert_eq!(written, total);
+        assert_eq!(sink.taken, expected);
+
+        // A sink that stops early reports exactly what it took, which is
+        // what tells commit_batch how much of the batch survived.
+        let mut slices: Vec<IoSlice<'_>> = records
+            .iter()
+            .flat_map(|r| [IoSlice::new(r.header), IoSlice::new(r.body)])
+            .collect();
+        let cap = records[0].len() as usize + 5;
+        let mut sink = ChokedSink {
+            taken: Vec::new(),
+            chunk: 7,
+            cap,
+        };
+        let (written, error) = write_all_vectored(&mut sink, &mut slices);
+        assert!(error.is_some());
+        assert_eq!(written, cap as u64);
+        assert_eq!(sink.taken, expected[..cap]);
     }
 
     #[test]
