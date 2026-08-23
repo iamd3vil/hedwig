@@ -6,11 +6,15 @@
 //! released once the bytes have been handed to the kernel page cache. SMTP
 //! acceptance awaits only this append completion.
 //!
-//! Publish ordering per record (PLAN §9.5): write the complete record, then
-//! advance the shard's committed head under the state lock, then notify the
-//! dispatcher, then complete the request. The committed head never exposes
-//! a partial record.
+//! Publish ordering (PLAN §9.5): write the complete records, then advance
+//! the shard's committed head under the state lock, then notify the
+//! dispatcher, then complete the requests. The committed head never exposes
+//! a partial record — records already queued when the writer wakes are
+//! coalesced into one vectored append and published together, and a write
+//! that tears is rolled back to the last record boundary before the head
+//! moves.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -34,6 +38,12 @@ pub struct WriterConfig {
     /// Total bytes of not-yet-written admission buffering across all shards.
     pub pending_append_bytes: u64,
 }
+
+/// Most records coalesced into one vectored append. Two iovecs per record
+/// keeps the array well under IOV_MAX (1024 on Linux), past which writev
+/// would short-write and cost extra syscalls anyway. Admission bounds the
+/// bytes; this bounds the syscall.
+const MAX_BATCH_RECORDS: usize = 64;
 
 /// One committed segment head. `committed` is the offset one past the last
 /// complete record; for sealed entries it is the segment's final length.
@@ -399,94 +409,211 @@ impl ShardWriter {
         config: WriterConfig,
     ) {
         while let Some(msg) = rx.blocking_recv() {
-            let req = match msg {
+            let first = match msg {
                 WriterMsg::Append(req) => req,
                 // Dropping the receiver fails any requests queued after the
                 // sentinel with WriterClosed (their completions drop).
                 WriterMsg::Shutdown => break,
             };
-            let result = self.write_one(&req, &shared, &config);
-            if let Err(e) = &result {
-                crate::metrics::logqueue_append_error();
-                tracing::error!(
-                    shard = shared.shard(),
-                    message_id = %req.msg.message_id,
-                    error = %e,
-                    "append failed"
-                );
+            let (batch, shutdown) = Self::collect_batch(first, &mut rx);
+            self.write_batch(batch, &shared, &config);
+            if shutdown {
+                break;
             }
-            // Publish ordering: head advanced and dispatcher notified inside
-            // write_one BEFORE this completion is sent.
-            let _ = req.completion.send(result);
         }
         tracing::debug!(shard = shared.shard(), "append writer drained and stopped");
     }
 
-    fn write_one(
+    /// Take `first` plus whatever admission has already queued behind it, up
+    /// to the batch cap. Nothing is ever waited for, so a lone append is as
+    /// prompt as before; a backlog costs one vectored write and one published
+    /// head instead of one each.
+    ///
+    /// The returned flag means the shutdown sentinel was reached: everything
+    /// queued ahead of it is still written, then the writer exits.
+    fn collect_batch(
+        first: AppendRequest,
+        rx: &mut mpsc::UnboundedReceiver<WriterMsg>,
+    ) -> (VecDeque<AppendRequest>, bool) {
+        let mut batch = VecDeque::with_capacity(MAX_BATCH_RECORDS);
+        batch.push_back(first);
+        while batch.len() < MAX_BATCH_RECORDS {
+            match rx.try_recv() {
+                Ok(WriterMsg::Append(req)) => batch.push_back(req),
+                Ok(WriterMsg::Shutdown) => return (batch, true),
+                // Empty or disconnected: write what we have. A disconnect
+                // ends the outer loop on the next blocking_recv.
+                Err(_) => break,
+            }
+        }
+        (batch, false)
+    }
+
+    /// Write a whole batch and complete every request in it. One batch may
+    /// take several appends: a chunk ends where the active segment has to
+    /// rotate, or where a write failed.
+    fn write_batch(
         &mut self,
-        req: &AppendRequest,
+        mut batch: VecDeque<AppendRequest>,
         shared: &ShardShared,
         config: &WriterConfig,
-    ) -> Result<JobLocation, QueueError> {
+    ) {
+        while !batch.is_empty() {
+            let results = self.write_chunk(batch.make_contiguous(), shared, config);
+            debug_assert!(!results.is_empty() && results.len() <= batch.len());
+            for result in results {
+                let req = batch
+                    .pop_front()
+                    .expect("write_chunk returns at most one result per request");
+                if let Err(e) = &result {
+                    crate::metrics::logqueue_append_error();
+                    tracing::error!(
+                        shard = shared.shard(),
+                        message_id = %req.msg.message_id,
+                        error = %e,
+                        "append failed"
+                    );
+                }
+                // Publish ordering: head advanced and dispatcher notified
+                // inside write_chunk BEFORE this completion is sent.
+                let _ = req.completion.send(result);
+            }
+        }
+    }
+
+    /// Append as much of `reqs` as the active segment can take in one
+    /// vectored write, publish the new committed head, and return one result
+    /// per request resolved — always at least one, so the caller makes
+    /// progress. Requests beyond the returned results are left untouched for
+    /// the next chunk.
+    fn write_chunk(
+        &mut self,
+        reqs: &[AppendRequest],
+        shared: &ShardShared,
+        config: &WriterConfig,
+    ) -> Vec<Result<JobLocation, QueueError>> {
         // Recreate the active segment if the previous rotation sealed the
         // old one but failed to create its replacement.
         if self.active.is_none() {
-            let seg = ActiveSegment::create(self.dir.path(), self.next_segment)?;
-            self.next_segment += 1;
-            shared.open_segment(seg.segment());
-            self.active = Some(seg);
+            match ActiveSegment::create(self.dir.path(), self.next_segment) {
+                Ok(seg) => {
+                    self.next_segment += 1;
+                    shared.open_segment(seg.segment());
+                    self.active = Some(seg);
+                }
+                // An error belongs to one request (it cannot be cloned, and
+                // reporting it once is honest); the next chunk retries the
+                // create for the rest.
+                Err(e) => return vec![Err(e)],
+            }
         }
-        // Rotate if this record would overflow the target size (never on an
-        // empty segment: sizing validation guarantees any legal record fits
-        // within a full segment).
+        // Rotate if the first record would overflow the target size (never
+        // on an empty segment: sizing validation guarantees any legal record
+        // fits within a full segment).
         let active = self.active.as_ref().expect("just ensured");
         if active.len() > 0
-            && active.len() + req.sizes.record_len as u64 > config.segment_target_bytes
+            && active.len() + reqs[0].sizes.record_len as u64 > config.segment_target_bytes
         {
-            self.rotate(shared)?;
+            if let Err(e) = self.rotate(shared) {
+                return vec![Err(e)];
+            }
         }
 
         let active = self.active.as_mut().expect("rotate keeps an active segment");
-        let ordinal = active.next_ordinal();
-        let params = RecordParams {
-            message_id: req.msg.message_id,
-            enqueue_ms: req.msg.enqueue_ms,
-            generation: req.msg.generation,
-            ordinal,
-            sender: &req.msg.sender,
-            recipients: &req.msg.recipients,
-            body: &req.msg.body,
-        };
-        // Encode the header only and let the kernel gather it with the body:
-        // copying a multi-megabyte body into a contiguous buffer once per
-        // append buys nothing over a two-iovec write.
-        let header = record::encode_header(&params, req.sizes)?;
+        // Records never span segments, so the chunk stops at the segment
+        // target and the remainder rotates in the next one. The first record
+        // always goes in, whatever its size, or the batch could not drain.
+        let room = config.segment_target_bytes.saturating_sub(active.len());
+        let mut count = 0;
+        let mut chunk_bytes = 0u64;
+        for req in reqs {
+            let len = req.sizes.record_len as u64;
+            if count > 0 && chunk_bytes + len > room {
+                break;
+            }
+            chunk_bytes += len;
+            count += 1;
+        }
+
+        // Ordinals are consecutive from the segment's next ordinal, which is
+        // what append_batch and the tail validator both require.
+        let base_ordinal = active.next_ordinal();
+        let mut headers = Vec::with_capacity(count);
+        for (i, req) in reqs[..count].iter().enumerate() {
+            let params = RecordParams {
+                message_id: req.msg.message_id,
+                enqueue_ms: req.msg.enqueue_ms,
+                generation: req.msg.generation,
+                ordinal: base_ordinal + i as u32,
+                sender: &req.msg.sender,
+                recipients: &req.msg.recipients,
+                body: &req.msg.body,
+            };
+            // Header only: the kernel gathers it with the body, so a
+            // multi-megabyte message is never copied to make the record
+            // contiguous.
+            match record::encode_header(&params, req.sizes) {
+                Ok(header) => headers.push(header),
+                // Admission measured these sizes, so this is unreachable.
+                // Were it not, the offending record must not take the rest
+                // of the chunk down with it.
+                Err(e) if i == 0 => return vec![Err(e)],
+                Err(_) => break,
+            }
+        }
+        let count = headers.len();
+        let records: Vec<PendingRecord<'_>> = headers
+            .iter()
+            .zip(reqs)
+            .map(|(header, req)| PendingRecord {
+                header,
+                body: &req.msg.body,
+            })
+            .collect();
 
         let write_started = std::time::Instant::now();
-        let mut batch = active.append_batch(&[PendingRecord {
-            header: &header,
-            body: &req.msg.body,
-        }]);
-        if let Some(e) = batch.error {
-            return Err(e);
-        }
-        let offset = batch.offsets.pop().expect("committed record has an offset");
+        let batch = active.append_batch(&records);
+        // One observation per vectored write: that is the latency every
+        // record in the chunk shared.
         crate::metrics::logqueue_append_duration_observe(shared.shard(), write_started.elapsed());
-        crate::metrics::logqueue_records_appended(shared.shard(), 1);
-        crate::metrics::logqueue_bytes_appended(shared.shard(), req.sizes.record_len as u64);
-        crate::metrics::logqueue_active_segment_bytes_set(shared.shard(), active.len());
-        let location = JobLocation {
-            shard: shared.shard(),
-            segment: active.segment(),
-            offset,
-            length: req.sizes.record_len,
-            ordinal,
-            generation: req.msg.generation,
-        };
 
-        shared.advance_committed(location.segment, active.len());
-        shared.notify.notify_one();
-        Ok(location)
+        let committed = batch.offsets.len();
+        debug_assert!(committed <= count);
+        if committed > 0 {
+            let bytes: u64 = reqs[..committed]
+                .iter()
+                .map(|r| r.sizes.record_len as u64)
+                .sum();
+            crate::metrics::logqueue_records_appended(shared.shard(), committed as u64);
+            crate::metrics::logqueue_bytes_appended(shared.shard(), bytes);
+            crate::metrics::logqueue_active_segment_bytes_set(shared.shard(), active.len());
+            // Publish once for the chunk: the head moves straight from the
+            // old tail to the end of the last record that fully landed, so
+            // it never exposes a record the write tore.
+            shared.advance_committed(active.segment(), active.len());
+            shared.notify.notify_one();
+        }
+
+        let mut results = Vec::with_capacity(committed + 1);
+        for (i, offset) in batch.offsets.iter().enumerate() {
+            results.push(Ok(JobLocation {
+                shard: shared.shard(),
+                segment: active.segment(),
+                offset: *offset,
+                length: reqs[i].sizes.record_len,
+                ordinal: base_ordinal + i as u32,
+                generation: reqs[i].msg.generation,
+            }));
+        }
+        if let Some(e) = batch.error {
+            // The record the write stopped on takes the error; anything
+            // after it never reached the file and is retried by the next
+            // chunk. append_batch only errors with a record left unwritten,
+            // so this stays within one result per request.
+            debug_assert!(committed < reqs.len());
+            results.push(Err(e));
+        }
+        results
     }
 
     fn rotate(&mut self, shared: &ShardShared) -> Result<(), QueueError> {
@@ -808,6 +935,197 @@ mod tests {
         handle.append(message(1000, &big_body)).await.unwrap();
 
         writers.shutdown().await;
+    }
+
+    /// One queued request, for the batch-collection tests.
+    fn request(seq: u64) -> (AppendRequest, oneshot::Receiver<Result<JobLocation, QueueError>>) {
+        let msg = message(seq, b"body");
+        let params = RecordParams {
+            message_id: msg.message_id,
+            enqueue_ms: msg.enqueue_ms,
+            generation: msg.generation,
+            ordinal: 0,
+            sender: &msg.sender,
+            recipients: &msg.recipients,
+            body: &msg.body,
+        };
+        let sizes = record::encoded_sizes(&params).unwrap();
+        let (tx, rx) = oneshot::channel();
+        (
+            AppendRequest {
+                msg,
+                sizes,
+                completion: tx,
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn batch_collection_drains_the_backlog_up_to_the_cap() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let queued = MAX_BATCH_RECORDS + 5;
+        let mut keep_alive = Vec::new();
+        for i in 0..queued as u64 {
+            let (req, completion) = request(i);
+            keep_alive.push(completion);
+            tx.send(WriterMsg::Append(req)).unwrap();
+        }
+        tx.send(WriterMsg::Shutdown).unwrap();
+
+        // First batch fills to the cap and does not see the sentinel yet.
+        let first = match rx.try_recv().unwrap() {
+            WriterMsg::Append(req) => req,
+            WriterMsg::Shutdown => panic!("sentinel arrived first"),
+        };
+        let (batch, shutdown) = ShardWriter::collect_batch(first, &mut rx);
+        assert_eq!(batch.len(), MAX_BATCH_RECORDS);
+        assert!(!shutdown);
+
+        // The rest come out in one batch, and the sentinel is reported
+        // rather than swallowed.
+        let first = match rx.try_recv().unwrap() {
+            WriterMsg::Append(req) => req,
+            WriterMsg::Shutdown => panic!("sentinel arrived before the backlog"),
+        };
+        let (batch, shutdown) = ShardWriter::collect_batch(first, &mut rx);
+        assert_eq!(batch.len(), queued - MAX_BATCH_RECORDS - 1 + 1);
+        assert!(shutdown);
+    }
+
+    #[test]
+    fn batch_collection_of_a_lone_request_does_not_wait() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (req, _completion) = request(1);
+        tx.send(WriterMsg::Append(req)).unwrap();
+        let first = match rx.try_recv().unwrap() {
+            WriterMsg::Append(req) => req,
+            WriterMsg::Shutdown => panic!("unexpected sentinel"),
+        };
+        let (batch, shutdown) = ShardWriter::collect_batch(first, &mut rx);
+        assert_eq!(batch.len(), 1);
+        assert!(!shutdown);
+    }
+
+    /// A burst large enough that the writer coalesces records must produce
+    /// exactly the same spool as one-at-a-time appends: dense offsets, one
+    /// ordinal per record, every body intact and a tail that validates.
+    #[tokio::test]
+    async fn coalesced_burst_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path().join("spool"), 1).unwrap();
+        let writers = LogWriters::start(&spool, config()).unwrap();
+        let handle = writers.handle();
+
+        let count = 300u64;
+        let mut tasks = Vec::new();
+        for i in 0..count {
+            let handle = handle.clone();
+            tasks.push(tokio::spawn(async move {
+                let body = vec![b'x'; (i % 97 + 1) as usize];
+                let msg = message(i, &body);
+                let id = msg.message_id;
+                (id, body, handle.append_to_shard(0, msg).await.unwrap())
+            }));
+        }
+        let mut landed = Vec::new();
+        for t in tasks {
+            landed.push(t.await.unwrap());
+        }
+
+        let chain = handle.shard_shared(0).chain();
+        assert_eq!(chain.len(), 1, "one segment expected: {chain:?}");
+        let head = chain[0];
+        writers.shutdown().await;
+
+        landed.sort_by_key(|(_, _, loc)| loc.offset);
+        let mut expected_offset = 0u64;
+        let path = spool
+            .shard(0)
+            .path()
+            .join(crate::logqueue::segment::active_file_name(head.segment));
+        let reader = SegmentReader::open(&path).unwrap();
+        for (ordinal, (id, body, loc)) in landed.iter().enumerate() {
+            assert_eq!(loc.offset, expected_offset, "hole at ordinal {ordinal}");
+            assert_eq!(loc.ordinal, ordinal as u32);
+            expected_offset += loc.length as u64;
+            let (header, record) = reader
+                .read_record_exact(loc.offset, loc.length, MAX_RECORD_LEN)
+                .unwrap();
+            assert_eq!(header.message_id, *id);
+            assert_eq!(&record[header.header_len as usize..], &body[..]);
+        }
+        assert_eq!(head.committed, expected_offset);
+
+        let v = validate_active_tail(&path, MAX_RECORD_LEN).unwrap();
+        assert_eq!(v.records, count as u32);
+        assert_eq!(v.truncated_bytes, 0);
+        assert_eq!(v.committed_len, expected_offset);
+    }
+
+    /// A batch that outgrows the active segment must split at the rotation
+    /// boundary: records never span segments, and each segment's ordinals
+    /// restart at zero.
+    #[tokio::test]
+    async fn coalesced_burst_splits_across_rotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path().join("spool"), 1).unwrap();
+        let mut cfg = config();
+        cfg.segment_target_bytes = 8192;
+        let writers = LogWriters::start(&spool, cfg).unwrap();
+        let handle = writers.handle();
+
+        let count = 200u64;
+        let mut tasks = Vec::new();
+        for i in 0..count {
+            let handle = handle.clone();
+            tasks.push(tokio::spawn(async move {
+                let body = vec![b'w'; 700];
+                handle.append_to_shard(0, message(i, &body)).await.unwrap()
+            }));
+        }
+        let mut landed = Vec::new();
+        for t in tasks {
+            landed.push(t.await.unwrap());
+        }
+
+        let chain = handle.shard_shared(0).chain();
+        assert!(chain.len() > 1, "expected rotations, chain: {chain:?}");
+        writers.shutdown().await;
+
+        // Per segment: offsets dense from zero, ordinals dense from zero,
+        // and nothing past the published committed head.
+        let mut by_segment: std::collections::BTreeMap<u64, Vec<&JobLocation>> = Default::default();
+        for loc in &landed {
+            by_segment.entry(loc.segment).or_default().push(loc);
+        }
+        assert_eq!(by_segment.len(), chain.len());
+        let mut total = 0;
+        for (segment, mut locs) in by_segment {
+            locs.sort_by_key(|l| l.offset);
+            let head = chain.iter().find(|h| h.segment == segment).unwrap();
+            let mut expected_offset = 0u64;
+            for (i, loc) in locs.iter().enumerate() {
+                assert_eq!(loc.offset, expected_offset, "hole in segment {segment}");
+                assert_eq!(loc.ordinal, i as u32, "ordinal gap in segment {segment}");
+                expected_offset += loc.length as u64;
+                total += 1;
+            }
+            assert_eq!(head.committed, expected_offset);
+            let name = if head.sealed {
+                crate::logqueue::segment::sealed_file_name(segment)
+            } else {
+                crate::logqueue::segment::active_file_name(segment)
+            };
+            let path = spool.shard(0).path().join(name);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), head.committed);
+            if !head.sealed {
+                let v = validate_active_tail(&path, MAX_RECORD_LEN).unwrap();
+                assert_eq!(v.truncated_bytes, 0);
+                assert_eq!(v.records as usize, locs.len());
+            }
+        }
+        assert_eq!(total, count);
     }
 
     #[tokio::test]
