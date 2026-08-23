@@ -414,6 +414,9 @@ impl SmtpServer {
         // Length of data_buffer already searched for the DATA terminator;
         // lets each read scan only the newly received bytes.
         let mut data_scanned: usize = 0;
+        // Latched once a message exceeds the size limit, so the shedding
+        // that keeps memory bounded cannot make it look small again.
+        let mut data_oversized = false;
         // Set when `buf` already holds bytes the client pipelined after an
         // end-of-DATA: they are commands, and blocking on a read before
         // answering them would hang the connection until the idle timeout.
@@ -450,8 +453,15 @@ impl SmtpServer {
             buffered_commands = false;
 
             if receiving_data {
-                self.process_data(session, stream, &mut buf, &mut data_buffer, &mut data_scanned)
-                    .await?;
+                self.process_data(
+                    session,
+                    stream,
+                    &mut buf,
+                    &mut data_buffer,
+                    &mut data_scanned,
+                    &mut data_oversized,
+                )
+                .await?;
                 buffered_commands =
                     session.state != SessionState::ReceivingData && !buf.is_empty();
                 continue;
@@ -507,6 +517,8 @@ impl SmtpServer {
                             reply.clear();
                             buf.clear();
                             data_buffer.clear();
+                            data_scanned = 0;
+                            data_oversized = false;
                             // Bound the handshake so a client that goes
                             // silent after STARTTLS can't hold the
                             // connection (and its permit) forever.
@@ -558,8 +570,15 @@ impl SmtpServer {
                 // Content the client sent in the same packet as DATA.
                 data_buffer.extend_from_slice(&buf);
                 buf.clear();
-                self.process_data(session, stream, &mut buf, &mut data_buffer, &mut data_scanned)
-                    .await?;
+                self.process_data(
+                    session,
+                    stream,
+                    &mut buf,
+                    &mut data_buffer,
+                    &mut data_scanned,
+                    &mut data_oversized,
+                )
+                .await?;
                 buffered_commands =
                     session.state != SessionState::ReceivingData && !buf.is_empty();
             }
@@ -576,29 +595,45 @@ impl SmtpServer {
         buf: &mut BytesMut,
         data_buffer: &mut BytesMut,
         data_scanned: &mut usize,
+        oversized: &mut bool,
     ) -> Result<()> {
         // Both callers drain `buf` before handing bytes to DATA, so
         // appending leftovers below preserves wire order.
         debug_assert!(buf.is_empty(), "command buffer must be drained during DATA");
-        // Only the newly received bytes need to be searched; earlier
-        // reads already covered the rest.
-        let terminator = find_data_terminator(data_buffer, *data_scanned);
+        // Once over the limit, stay over it: the shedding below trims the
+        // buffer back under `max_message_size`, and without this latch the
+        // size check would pass again and the truncated remains would be
+        // accepted with a 250.
+        *oversized |= data_buffer.len() > self.max_message_size;
+
+        // End of data: `<CRLF>.<CRLF>`, or a lone `.<CRLF>` when the body is
+        // empty (RFC 5321 4.1.1.4 — there is no preceding line to end). The
+        // empty form is only meaningful while the buffer still starts at the
+        // first body byte, which shedding below breaks.
+        let end = if !*oversized && data_buffer.starts_with(b".\r\n") {
+            Some((0usize, 3usize))
+        } else {
+            // Only the newly received bytes need to be searched; earlier
+            // reads already covered the rest.
+            find_data_terminator(data_buffer, *data_scanned)
+                .map(|pos| (pos, pos + DATA_TERMINATOR.len()))
+        };
 
         // Enforce message size limit.
         // After rejecting, keep discarding until the DATA terminator
         // (<CRLF>.<CRLF>) so the remaining body bytes aren't
         // misparsed as SMTP commands on this connection.
-        if data_buffer.len() > self.max_message_size {
-            if let Some(pos) = terminator {
+        if *oversized {
+            if let Some((_, consumed)) = end {
                 stream.write_line(b"552 5.3.4 Message too big\r\n").await?;
                 // Keep whatever followed the terminator: it is the next
                 // command group, not part of the rejected message.
-                let end = pos + DATA_TERMINATOR.len();
-                if end < data_buffer.len() {
-                    buf.extend_from_slice(&data_buffer[end..]);
+                if consumed < data_buffer.len() {
+                    buf.extend_from_slice(&data_buffer[consumed..]);
                 }
                 data_buffer.clear();
                 *data_scanned = 0;
+                *oversized = false;
                 session.state = SessionState::Authenticated;
             }
             // Otherwise keep accumulating until terminator arrives,
@@ -616,22 +651,22 @@ impl SmtpServer {
             return Ok(());
         }
 
-        match terminator {
-            Some(pos) => {
+        match end {
+            Some((body_end, consumed)) => {
                 // A stuffed dot can only start the message or follow a CRLF;
                 // when neither occurs (the overwhelmingly common case) the
                 // body is a zero-copy slice of the receive buffer.
                 let stuffed = {
-                    let raw = &data_buffer[..pos];
+                    let raw = &data_buffer[..body_end];
                     raw.starts_with(b".") || memchr::memmem::find(raw, b"\r\n.").is_some()
                 };
                 session.email.body = if stuffed {
-                    let body = Bytes::from(unstuff_dot_lines(&data_buffer[..pos]));
-                    data_buffer.advance(pos + DATA_TERMINATOR.len());
+                    let body = Bytes::from(unstuff_dot_lines(&data_buffer[..body_end]));
+                    data_buffer.advance(consumed);
                     body
                 } else {
-                    let body = data_buffer.split_to(pos).freeze();
-                    data_buffer.advance(DATA_TERMINATOR.len());
+                    let body = data_buffer.split_to(body_end).freeze();
+                    data_buffer.advance(consumed - body_end);
                     body
                 };
                 // RFC 2920 allows a command group after the end-of-data dot
@@ -917,6 +952,15 @@ impl SmtpServer {
     }
 }
 
+/// Copies one body line into `output`, removing the transparency dot the
+/// sender added (RFC 5321 4.5.2). `segment` must start at a line boundary.
+fn push_unstuffed_line(output: &mut Vec<u8>, segment: &[u8]) {
+    match segment.split_first() {
+        Some((b'.', rest)) => output.extend_from_slice(rest),
+        _ => output.extend_from_slice(segment),
+    }
+}
+
 // unstuff_dot_lines removes dot-stuffing from a raw message slice in place without converting to a string.
 fn unstuff_dot_lines(input: &[u8]) -> Vec<u8> {
     // Prepare an output buffer with the same capacity as the input.
@@ -940,13 +984,16 @@ fn unstuff_dot_lines(input: &[u8]) -> Vec<u8> {
                 output.extend_from_slice(b"\r\n");
                 offset = line_end + 2;
             } else {
-                // CR is not followed by LF; copy the rest and break.
-                output.extend_from_slice(&input[offset..]);
+                // CR is not followed by LF; copy the rest and break. It
+                // still begins a line, so its stuffing comes off.
+                push_unstuffed_line(&mut output, &input[offset..]);
                 break;
             }
         } else {
-            // No CR found, copy the remaining bytes.
-            output.extend_from_slice(&input[offset..]);
+            // The final line: its CRLF was consumed as part of the
+            // end-of-data sequence, but it is a line like any other and its
+            // transparency dot must come off too.
+            push_unstuffed_line(&mut output, &input[offset..]);
             break;
         }
     }
@@ -1007,6 +1054,27 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn test_unstuff_dot_lines_covers_every_line_position() {
+        // Nothing to do: returned unchanged.
+        assert_eq!(unstuff_dot_lines(b"plain\r\nlines"), b"plain\r\nlines");
+        // First, middle and final line, the final one having no CRLF of its
+        // own because the end-of-data sequence consumed it.
+        assert_eq!(
+            unstuff_dot_lines(b".first\r\nmid\r\n..last"),
+            b"first\r\nmid\r\n.last"
+        );
+        // A body that is exactly one stuffed line.
+        assert_eq!(unstuff_dot_lines(b".."), b".");
+        // Only the leading dot goes; interior dots are content.
+        assert_eq!(unstuff_dot_lines(b"..a.b"), b".a.b");
+        // Empty input and a lone CRLF are untouched.
+        assert_eq!(unstuff_dot_lines(b""), b"");
+        assert_eq!(unstuff_dot_lines(b"\r\n"), b"\r\n");
+        // A bare CR ends the scan; that trailing segment is still a line.
+        assert_eq!(unstuff_dot_lines(b"a\r\n.b\rc"), b"a\r\nb\rc");
+    }
 
     #[test]
     fn test_find_data_terminator_in_one_chunk() {
@@ -1279,13 +1347,20 @@ mod tests {
     /// server wrote, given a list of client writes performed after DATA is
     /// acknowledged. Each write goes out as one segment.
     async fn run_pipelined_session(writes: &[&[u8]]) -> (String, Vec<Email>) {
+        run_session_with(DEFAULT_MAX_MESSAGE_SIZE, writes).await
+    }
+
+    async fn run_session_with(
+        max_message_size: usize,
+        writes: &[&[u8]],
+    ) -> (String, Vec<Email>) {
         let callbacks = Arc::new(RecordingCallbacks {
             emails: StdMutex::new(Vec::new()),
         });
         let server = SmtpServer {
             callbacks: callbacks.clone(),
             auth_enabled: false,
-            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_message_size,
             cmd_timeout: Duration::from_secs(5),
             data_timeout: Duration::from_secs(5),
             hostname: "test.local".to_string(),
@@ -1318,6 +1393,88 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
         let emails = callbacks.emails.lock().unwrap().drain(..).collect();
         (String::from_utf8_lossy(&sink).to_string(), emails)
+    }
+
+    /// A message over the size limit must be rejected with 552, not
+    /// accepted. The shedding path used to trim the buffer below the limit
+    /// while discarding the body, so by the time the terminator arrived the
+    /// size check passed and the server answered 250 for a body consisting
+    /// of the few bytes it happened to keep.
+    #[tokio::test]
+    async fn test_oversize_message_is_rejected_not_silently_accepted() {
+        let big = vec![b'x'; 32 * 1024];
+        let mut body = b"Subject: huge\r\n\r\n".to_vec();
+        body.extend_from_slice(&big);
+        body.extend_from_slice(b"\r\n.\r\n");
+        let (replies, emails) = run_session_with(
+            1024,
+            &[
+                b"EHLO client.test\r\n",
+                b"MAIL FROM:<a@example.com>\r\nRCPT TO:<b@example.org>\r\nDATA\r\n",
+                &body,
+                // The session must still be usable afterwards.
+                b"MAIL FROM:<c@example.com>\r\nRCPT TO:<d@example.org>\r\nDATA\r\n",
+                b"Subject: small\r\n\r\nfits\r\n.\r\nQUIT\r\n",
+            ],
+        )
+        .await;
+
+        assert!(
+            replies.contains("552"),
+            "oversize message must be refused with 552, got {replies:?}"
+        );
+        assert_eq!(
+            emails.len(),
+            1,
+            "only the small message may be accepted, got {} -- {replies:?}",
+            emails.len()
+        );
+        assert!(
+            emails[0].body.ends_with(b"fits"),
+            "the accepted message must be the small one, got {:?}",
+            emails[0].body
+        );
+        assert!(replies.contains("221"), "session must stay usable: {replies:?}");
+    }
+
+    /// RFC 5321 permits an empty message body: the client sends the
+    /// end-of-data dot immediately after the 354. There is no preceding CRLF
+    /// for the usual <CRLF>.<CRLF> to match, so this used to stall until the
+    /// data timeout.
+    #[tokio::test]
+    async fn test_empty_message_body_is_accepted() {
+        let (replies, emails) = run_pipelined_session(&[
+            b"EHLO client.test\r\n",
+            b"MAIL FROM:<a@example.com>\r\nRCPT TO:<b@example.org>\r\nDATA\r\n",
+            b".\r\nQUIT\r\n",
+        ])
+        .await;
+
+        assert_eq!(emails.len(), 1, "empty body must be accepted: {replies:?}");
+        assert!(emails[0].body.is_empty(), "body must be empty, got {:?}", emails[0].body);
+        assert!(replies.contains("221"), "session must continue: {replies:?}");
+    }
+
+    /// The last body line's CRLF is consumed as part of the end-of-data
+    /// sequence, so it used to escape unstuffing: a message whose final line
+    /// is "." arrived as "..".
+    #[tokio::test]
+    async fn test_trailing_stuffed_line_is_unstuffed() {
+        let (replies, emails) = run_pipelined_session(&[
+            b"EHLO client.test\r\n",
+            b"MAIL FROM:<a@example.com>\r\nRCPT TO:<b@example.org>\r\nDATA\r\n",
+            // Wire form of a message whose last line is a single ".".
+            b"hello\r\n..\r\n.\r\nQUIT\r\n",
+        ])
+        .await;
+
+        assert_eq!(emails.len(), 1, "message must be accepted: {replies:?}");
+        assert_eq!(
+            &emails[0].body[..],
+            b"hello\r\n.",
+            "trailing stuffed dot must be removed, got {:?}",
+            emails[0].body
+        );
     }
 
     /// A client may pipeline a command group after the end-of-DATA dot, and
