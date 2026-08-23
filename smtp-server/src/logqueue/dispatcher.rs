@@ -151,11 +151,18 @@ impl Drop for Claim {
 
 type ClaimWaiter = oneshot::Sender<Option<Claim>>;
 
+/// Open segment readers shared by the worker-facing handle and the
+/// dispatcher (which evicts entries when it deletes a segment). An open
+/// descriptor keeps working across the seal-rename and the unlink, so
+/// eviction only bounds the map — it is never needed for correctness.
+type WorkerReaderCache = Arc<std::sync::Mutex<HashMap<(u16, u64), Arc<SegmentReader>>>>;
+
 /// Cloneable handle workers use to pull claims and read message bodies.
 #[derive(Clone)]
 pub struct DispatcherHandle {
     claim_tx: mpsc::Sender<ClaimWaiter>,
     shard_dirs: Arc<Vec<PathBuf>>,
+    readers: WorkerReaderCache,
 }
 
 impl DispatcherHandle {
@@ -169,13 +176,26 @@ impl DispatcherHandle {
 
     /// Read and verify a message body by its location (blocking I/O runs on
     /// a blocking task). Returns the body bytes.
-    pub async fn read_body(&self, location: JobLocation) -> Result<Vec<u8>, QueueError> {
+    pub async fn read_body(&self, location: JobLocation) -> Result<bytes::Bytes, QueueError> {
+        let key = (location.shard, location.segment);
+        let cached = self.readers.lock().unwrap().get(&key).cloned();
         let dir = self.shard_dirs[location.shard as usize].clone();
+        let readers = Arc::clone(&self.readers);
         tokio::task::spawn_blocking(move || {
-            let reader = open_segment_reader(&dir, location.segment)?;
-            let (_, body) =
-                reader.read_record_at(location.offset, super::record::MAX_RECORD_LEN)?;
-            Ok(body)
+            let reader = match cached {
+                Some(r) => r,
+                None => {
+                    let r = Arc::new(open_segment_reader(&dir, location.segment)?);
+                    readers.lock().unwrap().insert(key, Arc::clone(&r));
+                    r
+                }
+            };
+            let (header, buf) = reader.read_record_exact(
+                location.offset,
+                location.length,
+                super::record::MAX_RECORD_LEN,
+            )?;
+            Ok(bytes::Bytes::from(buf).slice(header.header_len as usize..))
         })
         .await
         .expect("read_body task panicked")
@@ -291,6 +311,9 @@ pub struct Dispatcher {
     compaction: Option<CompactionRun>,
     events_tx: mpsc::UnboundedSender<WorkerEvent>,
     cp_tx: mpsc::UnboundedSender<(u16, Result<(), QueueError>)>,
+    /// Same map the worker handle caches readers in; entries are evicted
+    /// here when their segment is deleted.
+    worker_readers: WorkerReaderCache,
 }
 
 impl Dispatcher {
@@ -307,9 +330,11 @@ impl Dispatcher {
         let (cp_tx, cp_rx) = mpsc::unbounded_channel();
 
         let shard_dirs = Arc::new(shard_inits.iter().map(|s| s.dir.clone()).collect::<Vec<_>>());
+        let worker_readers: WorkerReaderCache = Arc::default();
         let handle = DispatcherHandle {
             claim_tx,
             shard_dirs,
+            readers: Arc::clone(&worker_readers),
         };
 
         let mut dispatcher = Dispatcher {
@@ -326,6 +351,7 @@ impl Dispatcher {
             compaction: None,
             events_tx,
             cp_tx,
+            worker_readers,
         };
         for init in shard_inits {
             dispatcher.add_shard(init);
@@ -1049,6 +1075,10 @@ impl Dispatcher {
         shard.tombstones.remove(&segment);
         shard.stats.remove(&segment);
         shard.shared.remove_segment(segment);
+        self.worker_readers
+            .lock()
+            .unwrap()
+            .remove(&(self.shards[shard_idx].shard, segment));
         if let Some(run) = &self.compaction {
             if run.shard_idx == shard_idx && run.segment == segment {
                 self.compaction = None; // everything left in it just died
@@ -1168,11 +1198,11 @@ impl Dispatcher {
 
             let record = {
                 let shard = &mut self.shards[shard_idx];
-                shard
-                    .reader(source)
-                    .and_then(|r| r.read_record_at(old.offset, super::record::MAX_RECORD_LEN))
+                shard.reader(source).and_then(|r| {
+                    r.read_record_exact(old.offset, old.length, super::record::MAX_RECORD_LEN)
+                })
             };
-            let (header, body) = match record {
+            let (header, buf) = match record {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(message_id = %id, error = %e,
@@ -1182,6 +1212,7 @@ impl Dispatcher {
                     return;
                 }
             };
+            let body = bytes::Bytes::from(buf).slice(header.header_len as usize..);
 
             let append = self.append.clone();
             let new = match append
@@ -1193,7 +1224,7 @@ impl Dispatcher {
                         generation: old.generation + 1,
                         sender: header.sender,
                         recipients: header.recipients,
-                        body: bytes::Bytes::from(body),
+                        body,
                     },
                 )
                 .await
@@ -1470,7 +1501,7 @@ mod tests {
         assert_eq!(claim.job.recipients, vec!["r1@example.com".to_string()]);
 
         let body = h.handle.read_body(claim.job.location).await.unwrap();
-        assert_eq!(body, b"body 1");
+        assert_eq!(&body[..], b"body 1");
 
         claim.report(JobOutcome::Delivered {
             response: "250 ok".into(),
@@ -2093,7 +2124,7 @@ mod tests {
         assert_eq!(claim.job.message_id, id);
         assert_eq!(claim.job.location, new_loc);
         let body = handle.read_body(claim.job.location).await.unwrap();
-        assert_eq!(body, b"new copy");
+        assert_eq!(&body[..], b"new copy");
         claim.report(JobOutcome::Delivered {
             response: "250 ok".into(),
         });
