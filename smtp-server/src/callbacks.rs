@@ -307,7 +307,7 @@ impl Callbacks {
             generation: 0,
             sender: email.from,
             recipients: email.to,
-            body: bytes::Bytes::from(email.body.into_bytes()),
+            body: email.body,
         };
         tap.append.append(msg).await.map_err(|e| {
             warn!(error = %e, "append to log queue failed");
@@ -328,11 +328,17 @@ impl Callbacks {
         // We are using ulid as the message id instead of message_id from the email.
         // The issue is we can't depend on the email client to provide a unique message id.
         let body_len = email.body.len();
+        // The legacy spool format stores the body inside a JSON envelope, so
+        // it needs UTF-8. The log backend keeps the raw bytes.
+        let body = String::from_utf8(email.body.into()).map_err(|_| SmtpError::ParseError {
+            message: "Invalid UTF-8 in email body".into(),
+            span: (0, body_len).into(),
+        })?;
         let stored_email = StoredEmail {
             message_id: ulid.clone(),
             from: email.from,
             to: email.to,
-            body: email.body,
+            body,
             queued_at: Some(Utc::now()),
         };
         // Map any error into a SmtpError.
@@ -1323,7 +1329,7 @@ mod tests {
         let email = Email {
             from: "sender@example.com".to_string(),
             to: vec!["recipient@example.com".to_string()],
-            body: "Test email body".to_string(),
+            body: "Test email body".into(),
         };
 
         let result = callbacks.process_email(email).await;
@@ -1344,7 +1350,7 @@ mod tests {
         let email = Email {
             from: "sender@example.com".to_string(),
             to: vec!["recipient@example.com".to_string()],
-            body: "Test email body".to_string(),
+            body: "Test email body".into(),
         };
 
         let result = callbacks.process_email(email).await;
@@ -1599,7 +1605,7 @@ mod tests {
         let email = Email {
             from: "sender@example.com".to_string(),
             to: vec!["recipient@example.com".to_string()],
-            body: "Test email body".to_string(),
+            body: "Test email body".into(),
         };
 
         let result = callbacks.on_data(email).await;

@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use base64::prelude::*;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use memchr::memchr;
 use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
 use std::pin::Pin;
@@ -174,8 +174,10 @@ pub struct Email {
     pub from: String,
     /// A list of recipient email addresses.
     pub to: Vec<String>,
-    /// The full content of the email, including headers and body.
-    pub body: String,
+    /// The full content of the email, including headers and body. Kept as
+    /// raw bytes: message content is opaque to the server and is usually a
+    /// zero-copy slice of the receive buffer.
+    pub body: Bytes,
 }
 
 #[derive(Debug, PartialEq)]
@@ -411,12 +413,20 @@ impl SmtpServer {
         let mut data_scanned: usize = 0;
 
         loop {
-            let timeout = if session.state == SessionState::ReceivingData {
+            let receiving_data = session.state == SessionState::ReceivingData;
+            let timeout = if receiving_data {
                 self.data_timeout
             } else {
                 self.cmd_timeout
             };
-            let n = match tokio::time::timeout(timeout, stream.read_buf(&mut buf)).await {
+            // During DATA, read straight into the message buffer — no
+            // intermediate copy through `buf`.
+            let read_target = if receiving_data {
+                &mut data_buffer
+            } else {
+                &mut buf
+            };
+            let n = match tokio::time::timeout(timeout, stream.read_buf(read_target)).await {
                 Ok(result) => result.into_diagnostic()?,
                 Err(_) => {
                     let _ = stream
@@ -429,160 +439,205 @@ impl SmtpServer {
                 return Ok(());
             }
 
-            if session.state == SessionState::ReceivingData {
-                // Accumulate the incoming bytes.
-                data_buffer.extend_from_slice(&buf[..]);
-                buf.clear();
-
-                // Only the newly received bytes need to be searched; earlier
-                // reads already covered the rest.
-                let terminator = find_data_terminator(&data_buffer, data_scanned);
-
-                // Enforce message size limit.
-                // After rejecting, keep discarding until the DATA terminator
-                // (<CRLF>.<CRLF>) so the remaining body bytes aren't
-                // misparsed as SMTP commands on this connection.
-                if data_buffer.len() > self.max_message_size {
-                    if terminator.is_some() {
-                        stream.write_line(b"552 5.3.4 Message too big\r\n").await?;
-                        data_buffer.clear();
-                        data_scanned = 0;
-                        session.state = SessionState::Authenticated;
-                    }
-                    // Otherwise keep accumulating until terminator arrives,
-                    // but shed already-scanned bytes to bound memory usage.
-                    // We only need to keep the last 4 bytes for a split terminator.
-                    else if data_buffer.len() > self.max_message_size + 4096 {
-                        let keep_from = data_buffer.len() - 4;
-                        let tail: Vec<u8> = data_buffer[keep_from..].to_vec();
-                        data_buffer.clear();
-                        data_buffer.extend_from_slice(&tail);
-                        data_scanned = 0;
-                    } else {
-                        data_scanned = data_buffer.len();
-                    }
-                    continue;
-                }
-
-                match terminator {
-                    Some(pos) => {
-                        // raw_message holds all data up to the termination sequence.
-                        let raw_message = &data_buffer[..pos];
-                        // Instead of converting to a string, unstuff directly on the bytes.
-                        let unstuffed_bytes = unstuff_dot_lines(raw_message);
-                        // If your processing expects a string, convert once at the end.
-                        session.email.body = String::from_utf8(unstuffed_bytes).map_err(|_| {
-                            SmtpError::ParseError {
-                                message: "Invalid UTF-8 in email body".into(),
-                                span: (0, data_buffer.len()).into(),
-                            }
-                        })?;
-                        self.callbacks
-                            .on_data(std::mem::take(&mut session.email))
-                            .await?;
-                        stream.write_line(b"250 OK\r\n").await?;
-                        session.state = SessionState::Authenticated;
-                        data_buffer.clear();
-                        data_scanned = 0;
-                    }
-                    None => {
-                        data_scanned = data_buffer.len();
-                    }
-                }
+            if receiving_data {
+                self.process_data(session, stream, &mut data_buffer, &mut data_scanned)
+                    .await?;
                 continue;
             }
 
-            // Process normal commands by scanning for CRLF in buf.
+            // Process every complete command line in buf, batching replies
+            // into one write per read (RFC 2920 PIPELINING).
+            let mut reply = BytesMut::new();
             while let Some(cr) = memchr(b'\r', &buf) {
-                if cr + 1 < buf.len() && buf[cr + 1] == b'\n' {
-                    // Extract the complete line, including CRLF.
-                    let line = buf.split_to(cr + 2);
-                    // Remove CRLF.
-                    let line = &line[..line.len().saturating_sub(2)];
-                    // Deliberate leniency: surrounding whitespace is trimmed
-                    // before parsing, so padded commands from sloppy clients
-                    // (e.g. "STARTTLS \r\n") are accepted.
-                    let command = std::str::from_utf8(line)
-                        .map_err(|err| SmtpError::ParseError {
-                            message: format!("Invalid UTF-8 sequence: {}", err),
-                            span: (0, line.len()).into(),
-                        })?
-                        .trim()
-                        .to_string();
-
-                    match parse_command(&command, &session.state) {
-                        // STARTTLS is handled here rather than in handle_command
-                        // because the upgrade must also discard any bytes the
-                        // client pipelined after the command (RFC 3207: possible
-                        // plaintext injection) — and those live in `buf`.
-                        Ok(SmtpCommand::StartTls) => {
-                            if !stream.supports_starttls() {
-                                stream.write_line(b"502 STARTTLS not supported\r\n").await?;
-                            } else if matches!(
-                                session.state,
-                                SessionState::ReceivingMailFrom | SessionState::ReceivingRcptTo
-                            ) {
-                                stream
-                                    .write_line(
-                                        b"503 STARTTLS not allowed during mail transaction\r\n",
-                                    )
-                                    .await?;
-                            } else {
-                                stream.write_line(b"220 Ready to start TLS\r\n").await?;
-                                buf.clear();
-                                data_buffer.clear();
-                                // Bound the handshake so a client that goes
-                                // silent after STARTTLS can't hold the
-                                // connection (and its permit) forever.
-                                match tokio::time::timeout(
-                                    self.cmd_timeout,
-                                    stream.upgrade_to_tls(),
-                                )
-                                .await
-                                {
-                                    Ok(result) => result?,
-                                    // The handshake never completed; the stream
-                                    // is unusable, so just drop the connection.
-                                    Err(_) => return Ok(()),
-                                }
-                                // RFC 3207: the session is reset to its initial
-                                // state; the client must EHLO again.
-                                session.email = Email::default();
-                                session.state = SessionState::Connected;
-                            }
-                        }
-                        Ok(cmd) => {
-                            if self.handle_command(session, cmd, stream).await? {
-                                return Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Parse error: {}", e);
-                            stream
-                                .write_line(b"500 Syntax error, command unrecognized\r\n")
-                                .await?;
-                        }
-                    }
-                } else {
-                    // If we find a CR that isn’t followed by LF, break and wait for more data.
+                if cr + 1 >= buf.len() || buf[cr + 1] != b'\n' {
+                    // CR not (yet) followed by LF; wait for more data.
                     break;
                 }
+                // Extract the complete line, including CRLF.
+                let line = buf.split_to(cr + 2);
+                // Remove CRLF.
+                let line = &line[..line.len().saturating_sub(2)];
+                // Deliberate leniency: surrounding whitespace is trimmed
+                // before parsing, so padded commands from sloppy clients
+                // (e.g. "STARTTLS \r\n") are accepted.
+                let command = match std::str::from_utf8(line) {
+                    Ok(s) => s.trim(),
+                    Err(err) => {
+                        let _ = stream.write_all(&reply).await;
+                        return Err(SmtpError::ParseError {
+                            message: format!("Invalid UTF-8 sequence: {}", err),
+                            span: (0, line.len()).into(),
+                        }
+                        .into());
+                    }
+                };
+
+                match parse_command(command, &session.state) {
+                    // STARTTLS is handled here rather than in handle_command
+                    // because the upgrade must also discard any bytes the
+                    // client pipelined after the command (RFC 3207: possible
+                    // plaintext injection) — and those live in `buf`.
+                    Ok(SmtpCommand::StartTls) => {
+                        if !stream.supports_starttls() {
+                            reply.extend_from_slice(b"502 STARTTLS not supported\r\n");
+                        } else if matches!(
+                            session.state,
+                            SessionState::ReceivingMailFrom | SessionState::ReceivingRcptTo
+                        ) {
+                            reply.extend_from_slice(
+                                b"503 STARTTLS not allowed during mail transaction\r\n",
+                            );
+                        } else {
+                            // RFC 2920: flush pending replies (plus the 220)
+                            // before the handshake bytes take over the wire.
+                            reply.extend_from_slice(b"220 Ready to start TLS\r\n");
+                            stream.write_all(&reply).await.into_diagnostic()?;
+                            reply.clear();
+                            buf.clear();
+                            data_buffer.clear();
+                            // Bound the handshake so a client that goes
+                            // silent after STARTTLS can't hold the
+                            // connection (and its permit) forever.
+                            match tokio::time::timeout(self.cmd_timeout, stream.upgrade_to_tls())
+                                .await
+                            {
+                                Ok(result) => result?,
+                                // The handshake never completed; the stream
+                                // is unusable, so just drop the connection.
+                                Err(_) => return Ok(()),
+                            }
+                            // RFC 3207: the session is reset to its initial
+                            // state; the client must EHLO again.
+                            session.email = Email::default();
+                            session.state = SessionState::Connected;
+                        }
+                    }
+                    Ok(cmd) => {
+                        let starttls = stream.supports_starttls();
+                        match self.handle_command(session, cmd, starttls, &mut reply).await {
+                            Ok(true) => {
+                                stream.write_all(&reply).await.into_diagnostic()?;
+                                return Ok(());
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                // Deliver replies already owed for earlier
+                                // pipelined commands before the error reply.
+                                let _ = stream.write_all(&reply).await;
+                                return Err(e);
+                            }
+                        }
+                        if session.state == SessionState::ReceivingData {
+                            // Remaining buffered bytes are message content,
+                            // not commands.
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Parse error: {}", e);
+                        reply.extend_from_slice(b"500 Syntax error, command unrecognized\r\n");
+                    }
+                }
+            }
+            if !reply.is_empty() {
+                stream.write_all(&reply).await.into_diagnostic()?;
+            }
+            if session.state == SessionState::ReceivingData && !buf.is_empty() {
+                // Content the client sent in the same packet as DATA.
+                data_buffer.extend_from_slice(&buf);
+                buf.clear();
+                self.process_data(session, stream, &mut data_buffer, &mut data_scanned)
+                    .await?;
             }
         }
+    }
+
+    /// Handles bytes accumulated in `data_buffer` during DATA: enforces the
+    /// size limit and, once the terminator arrives, unstuffs and delivers
+    /// the message.
+    async fn process_data(
+        &self,
+        session: &mut SmtpSession,
+        stream: &mut Box<dyn SmtpStream>,
+        data_buffer: &mut BytesMut,
+        data_scanned: &mut usize,
+    ) -> Result<()> {
+        // Only the newly received bytes need to be searched; earlier
+        // reads already covered the rest.
+        let terminator = find_data_terminator(data_buffer, *data_scanned);
+
+        // Enforce message size limit.
+        // After rejecting, keep discarding until the DATA terminator
+        // (<CRLF>.<CRLF>) so the remaining body bytes aren't
+        // misparsed as SMTP commands on this connection.
+        if data_buffer.len() > self.max_message_size {
+            if terminator.is_some() {
+                stream.write_line(b"552 5.3.4 Message too big\r\n").await?;
+                data_buffer.clear();
+                *data_scanned = 0;
+                session.state = SessionState::Authenticated;
+            }
+            // Otherwise keep accumulating until terminator arrives,
+            // but shed already-scanned bytes to bound memory usage.
+            // We only need to keep the last 4 bytes for a split terminator.
+            else if data_buffer.len() > self.max_message_size + 4096 {
+                let keep_from = data_buffer.len() - 4;
+                let tail: Vec<u8> = data_buffer[keep_from..].to_vec();
+                data_buffer.clear();
+                data_buffer.extend_from_slice(&tail);
+                *data_scanned = 0;
+            } else {
+                *data_scanned = data_buffer.len();
+            }
+            return Ok(());
+        }
+
+        match terminator {
+            Some(pos) => {
+                // A stuffed dot can only start the message or follow a CRLF;
+                // when neither occurs (the overwhelmingly common case) the
+                // body is a zero-copy slice of the receive buffer.
+                let stuffed = {
+                    let raw = &data_buffer[..pos];
+                    raw.starts_with(b".") || memchr::memmem::find(raw, b"\r\n.").is_some()
+                };
+                session.email.body = if stuffed {
+                    Bytes::from(unstuff_dot_lines(&data_buffer[..pos]))
+                } else {
+                    data_buffer.split_to(pos).freeze()
+                };
+                self.callbacks
+                    .on_data(std::mem::take(&mut session.email))
+                    .await?;
+                stream.write_line(b"250 OK\r\n").await?;
+                session.state = SessionState::Authenticated;
+                data_buffer.clear();
+                *data_scanned = 0;
+            }
+            None => {
+                *data_scanned = data_buffer.len();
+            }
+        }
+        Ok(())
     }
 
     async fn handle_command(
         &self,
         session: &mut SmtpSession,
         command: SmtpCommand,
-        stream: &mut Box<dyn SmtpStream>,
+        supports_starttls: bool,
+        reply: &mut BytesMut,
     ) -> Result<bool> {
         match (&session.state, command) {
             (SessionState::Connected, SmtpCommand::Ehlo(domain)) => {
                 self.callbacks.on_ehlo(&domain).await?;
                 let mut response = format!("250-{}\r\n", self.hostname);
                 response.push_str(&format!("250-SIZE {}\r\n", self.max_message_size));
-                if stream.supports_starttls() {
+                // The command loop already handles batched input; advertise
+                // it (RFC 2920) so conforming clients stop serializing every
+                // round-trip.
+                response.push_str("250-PIPELINING\r\n");
+                if supports_starttls {
                     response.push_str("250-STARTTLS\r\n");
                 }
                 // Add AUTH support if enabled.
@@ -594,7 +649,7 @@ impl SmtpServer {
                     }
                 }
                 response.push_str("250 OK\r\n");
-                stream.write_line(response.as_bytes()).await?;
+                reply.extend_from_slice(response.as_bytes());
                 if self.auth_enabled {
                     session.state = SessionState::Greeted;
                 } else {
@@ -602,25 +657,21 @@ impl SmtpServer {
                 }
             }
             (SessionState::Greeted, SmtpCommand::AuthPlain(auth_data)) => {
-                self.handle_auth_plain(session, auth_data, stream).await?;
+                self.handle_auth_plain(session, auth_data, reply).await?;
             }
             (SessionState::Greeted, SmtpCommand::AuthLogin) => {
                 session.state = SessionState::AuthenticatingUsername;
-                stream.write_line(b"334 VXNlcm5hbWU6\r\n").await?;
+                reply.extend_from_slice(b"334 VXNlcm5hbWU6\r\n");
             }
             (SessionState::Greeted, SmtpCommand::AuthCramMd5) => {
                 if !self.callbacks.supports_cram_md5() {
-                    stream
-                        .write_line(b"504 Unrecognized authentication type\r\n")
-                        .await?;
+                    reply.extend_from_slice(b"504 Unrecognized authentication type\r\n");
                     return Ok(false);
                 }
                 let challenge = self.generate_cram_md5_challenge();
                 let encoded = BASE64_STANDARD.encode(&challenge);
                 session.state = SessionState::AuthenticatingCramMd5(challenge);
-                stream
-                    .write_line(format!("334 {}\r\n", encoded).as_bytes())
-                    .await?;
+                reply.extend_from_slice(format!("334 {}\r\n", encoded).as_bytes());
             }
             // RFC 4954 §4: a client may cancel an in-progress AUTH exchange
             // by sending "*"; the server must answer 501 and keep the
@@ -634,37 +685,35 @@ impl SmtpServer {
                 | SmtpCommand::AuthCramMd5Response(ref line),
             ) if line == "*" => {
                 session.state = SessionState::Greeted;
-                stream
-                    .write_line(b"501 Authentication cancelled\r\n")
-                    .await?;
+                reply.extend_from_slice(b"501 Authentication cancelled\r\n");
             }
             (
                 SessionState::AuthenticatingCramMd5(challenge),
                 SmtpCommand::AuthCramMd5Response(response),
             ) => {
-                self.handle_auth_cram_md5(session, challenge.clone(), response, stream)
+                self.handle_auth_cram_md5(session, challenge.clone(), response, reply)
                     .await?;
             }
             (SessionState::AuthenticatingUsername, SmtpCommand::AuthUsername(username)) => {
                 match decode_base64(&username) {
                     Ok(decoded_username) => {
                         session.state = SessionState::AuthenticatingPassword(decoded_username);
-                        stream.write_line(b"334 UGFzc3dvcmQ6\r\n").await?;
+                        reply.extend_from_slice(b"334 UGFzc3dvcmQ6\r\n");
                     }
-                    Err(_) => self.reject_malformed_auth(session, stream).await?,
+                    Err(_) => self.reject_malformed_auth(session, reply),
                 }
             }
             (
                 SessionState::AuthenticatingPassword(username),
                 SmtpCommand::AuthPassword(password),
             ) => {
-                self.handle_auth_login(session, username.to_string(), password, stream)
+                self.handle_auth_login(session, username.to_string(), password, reply)
                     .await?;
             }
             (SessionState::Authenticated, SmtpCommand::MailFrom(from_command)) => {
                 self.callbacks.on_mail_from(&from_command).await?;
                 session.email.from = from_command.address.clone();
-                stream.write_line(b"250 OK\r\n").await?;
+                reply.extend_from_slice(b"250 OK\r\n");
                 session.state = SessionState::ReceivingMailFrom;
             }
             (SessionState::ReceivingMailFrom, SmtpCommand::RcptTo(to))
@@ -672,12 +721,12 @@ impl SmtpServer {
                 if session.email.to.len() >= MAX_RECIPIENTS {
                     // Transient per RFC 5321 §4.5.3.1.10: the client may
                     // send the remaining recipients in a new transaction.
-                    stream.write_line(b"452 4.5.3 Too many recipients\r\n").await?;
+                    reply.extend_from_slice(b"452 4.5.3 Too many recipients\r\n");
                     session.state = SessionState::ReceivingRcptTo;
                 } else {
                     self.callbacks.on_rcpt_to(&to).await?;
                     session.email.to.push(to);
-                    stream.write_line(b"250 OK\r\n").await?;
+                    reply.extend_from_slice(b"250 OK\r\n");
                     session.state = SessionState::ReceivingRcptTo;
                 }
             }
@@ -687,37 +736,33 @@ impl SmtpServer {
                 session.email = Email {
                     from: from_command.address.clone(),
                     to: Vec::with_capacity(1),
-                    body: String::new(),
+                    body: Bytes::new(),
                 };
-                stream.write_line(b"250 OK\r\n").await?;
+                reply.extend_from_slice(b"250 OK\r\n");
                 session.state = SessionState::ReceivingMailFrom;
             }
             (SessionState::ReceivingRcptTo, SmtpCommand::Data) => {
-                stream
-                    .write_line(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n")
-                    .await?;
+                reply.extend_from_slice(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n");
                 session.state = SessionState::ReceivingData;
             }
             (_, SmtpCommand::Quit) => {
-                stream.write_line(b"221 Bye\r\n").await?;
+                reply.extend_from_slice(b"221 Bye\r\n");
                 return Ok(true);
             }
             (_, SmtpCommand::Rset) => {
                 // Reset the session state
                 session.reset();
-                stream.write_line(b"250 OK\r\n").await?;
+                reply.extend_from_slice(b"250 OK\r\n");
             }
             (_, SmtpCommand::Noop) => {
-                stream.write_line(b"250 OK\r\n").await?;
+                reply.extend_from_slice(b"250 OK\r\n");
             }
             cmd => {
                 if !session.can_accept_mail_commands() {
-                    stream
-                        .write_line(b"530 Authentication required\r\n")
-                        .await?;
+                    reply.extend_from_slice(b"530 Authentication required\r\n");
                 } else {
                     eprintln!("Unknown command: {:?}", cmd);
-                    stream.write_line(b"500 Unknown command\r\n").await?;
+                    reply.extend_from_slice(b"500 Unknown command\r\n");
                 }
             }
         }
@@ -727,32 +772,26 @@ impl SmtpServer {
     /// Rejects a malformed AUTH exchange with 501 and returns the session to
     /// `Greeted`, keeping the connection usable for another attempt instead
     /// of tearing it down.
-    async fn reject_malformed_auth(
-        &self,
-        session: &mut SmtpSession,
-        stream: &mut Box<dyn SmtpStream>,
-    ) -> Result<()> {
+    fn reject_malformed_auth(&self, session: &mut SmtpSession, reply: &mut BytesMut) {
         session.state = SessionState::Greeted;
-        stream
-            .write_line(b"501 Invalid authentication data\r\n")
-            .await?;
-        Ok(())
+        reply.extend_from_slice(b"501 Invalid authentication data\r\n");
     }
 
     async fn handle_auth_plain(
         &self,
         session: &mut SmtpSession,
         auth_data: String,
-        stream: &mut Box<dyn SmtpStream>,
+        reply: &mut BytesMut,
     ) -> Result<()> {
         let credentials = decode_base64(&auth_data).ok().and_then(|decoded| {
             let parts: Vec<&str> = decoded.split('\0').collect();
             (parts.len() == 3).then(|| (parts[1].to_string(), parts[2].to_string()))
         });
         let Some((username, password)) = credentials else {
-            return self.reject_malformed_auth(session, stream).await;
+            self.reject_malformed_auth(session, reply);
+            return Ok(());
         };
-        self.handle_authentication(session, &username, &password, stream)
+        self.handle_authentication(session, &username, &password, reply)
             .await
     }
 
@@ -761,12 +800,13 @@ impl SmtpServer {
         session: &mut SmtpSession,
         username: String,
         password: String,
-        stream: &mut Box<dyn SmtpStream>,
+        reply: &mut BytesMut,
     ) -> Result<()> {
         let Ok(decoded_password) = decode_base64(&password) else {
-            return self.reject_malformed_auth(session, stream).await;
+            self.reject_malformed_auth(session, reply);
+            return Ok(());
         };
-        self.handle_authentication(session, &username, &decoded_password, stream)
+        self.handle_authentication(session, &username, &decoded_password, reply)
             .await
     }
 
@@ -775,7 +815,7 @@ impl SmtpServer {
         session: &mut SmtpSession,
         challenge: String,
         response: String,
-        stream: &mut Box<dyn SmtpStream>,
+        reply: &mut BytesMut,
     ) -> Result<()> {
         // RFC 2195: the response is "<username> <hex digest>". The digest
         // never contains spaces, so split on the last one to tolerate
@@ -786,13 +826,14 @@ impl SmtpServer {
                 .map(|(u, d)| (u.to_string(), d.to_string()))
         });
         let Some((username, digest)) = credentials else {
-            return self.reject_malformed_auth(session, stream).await;
+            self.reject_malformed_auth(session, reply);
+            return Ok(());
         };
         let result = self
             .callbacks
             .on_auth_cram_md5(&username, &challenge, &digest)
             .await;
-        self.finish_authentication(session, result, stream).await
+        self.finish_authentication(session, result, reply)
     }
 
     /// Generates a unique RFC 2195 challenge (`<counter.nanos@hostname>`).
@@ -815,31 +856,26 @@ impl SmtpServer {
         session: &mut SmtpSession,
         username: &str,
         password: &str,
-        stream: &mut Box<dyn SmtpStream>,
+        reply: &mut BytesMut,
     ) -> Result<()> {
         let result = self.callbacks.on_auth(username, password).await;
-        self.finish_authentication(session, result, stream).await
+        self.finish_authentication(session, result, reply)
     }
 
-    async fn finish_authentication(
+    fn finish_authentication(
         &self,
         session: &mut SmtpSession,
         result: Result<bool, SmtpError>,
-        stream: &mut Box<dyn SmtpStream>,
+        reply: &mut BytesMut,
     ) -> Result<()> {
         match result {
             Ok(true) => {
                 session.state = SessionState::Authenticated;
-                stream
-                    .write_line(b"235 Authentication successful\r\n")
-                    .await?;
+                reply.extend_from_slice(b"235 Authentication successful\r\n");
             }
             Ok(false) | Err(_) => {
                 session.state = SessionState::Greeted;
-                stream
-                    .write_line(b"535 Authentication failed\r\n")
-                    .await
-                    .wrap_err("Authentication failed")?;
+                reply.extend_from_slice(b"535 Authentication failed\r\n");
             }
         }
         Ok(())
@@ -894,7 +930,7 @@ impl SmtpSession {
             email: Email {
                 from: String::new(),
                 to: Vec::with_capacity(1),
-                body: String::new(),
+                body: Bytes::new(),
             },
         }
     }
@@ -903,7 +939,7 @@ impl SmtpSession {
         self.email = Email {
             from: String::new(),
             to: Vec::with_capacity(1),
-            body: String::new(),
+            body: Bytes::new(),
         };
         // Reset the state, but keep authentication
         if self.state != SessionState::Connected && self.state != SessionState::Greeted {
@@ -1125,7 +1161,7 @@ mod tests {
 
         let emails = callbacks.emails.lock().unwrap();
         assert_eq!(emails.len(), 1);
-        emails[0].body.clone()
+        String::from_utf8(emails[0].body.to_vec()).expect("body is valid utf8")
     }
 
     #[tokio::test]
