@@ -471,9 +471,20 @@ impl SmtpServer {
             // into one write per read (RFC 2920 PIPELINING).
             reply.clear();
             while let Some(cr) = memchr(b'\r', &buf) {
-                if cr + 1 >= buf.len() || buf[cr + 1] != b'\n' {
-                    // CR not (yet) followed by LF; wait for more data.
+                if cr + 1 >= buf.len() {
+                    // Possibly the first half of a CRLF; wait for more data.
                     break;
+                }
+                if buf[cr + 1] != b'\n' {
+                    // A bare CR is illegal in a command line (RFC 5321
+                    // 2.3.8), and the byte after it is already here so this
+                    // is not a split CRLF. Consume through it and say so:
+                    // leaving it in place means every later read re-finds
+                    // the same CR and the connection stalls until the idle
+                    // timeout, even though the client is waiting on us.
+                    let _ = buf.split_to(cr + 1);
+                    reply.extend_from_slice(b"500 Syntax error, bare CR not allowed\r\n");
+                    continue;
                 }
                 // Extract the complete line, including CRLF.
                 let line = buf.split_to(cr + 2);
@@ -1474,6 +1485,29 @@ mod tests {
             b"hello\r\n.",
             "trailing stuffed dot must be removed, got {:?}",
             emails[0].body
+        );
+    }
+
+    /// A bare CR is illegal in a command line (RFC 5321 2.3.8). The loop
+    /// keyed on CR and treated "not followed by LF" as "wait for more data",
+    /// so the same CR was re-found on every read and the connection stalled
+    /// until the idle timeout instead of being told it was malformed.
+    #[tokio::test]
+    async fn test_bare_cr_in_command_does_not_stall() {
+        let (replies, _) = run_pipelined_session(&[
+            b"EHLO client.test\r\n",
+            b"NOOP\rNOOP\r\n",
+            b"QUIT\r\n",
+        ])
+        .await;
+
+        assert!(
+            replies.contains("500"),
+            "a bare CR must be reported, got {replies:?}"
+        );
+        assert!(
+            replies.contains("221"),
+            "the connection must not stall after a bare CR, got {replies:?}"
         );
     }
 
