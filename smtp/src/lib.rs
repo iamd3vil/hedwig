@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use base64::prelude::*;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use memchr::memchr;
 use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
 use std::pin::Pin;
@@ -414,37 +414,46 @@ impl SmtpServer {
         // Length of data_buffer already searched for the DATA terminator;
         // lets each read scan only the newly received bytes.
         let mut data_scanned: usize = 0;
+        // Set when `buf` already holds bytes the client pipelined after an
+        // end-of-DATA: they are commands, and blocking on a read before
+        // answering them would hang the connection until the idle timeout.
+        let mut buffered_commands = false;
 
         loop {
             let receiving_data = session.state == SessionState::ReceivingData;
-            let timeout = if receiving_data {
-                self.data_timeout
-            } else {
-                self.cmd_timeout
-            };
-            // During DATA, read straight into the message buffer — no
-            // intermediate copy through `buf`.
-            let read_target = if receiving_data {
-                &mut data_buffer
-            } else {
-                &mut buf
-            };
-            let n = match tokio::time::timeout(timeout, stream.read_buf(read_target)).await {
-                Ok(result) => result.into_diagnostic()?,
-                Err(_) => {
-                    let _ = stream
-                        .write_line(b"421 4.4.2 Connection timed out\r\n")
-                        .await;
+            if !buffered_commands {
+                let timeout = if receiving_data {
+                    self.data_timeout
+                } else {
+                    self.cmd_timeout
+                };
+                // During DATA, read straight into the message buffer — no
+                // intermediate copy through `buf`.
+                let read_target = if receiving_data {
+                    &mut data_buffer
+                } else {
+                    &mut buf
+                };
+                let n = match tokio::time::timeout(timeout, stream.read_buf(read_target)).await {
+                    Ok(result) => result.into_diagnostic()?,
+                    Err(_) => {
+                        let _ = stream
+                            .write_line(b"421 4.4.2 Connection timed out\r\n")
+                            .await;
+                        return Ok(());
+                    }
+                };
+                if n == 0 {
                     return Ok(());
                 }
-            };
-            if n == 0 {
-                return Ok(());
             }
+            buffered_commands = false;
 
             if receiving_data {
-                self.process_data(session, stream, &mut data_buffer, &mut data_scanned)
+                self.process_data(session, stream, &mut buf, &mut data_buffer, &mut data_scanned)
                     .await?;
+                buffered_commands =
+                    session.state != SessionState::ReceivingData && !buf.is_empty();
                 continue;
             }
 
@@ -549,8 +558,10 @@ impl SmtpServer {
                 // Content the client sent in the same packet as DATA.
                 data_buffer.extend_from_slice(&buf);
                 buf.clear();
-                self.process_data(session, stream, &mut data_buffer, &mut data_scanned)
+                self.process_data(session, stream, &mut buf, &mut data_buffer, &mut data_scanned)
                     .await?;
+                buffered_commands =
+                    session.state != SessionState::ReceivingData && !buf.is_empty();
             }
         }
     }
@@ -562,9 +573,13 @@ impl SmtpServer {
         &self,
         session: &mut SmtpSession,
         stream: &mut Box<dyn SmtpStream>,
+        buf: &mut BytesMut,
         data_buffer: &mut BytesMut,
         data_scanned: &mut usize,
     ) -> Result<()> {
+        // Both callers drain `buf` before handing bytes to DATA, so
+        // appending leftovers below preserves wire order.
+        debug_assert!(buf.is_empty(), "command buffer must be drained during DATA");
         // Only the newly received bytes need to be searched; earlier
         // reads already covered the rest.
         let terminator = find_data_terminator(data_buffer, *data_scanned);
@@ -574,8 +589,14 @@ impl SmtpServer {
         // (<CRLF>.<CRLF>) so the remaining body bytes aren't
         // misparsed as SMTP commands on this connection.
         if data_buffer.len() > self.max_message_size {
-            if terminator.is_some() {
+            if let Some(pos) = terminator {
                 stream.write_line(b"552 5.3.4 Message too big\r\n").await?;
+                // Keep whatever followed the terminator: it is the next
+                // command group, not part of the rejected message.
+                let end = pos + DATA_TERMINATOR.len();
+                if end < data_buffer.len() {
+                    buf.extend_from_slice(&data_buffer[end..]);
+                }
                 data_buffer.clear();
                 *data_scanned = 0;
                 session.state = SessionState::Authenticated;
@@ -605,17 +626,28 @@ impl SmtpServer {
                     raw.starts_with(b".") || memchr::memmem::find(raw, b"\r\n.").is_some()
                 };
                 session.email.body = if stuffed {
-                    Bytes::from(unstuff_dot_lines(&data_buffer[..pos]))
+                    let body = Bytes::from(unstuff_dot_lines(&data_buffer[..pos]));
+                    data_buffer.advance(pos + DATA_TERMINATOR.len());
+                    body
                 } else {
-                    data_buffer.split_to(pos).freeze()
+                    let body = data_buffer.split_to(pos).freeze();
+                    data_buffer.advance(DATA_TERMINATOR.len());
+                    body
                 };
+                // RFC 2920 allows a command group after the end-of-data dot
+                // (Postfix pipelines QUIT there). Those bytes are commands:
+                // discarding them leaves the client waiting for a reply that
+                // never comes, holding the connection until it times out.
+                if !data_buffer.is_empty() {
+                    buf.extend_from_slice(data_buffer);
+                }
+                data_buffer.clear();
+                *data_scanned = 0;
                 self.callbacks
                     .on_data(std::mem::take(&mut session.email))
                     .await?;
                 stream.write_line(b"250 OK\r\n").await?;
                 session.state = SessionState::Authenticated;
-                data_buffer.clear();
-                *data_scanned = 0;
             }
             None => {
                 *data_scanned = data_buffer.len();
@@ -1241,6 +1273,127 @@ mod tests {
         assert_eq!(emails.len(), 1);
         assert_eq!(emails[0].to.len(), MAX_RECIPIENTS);
         assert!(!emails[0].to.iter().any(|r| r.contains("one-too-many")));
+    }
+
+    /// Drives a session over a duplex stream and returns every byte the
+    /// server wrote, given a list of client writes performed after DATA is
+    /// acknowledged. Each write goes out as one segment.
+    async fn run_pipelined_session(writes: &[&[u8]]) -> (String, Vec<Email>) {
+        let callbacks = Arc::new(RecordingCallbacks {
+            emails: StdMutex::new(Vec::new()),
+        });
+        let server = SmtpServer {
+            callbacks: callbacks.clone(),
+            auth_enabled: false,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            cmd_timeout: Duration::from_secs(5),
+            data_timeout: Duration::from_secs(5),
+            hostname: "test.local".to_string(),
+        };
+        let (client, server_side) = tokio::io::duplex(65536);
+        let mut server_stream: Box<dyn SmtpStream> = Box::new(server_side);
+        let server_task =
+            tokio::spawn(async move { server.handle_client(&mut server_stream).await });
+        let (mut reader, mut writer) = tokio::io::split(client);
+
+        let mut sink = Vec::new();
+        let mut chunk = vec![0u8; 4096];
+        // Greeting.
+        let n = reader.read(&mut chunk).await.unwrap();
+        sink.extend_from_slice(&chunk[..n]);
+        for w in writes {
+            writer.write_all(w).await.unwrap();
+            writer.flush().await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        drop(writer);
+        // Read until the server closes or stops writing.
+        loop {
+            match tokio::time::timeout(Duration::from_millis(500), reader.read(&mut chunk)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => sink.extend_from_slice(&chunk[..n]),
+                Ok(Err(_)) => break,
+            }
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+        let emails = callbacks.emails.lock().unwrap().drain(..).collect();
+        (String::from_utf8_lossy(&sink).to_string(), emails)
+    }
+
+    /// A client may pipeline a command group after the end-of-DATA dot, and
+    /// Postfix does exactly that with QUIT. Those bytes are commands, not
+    /// message content: dropping them leaves the client waiting for a reply
+    /// that never comes until the idle timeout fires.
+    #[tokio::test]
+    async fn test_commands_pipelined_after_data_terminator_are_processed() {
+        let (replies, emails) = run_pipelined_session(&[
+            b"EHLO client.test\r\n",
+            b"MAIL FROM:<a@example.com>\r\nRCPT TO:<b@example.org>\r\nDATA\r\n",
+            // Body, terminator and QUIT in a single segment.
+            b"Subject: pipelined\r\n\r\nbody\r\n.\r\nQUIT\r\n",
+        ])
+        .await;
+
+        assert_eq!(emails.len(), 1, "message must be accepted: {replies:?}");
+        assert!(
+            replies.contains("250 OK"),
+            "expected 250 for the message, got {replies:?}"
+        );
+        assert!(
+            replies.contains("221"),
+            "QUIT pipelined after the terminator must be answered, got {replies:?}"
+        );
+    }
+
+    /// The same, but the next transaction is pipelined after the dot rather
+    /// than QUIT: it must be accepted, not silently dropped.
+    #[tokio::test]
+    async fn test_transaction_pipelined_after_data_terminator_is_accepted() {
+        let (replies, emails) = run_pipelined_session(&[
+            b"EHLO client.test\r\n",
+            b"MAIL FROM:<a@example.com>\r\nRCPT TO:<b@example.org>\r\nDATA\r\n",
+            b"Subject: first\r\n\r\nfirst body\r\n.\r\n              MAIL FROM:<c@example.com>\r\nRCPT TO:<d@example.org>\r\nDATA\r\n",
+            b"Subject: second\r\n\r\nsecond body\r\n.\r\nQUIT\r\n",
+        ])
+        .await;
+
+        assert_eq!(
+            emails.len(),
+            2,
+            "both messages must be accepted, got {} -- {replies:?}",
+            emails.len()
+        );
+        assert!(replies.contains("221"), "QUIT must be answered: {replies:?}");
+    }
+
+    /// PIPELINING must be advertised, since the command loop handles batched
+    /// input and clients otherwise serialize every round trip.
+    #[tokio::test]
+    async fn test_ehlo_advertises_pipelining() {
+        let (replies, _) = run_pipelined_session(&[b"EHLO client.test\r\n", b"QUIT\r\n"]).await;
+        assert!(
+            replies.contains("250-PIPELINING"),
+            "EHLO must advertise PIPELINING, got {replies:?}"
+        );
+    }
+
+    /// Message content is opaque bytes: a body that is not valid UTF-8 must
+    /// be accepted and delivered verbatim.
+    #[tokio::test]
+    async fn test_non_utf8_body_is_accepted_verbatim() {
+        let (replies, emails) = run_pipelined_session(&[
+            b"EHLO client.test\r\n",
+            b"MAIL FROM:<a@example.com>\r\nRCPT TO:<b@example.org>\r\nDATA\r\n",
+            b"Subject: binary\r\n\r\nraw \xff\xfe bytes\r\n.\r\nQUIT\r\n",
+        ])
+        .await;
+
+        assert_eq!(emails.len(), 1, "8-bit body must be accepted: {replies:?}");
+        assert!(
+            emails[0].body.ends_with(b"raw \xff\xfe bytes"),
+            "body must survive verbatim, got {:?}",
+            emails[0].body
+        );
     }
 
     #[tokio::test]
