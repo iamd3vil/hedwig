@@ -408,6 +408,9 @@ impl SmtpServer {
     ) -> Result<()> {
         let mut buf = BytesMut::with_capacity(32768); // 32kb
         let mut data_buffer = BytesMut::new();
+        // Reply accumulator, reused for the life of the connection: one
+        // write per read iteration without an allocation per command.
+        let mut reply = BytesMut::with_capacity(512);
         // Length of data_buffer already searched for the DATA terminator;
         // lets each read scan only the newly received bytes.
         let mut data_scanned: usize = 0;
@@ -447,7 +450,7 @@ impl SmtpServer {
 
             // Process every complete command line in buf, batching replies
             // into one write per read (RFC 2920 PIPELINING).
-            let mut reply = BytesMut::new();
+            reply.clear();
             while let Some(cr) = memchr(b'\r', &buf) {
                 if cr + 1 >= buf.len() || buf[cr + 1] != b'\n' {
                     // CR not (yet) followed by LF; wait for more data.
