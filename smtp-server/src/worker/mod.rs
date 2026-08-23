@@ -595,11 +595,16 @@ impl Worker {
     /// parks its slot; the log backend's `process_claim` reports
     /// `RateLimited` to the dispatcher instead and never waits.
     ///
-    /// Bounded by [`MAX_RATE_LIMIT_WAIT`]: if the domain is still starved
-    /// after that (other workers winning every refilled token), the message
-    /// is deferred rather than sent over the limit.
-    async fn await_rate_limit(&self, domain: &str) -> Result<()> {
-        await_rate_limit_within(&self.rate_limiter, domain, MAX_RATE_LIMIT_WAIT).await
+    /// `may_defer` bounds the wait by [`MAX_RATE_LIMIT_WAIT`], after which
+    /// the message is deferred rather than sent over the limit. The caller
+    /// must pass `false` once any recipient of this message has been
+    /// delivered: the legacy path defers the whole message, so deferring
+    /// after a partial delivery would re-send to that recipient on the
+    /// retry. In that case waiting for a token is the only option that is
+    /// neither a duplicate nor a limit violation.
+    async fn await_rate_limit(&self, domain: &str, may_defer: bool) -> Result<()> {
+        let budget = may_defer.then_some(MAX_RATE_LIMIT_WAIT);
+        await_rate_limit_within(&self.rate_limiter, domain, budget).await
     }
 
     /// Attempt delivery of one recipient through its MX servers, applying
@@ -978,6 +983,11 @@ impl Worker {
 
         let all_recipients = Self::merge_recipients(to, email);
 
+        // A deferral re-sends the whole message (the legacy spool keeps no
+        // per-recipient state), so once a recipient has accepted it we must
+        // not defer this attempt.
+        let mut delivered_any = false;
+
         // Parse to address for each.
         for to in all_recipients.iter() {
             info!(?to, ?from, "Attempting to send email");
@@ -994,7 +1004,7 @@ impl Worker {
             // configured limit was silently exceeded whenever this path was
             // hit. Wait and re-check instead, so transmission always follows
             // a token this attempt actually consumed.
-            self.await_rate_limit(domain).await?;
+            self.await_rate_limit(domain, !delivered_any).await?;
 
             match self
                 .deliver_recipient(&raw_email, from, to_trimmed, &parsed_email_id)
@@ -1004,6 +1014,7 @@ impl Worker {
                     smtp_response,
                     exchange,
                 } => {
+                    delivered_any = true;
                     let logged_at = Utc::now();
                     let delay_ms = calc_delay_ms(ctx.stored_email.queued_at, logged_at);
                     info!(
@@ -1122,15 +1133,16 @@ pub(crate) struct ClassifiedSendError {
     pub(crate) smtp_response: String,
 }
 
-/// Wait until `domain` has a token and consume it, giving up after
-/// `budget` of cumulative waiting with a defer-classified error.
+/// Wait until `domain` has a token and consume it. `budget` caps the
+/// cumulative wait, after which a defer-classified error is returned;
+/// `None` waits as long as it takes.
 ///
 /// Free-standing and budget-parameterized so tests exercise this exact
 /// loop without standing up a Worker or sleeping for a real minute.
 pub(crate) async fn await_rate_limit_within(
     limiter: &RateLimiter,
     domain: &str,
-    budget: Duration,
+    budget: Option<Duration>,
 ) -> Result<()> {
     let mut waited = Duration::ZERO;
     loop {
@@ -1140,7 +1152,7 @@ pub(crate) async fn await_rate_limit_within(
                 return Ok(());
             }
             RateLimitResult::RateLimited { retry_after } => {
-                if waited >= budget {
+                if budget.is_some_and(|b| waited >= b) {
                     info!(
                         domain = ?domain,
                         waited_ms = waited.as_millis(),
@@ -1592,7 +1604,7 @@ mod tests {
             default_limit: Some(6_000),
             domain_limits: std::collections::HashMap::new(),
         });
-        let budget = Duration::from_millis(50);
+        let budget = Some(Duration::from_millis(50));
 
         // A domain with tokens to spare is allowed straight through.
         await_rate_limit_within(&limiter, "example.com", budget)
@@ -1619,6 +1631,42 @@ mod tests {
             .downcast_ref::<ClassifiedSendError>()
             .expect("must be downcastable so process_job can defer");
         assert_eq!(classified.outcome, SendOutcome::Defer);
+    }
+
+    /// With no budget the loop must keep waiting rather than returning a
+    /// defer. `send_email` passes `None` once a recipient has accepted the
+    /// message, because the legacy path defers the whole message and a retry
+    /// would re-send to that recipient.
+    #[tokio::test]
+    async fn await_rate_limit_without_budget_waits_instead_of_deferring() {
+        use crate::worker::rate_limiter::{RateLimitConfig, RateLimiter};
+
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enabled: true,
+            default_limit: Some(6_000),
+            domain_limits: std::collections::HashMap::new(),
+        });
+        while !matches!(
+            limiter.check_rate_limit("example.com").await,
+            RateLimitResult::RateLimited { .. }
+        ) {}
+
+        // A zero budget gives up immediately; no budget must not.
+        assert!(
+            await_rate_limit_within(&limiter, "example.com", Some(Duration::ZERO))
+                .await
+                .is_err(),
+            "a budgeted wait gives up"
+        );
+        // The bucket refills on whole-second boundaries, so this has to wait
+        // through one before a token exists — and must wait, not error.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            await_rate_limit_within(&limiter, "example.com", None),
+        )
+        .await
+        .expect("must not hang indefinitely")
+        .expect("an unbudgeted wait must acquire a token, never defer");
     }
 
     #[test]
