@@ -282,11 +282,8 @@ async fn run_server(config_path: &str) -> Result<()> {
             });
         }
 
-        let tap = callbacks::LogQueueTap {
-            append: writers.handle(),
-            spool_root,
-            disk_reserve_bytes: qcfg.disk_reserve_bytes(),
-        };
+        let tap =
+            callbacks::LogQueueTap::new(writers.handle(), spool_root, qcfg.disk_reserve_bytes());
         let (callbacks, worker_resources, mta_sts_resolver) =
             callbacks::Callbacks::new_log(Arc::clone(&storage), tap, cfg.clone())
                 .await

@@ -43,9 +43,56 @@ fn cram_md5_digest(password: &str, challenge: &str) -> String {
 /// The log-queue acceptance path: SMTP DATA appends to the durable log and
 /// acknowledges on page-cache write completion, never waiting for workers.
 pub struct LogQueueTap {
-    pub append: crate::logqueue::writer::AppendHandle,
-    pub spool_root: std::path::PathBuf,
-    pub disk_reserve_bytes: u64,
+    append: crate::logqueue::writer::AppendHandle,
+    spool_root: std::path::PathBuf,
+    disk_reserve_bytes: u64,
+    /// Cached statvfs sample; free space moves on a scale of seconds, so
+    /// the accept path must not pay a syscall per message.
+    disk_free: std::sync::atomic::AtomicU64,
+    disk_free_checked_ms: std::sync::atomic::AtomicI64,
+}
+
+impl LogQueueTap {
+    pub fn new(
+        append: crate::logqueue::writer::AppendHandle,
+        spool_root: std::path::PathBuf,
+        disk_reserve_bytes: u64,
+    ) -> Self {
+        Self {
+            append,
+            spool_root,
+            disk_reserve_bytes,
+            // Fail open until the first sample lands.
+            disk_free: std::sync::atomic::AtomicU64::new(u64::MAX),
+            disk_free_checked_ms: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+
+    /// Free bytes on the spool filesystem, refreshed at most every 500 ms.
+    /// The compare-exchange lets exactly one accept per window pay the
+    /// statvfs; everyone else reads the cached value.
+    fn disk_free_cached(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        const REFRESH_MS: i64 = 500;
+        let now = Utc::now().timestamp_millis();
+        let last = self.disk_free_checked_ms.load(Relaxed);
+        if now.saturating_sub(last) >= REFRESH_MS
+            && self
+                .disk_free_checked_ms
+                .compare_exchange(last, now, Relaxed, Relaxed)
+                .is_ok()
+        {
+            match crate::logqueue::spool::disk_free_bytes(&self.spool_root) {
+                Ok(free) => self.disk_free.store(free, Relaxed),
+                Err(e) => {
+                    // Fail open: a broken statvfs must not stop mail flow.
+                    warn!(error = %e, "disk reserve check failed");
+                    self.disk_free.store(u64::MAX, Relaxed);
+                }
+            }
+        }
+        self.disk_free.load(Relaxed)
+    }
 }
 
 /// The Callbacks struct holds the configuration, storage, and sender channel.
@@ -240,22 +287,16 @@ impl Callbacks {
     /// dispatcher capacity never gate acceptance.
     async fn process_email_log(&self, tap: &LogQueueTap, email: Email) -> Result<(), SmtpError> {
         if tap.disk_reserve_bytes > 0 {
-            match crate::logqueue::spool::disk_free_bytes(&tap.spool_root) {
-                Ok(free) if free < tap.disk_reserve_bytes => {
-                    warn!(
-                        free_bytes = free,
-                        reserve_bytes = tap.disk_reserve_bytes,
-                        "disk reserve reached; rejecting message"
-                    );
-                    return Err(SmtpError::Transient {
-                        message: "4.3.1 insufficient system storage".into(),
-                    });
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    // Fail open: a broken statvfs must not stop mail flow.
-                    warn!(error = %e, "disk reserve check failed");
-                }
+            let free = tap.disk_free_cached();
+            if free < tap.disk_reserve_bytes {
+                warn!(
+                    free_bytes = free,
+                    reserve_bytes = tap.disk_reserve_bytes,
+                    "disk reserve reached; rejecting message"
+                );
+                return Err(SmtpError::Transient {
+                    message: "4.3.1 insufficient system storage".into(),
+                });
             }
         }
 
