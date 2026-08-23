@@ -72,6 +72,10 @@ impl Default for DispatcherConfig {
 
 /// What a worker receives: identity, location, and delivery metadata —
 /// never the message body.
+///
+/// The envelope is shared rather than owned: it is handed out on every
+/// dispatch of every retry, and a message with many recipients would
+/// otherwise pay a string allocation per recipient per attempt.
 #[derive(Debug, Clone)]
 pub struct DeliveryJob {
     pub message_id: MessageId,
@@ -79,9 +83,9 @@ pub struct DeliveryJob {
     pub attempts: u32,
     pub claim_generation: u64,
     pub enqueue_ms: i64,
-    pub sender: String,
+    pub sender: Arc<str>,
     /// Recipients that have not yet accepted the message.
-    pub recipients: Vec<String>,
+    pub recipients: Arc<[String]>,
 }
 
 /// A worker's report for one claim.
@@ -225,10 +229,10 @@ struct Job {
     enqueue_ms: i64,
     /// Remaining recipients when a partial delivery has happened; `None`
     /// means the full envelope from the payload header.
-    remaining: Option<Vec<String>>,
+    remaining: Option<Arc<[String]>>,
     last_error: Option<String>,
     /// Envelope cache filled on first dispatch (sender, all recipients).
-    envelope: Option<(String, Vec<String>)>,
+    envelope: Option<(Arc<str>, Arc<[String]>)>,
     state: JobState,
 }
 
@@ -429,7 +433,8 @@ impl Dispatcher {
                     location: r.location,
                     attempts: r.attempts,
                     enqueue_ms: r.enqueue_ms,
-                    remaining: (!r.remaining_recipients.is_empty()).then_some(r.remaining_recipients),
+                    remaining: (!r.remaining_recipients.is_empty())
+                        .then(|| Arc::from(r.remaining_recipients)),
                     last_error: None,
                     envelope: None,
                     state: JobState::Ready,
@@ -447,7 +452,7 @@ impl Dispatcher {
                     // until the header is read; due time is a fine proxy for
                     // ordering once it re-enters ready.
                     enqueue_ms: d.next_attempt_ms,
-                    remaining: Some(d.remaining_recipients),
+                    remaining: Some(Arc::from(d.remaining_recipients)),
                     last_error: Some(d.last_error),
                     envelope: None,
                     state: JobState::Delayed {
@@ -643,7 +648,7 @@ impl Dispatcher {
             // higher is a compaction copy that must win (crash between
             // relocation and checkpoint leaves both copies on disk).
             #[allow(clippy::type_complexity)]
-            let mut discovered: Vec<(MessageId, JobLocation, i64, (String, Vec<String>))> =
+            let mut discovered: Vec<(MessageId, JobLocation, i64, (Arc<str>, Arc<[String]>))> =
                 Vec::new();
             let mut relocations: Vec<(MessageId, JobLocation)> = Vec::new();
             let shard_no = shard.shard;
@@ -676,7 +681,7 @@ impl Dispatcher {
                             h.message_id,
                             location,
                             h.enqueue_ms,
-                            (h.sender, h.recipients),
+                            (Arc::from(h.sender), Arc::from(h.recipients)),
                         )),
                         Some(job) if h.generation > job.location.generation => {
                             relocations.push((h.message_id, location));
@@ -852,7 +857,7 @@ impl Dispatcher {
         let header = reader.read_header_at(location.offset, super::record::MAX_RECORD_LEN)?;
         let job = self.jobs.get_mut(&id).expect("job exists");
         job.enqueue_ms = header.enqueue_ms;
-        job.envelope = Some((header.sender, header.recipients));
+        job.envelope = Some((Arc::from(header.sender), Arc::from(header.recipients)));
         Ok(())
     }
 
@@ -999,7 +1004,7 @@ impl Dispatcher {
             } => {
                 if let Some(job) = self.jobs.get_mut(&id) {
                     job.attempts = attempts;
-                    job.remaining = Some(remaining_recipients);
+                    job.remaining = Some(Arc::from(remaining_recipients));
                     job.last_error = Some(last_error);
                     job.state = JobState::Delayed {
                         due_ms: next_attempt_ms,
@@ -1343,7 +1348,7 @@ impl Dispatcher {
                     location: job.location,
                     attempts: job.attempts,
                     next_attempt_ms: due_ms,
-                    remaining_recipients: job.remaining.clone().unwrap_or_default(),
+                    remaining_recipients: job.remaining.as_deref().unwrap_or_default().to_vec(),
                     last_error: job.last_error.clone().unwrap_or_default(),
                 }),
                 // Ready, in-flight, and rate-limit holds all restart as
@@ -1353,7 +1358,7 @@ impl Dispatcher {
                     location: job.location,
                     attempts: job.attempts,
                     enqueue_ms: job.enqueue_ms,
-                    remaining_recipients: job.remaining.clone().unwrap_or_default(),
+                    remaining_recipients: job.remaining.as_deref().unwrap_or_default().to_vec(),
                 }),
             }
         }
@@ -1453,6 +1458,13 @@ mod tests {
         }
     }
 
+    fn message_to(seq: u64, rcpts: &[&str]) -> AppendMessage {
+        AppendMessage {
+            recipients: rcpts.iter().map(|r| (*r).to_string()).collect(),
+            ..message(seq, "unused@example.com")
+        }
+    }
+
     struct Harness {
         _spool: Spool,
         writers: LogWriters,
@@ -1507,8 +1519,8 @@ mod tests {
         let claim = h.handle.claim().await.expect("claim");
         assert_eq!(claim.job.location, loc);
         assert_eq!(claim.job.attempts, 0);
-        assert_eq!(claim.job.sender, "sender@example.com");
-        assert_eq!(claim.job.recipients, vec!["r1@example.com".to_string()]);
+        assert_eq!(&*claim.job.sender, "sender@example.com");
+        assert_eq!(&*claim.job.recipients, ["r1@example.com".to_string()]);
 
         let body = h.handle.read_body(claim.job.location).await.unwrap();
         assert_eq!(&body[..], b"body 1");
@@ -1542,11 +1554,96 @@ mod tests {
         let claim = h.handle.claim().await.unwrap();
         assert_eq!(claim.job.message_id, id);
         assert_eq!(claim.job.attempts, 1);
-        assert_eq!(claim.job.recipients, vec!["r1@example.com".to_string()]);
+        assert_eq!(&*claim.job.recipients, ["r1@example.com".to_string()]);
         claim.report(JobOutcome::Delivered {
             response: "250 ok".into(),
         });
         stop(h).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_remaining_recipients_survive_checkpoint_and_restart() {
+        // The envelope is shared, and the persisted forms (journal entry
+        // and checkpoint) own their strings: the set that comes back must
+        // still be exactly the set the worker reported, in order.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let config = DispatcherConfig {
+            // Force a checkpoint on the first outcome so recovery reads the
+            // snapshot path too, not just the journal.
+            checkpoint_interval_bytes: 1,
+            ..Default::default()
+        };
+        let id = {
+            let h = start(dir.path(), Arc::new(NoRateGate), config.clone());
+            let append = h.writers.handle();
+            append
+                .append(message_to(
+                    1,
+                    &["r1@example.com", "r2@example.com", "r3@example.com"],
+                ))
+                .await
+                .unwrap();
+
+            let claim = h.handle.claim().await.unwrap();
+            let id = claim.job.message_id;
+            assert_eq!(
+                &*claim.job.recipients,
+                [
+                    "r1@example.com".to_string(),
+                    "r2@example.com".to_string(),
+                    "r3@example.com".to_string()
+                ],
+                "first dispatch carries the full envelope from the payload header"
+            );
+            claim.report(JobOutcome::Deferred {
+                next_attempt_ms: now_ms() + 50,
+                remaining_recipients: vec!["r3@example.com".into(), "r2@example.com".into()],
+                error: "451 greylisted".into(),
+            });
+            stop(h).await;
+            id
+        };
+
+        let spool = Spool::open(root.join("spool"), 1).unwrap();
+        let writers = LogWriters::start(&spool, writer_config()).unwrap();
+        let (store, recovered) = ShardStateStore::recover(spool.shard(0).path(), 0).unwrap();
+        assert_eq!(
+            recovered
+                .deferred
+                .get(&id)
+                .map(|d| d.remaining_recipients.as_slice()),
+            Some(["r3@example.com".to_string(), "r2@example.com".to_string()].as_slice()),
+            "persisted state must hold the reported set verbatim"
+        );
+        let cancel = CancellationToken::new();
+        let (handle, task) = Dispatcher::start(
+            vec![ShardInit {
+                dir: spool.shard(0).path().to_path_buf(),
+                shared: writers.handle().shard_shared(0),
+                store,
+                recovered,
+            }],
+            writers.handle(),
+            Arc::new(NoRateGate),
+            config,
+            cancel.clone(),
+        );
+
+        let claim = handle.claim().await.expect("retry after restart");
+        assert_eq!(claim.job.message_id, id);
+        assert_eq!(claim.job.attempts, 1);
+        assert_eq!(
+            &*claim.job.recipients,
+            ["r3@example.com".to_string(), "r2@example.com".to_string()],
+            "the retry must target the persisted remaining set, unchanged"
+        );
+        claim.report(JobOutcome::Delivered {
+            response: "250 ok".into(),
+        });
+        cancel.cancel();
+        task.await.unwrap();
+        writers.shutdown().await;
     }
 
     #[tokio::test]

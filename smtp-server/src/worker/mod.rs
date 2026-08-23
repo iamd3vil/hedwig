@@ -26,6 +26,7 @@ pub use pool::{
 };
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::fs;
@@ -842,11 +843,12 @@ impl Worker {
         }
 
         // First attempt widens to Cc/Bcc like the legacy path; retries use
-        // exactly the persisted remaining set.
-        let recipients = if job.attempts == 0 {
-            Self::merge_recipients(&job.recipients, &msg)
+        // exactly the persisted remaining set, borrowed from the claim
+        // rather than copied.
+        let recipients: Cow<'_, [String]> = if job.attempts == 0 {
+            Cow::Owned(Self::merge_recipients(&job.recipients, &msg))
         } else {
-            job.recipients.clone()
+            Cow::Borrowed(&job.recipients)
         };
 
         let raw_email = match self.sign_outbound(body) {
@@ -874,7 +876,7 @@ impl Worker {
         let mut bounce_reason: Option<String> = None;
         let mut delivered_any = false;
 
-        for to in &recipients {
+        for to in recipients.iter() {
             let to_trimmed = to.trim_matches(|c| c == '<' || c == '>');
             let Some(parsed_email_id) = EmailAddress::parse(to_trimmed, None) else {
                 continue; // dropped, matching legacy behavior
@@ -1000,8 +1002,8 @@ impl Worker {
     ) -> crate::logqueue::dispatcher::JobOutcome {
         let archived = StoredEmail {
             message_id: job.message_id.to_string(),
-            from: job.sender.clone(),
-            to: job.recipients.clone(),
+            from: job.sender.to_string(),
+            to: job.recipients.to_vec(),
             body: String::from_utf8_lossy(body).into_owned(),
             queued_at: chrono::DateTime::from_timestamp_millis(job.enqueue_ms),
         };
