@@ -133,7 +133,11 @@ pub struct AppendMessage {
 
 struct AppendRequest {
     msg: AppendMessage,
-    encoded_len: u32,
+    /// Measured at admission and reused by the writer: computing the header
+    /// length walks the recipient list, and nothing about the record changes
+    /// between the two (the writer only stamps the ordinal, which is fixed
+    /// width).
+    sizes: record::RecordSizes,
     completion: oneshot::Sender<Result<JobLocation, QueueError>>,
 }
 
@@ -201,10 +205,10 @@ impl AppendHandle {
             recipients: &msg.recipients,
             body: &msg.body,
         };
-        let encoded_len = record::encoded_len(&params)?;
-        if encoded_len > self.max_record_len {
+        let sizes = record::encoded_sizes(&params)?;
+        if sizes.record_len > self.max_record_len {
             return Err(QueueError::RecordTooLarge {
-                len: encoded_len as u64,
+                len: sizes.record_len as u64,
                 limit: self.max_record_len as u64,
             });
         }
@@ -214,8 +218,7 @@ impl AppendHandle {
         // stay below the journal replay limit. The SMTP recipient cap keeps
         // real mail far under this; the check makes the queue safe on its
         // own.
-        let envelope_len =
-            encoded_len as u64 - msg.body.len() as u64 - record::FIXED_HEADER_LEN as u64;
+        let envelope_len = sizes.header_len as u64 - record::FIXED_HEADER_LEN as u64;
         if envelope_len > super::spool::ENVELOPE_ALLOWANCE {
             return Err(QueueError::InvalidRecord(format!(
                 "envelope is {envelope_len} bytes, exceeds the {} byte allowance",
@@ -226,7 +229,7 @@ impl AppendHandle {
         // Acquire admission permits for the encoded size, clamped so one
         // huge record cannot exceed the whole semaphore (it then simply
         // occupies all admission capacity while queued).
-        let permits = (encoded_len as u64).min(self.pending_limit) as u32;
+        let permits = (sizes.record_len as u64).min(self.pending_limit) as u32;
         let permit = Arc::clone(&self.pending_bytes)
             .acquire_many_owned(permits)
             .await
@@ -240,7 +243,7 @@ impl AppendHandle {
             .tx
             .send(WriterMsg::Append(AppendRequest {
                 msg,
-                encoded_len,
+                sizes,
                 completion: tx,
             }))
             .map_err(|_| QueueError::WriterClosed(shard))?;
@@ -438,7 +441,7 @@ impl ShardWriter {
         // within a full segment).
         let active = self.active.as_ref().expect("just ensured");
         if active.len() > 0
-            && active.len() + req.encoded_len as u64 > config.segment_target_bytes
+            && active.len() + req.sizes.record_len as u64 > config.segment_target_bytes
         {
             self.rotate(shared)?;
         }
@@ -454,12 +457,10 @@ impl ShardWriter {
             recipients: &req.msg.recipients,
             body: &req.msg.body,
         };
-        let sizes = record::encoded_sizes(&params)?;
-        debug_assert_eq!(sizes.record_len, req.encoded_len);
         // Encode the header only and let the kernel gather it with the body:
         // copying a multi-megabyte body into a contiguous buffer once per
         // append buys nothing over a two-iovec write.
-        let header = record::encode_header(&params, sizes)?;
+        let header = record::encode_header(&params, req.sizes)?;
 
         let write_started = std::time::Instant::now();
         let mut batch = active.append_batch(&[PendingRecord {
@@ -472,13 +473,13 @@ impl ShardWriter {
         let offset = batch.offsets.pop().expect("committed record has an offset");
         crate::metrics::logqueue_append_duration_observe(shared.shard(), write_started.elapsed());
         crate::metrics::logqueue_records_appended(shared.shard(), 1);
-        crate::metrics::logqueue_bytes_appended(shared.shard(), sizes.record_len as u64);
+        crate::metrics::logqueue_bytes_appended(shared.shard(), req.sizes.record_len as u64);
         crate::metrics::logqueue_active_segment_bytes_set(shared.shard(), active.len());
         let location = JobLocation {
             shard: shared.shard(),
             segment: active.segment(),
             offset,
-            length: req.encoded_len,
+            length: req.sizes.record_len,
             ordinal,
             generation: req.msg.generation,
         };
