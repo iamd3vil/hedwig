@@ -60,9 +60,11 @@ impl MtaStsResolver {
         }
     }
 
-    /// A cached policy is trusted until its `max_age` expiry (RFC 8461 §5.1;
-    /// the background refresher revalidates the TXT id), so the per-delivery
-    /// hot path here does no DNS at all for cached and known-absent domains.
+    /// A cached policy is trusted until its `max_age` expiry (RFC 8461 §5.1),
+    /// so the per-delivery hot path does no DNS at all for cached and
+    /// known-absent domains. The background refresher revalidates the TXT id
+    /// on its own interval, which is what bounds how long a rotated policy
+    /// can go unnoticed — delivery itself never checks.
     pub async fn get_policy(&self, domain: &str) -> Option<Arc<MtaStsPolicy>> {
         let domain = domain.to_ascii_lowercase();
 

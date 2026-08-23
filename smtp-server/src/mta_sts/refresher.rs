@@ -8,10 +8,23 @@ use tracing::{debug, info, warn};
 use super::cache::MtaStsResolver;
 use super::policy::{CachedPolicy, PolicyMode};
 
-pub async fn run_refresh_loop(resolver: Arc<MtaStsResolver>, shutdown: CancellationToken) {
-    info!("starting MTA-STS policy refresher loop");
+/// How often cached policies are revalidated against their TXT id.
+///
+/// Delivery reads the cache without checking DNS, so this interval is the
+/// worst-case lag before a domain that rotates its policy is noticed (a
+/// rotation that also moves MX hosts defers mail until then). One TXT
+/// lookup per cached policy per pass is far cheaper than the per-recipient,
+/// per-delivery lookup this replaced, so it is set well below the RFC 8461
+/// max_age most domains publish.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-    let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+pub async fn run_refresh_loop(resolver: Arc<MtaStsResolver>, shutdown: CancellationToken) {
+    info!(
+        interval_secs = REFRESH_INTERVAL.as_secs(),
+        "starting MTA-STS policy refresher loop"
+    );
+
+    let mut interval = tokio::time::interval(REFRESH_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     interval.tick().await;
