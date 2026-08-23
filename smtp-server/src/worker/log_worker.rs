@@ -41,7 +41,10 @@ impl LogWorker {
     /// Pull-and-deliver loop; exits when the dispatcher shuts down.
     pub async fn run(self) {
         while let Some(claim) = self.dispatcher.claim().await {
-            let job = claim.job.clone();
+            // Borrowed, not copied: `report` consumes the claim, so each
+            // outcome is built first and reported after, which keeps the
+            // envelope out of the per-delivery allocation path.
+            let job = &claim.job;
 
             let body = match self.dispatcher.read_body(job.location).await {
                 Ok(body) => body,
@@ -50,12 +53,13 @@ impl LogWorker {
                     // guessing terminal state; a transient I/O problem must
                     // not lose mail.
                     error!(msg_id = %job.message_id, error = %e, "failed to read message body");
-                    claim.report(JobOutcome::Deferred {
+                    let outcome = JobOutcome::Deferred {
                         next_attempt_ms: Utc::now().timestamp_millis()
                             + 60_000 * (1 << job.attempts.min(10)) as i64,
-                        remaining_recipients: job.recipients.clone(),
+                        remaining_recipients: job.recipients.to_vec(),
                         error: format!("payload read failed: {e}"),
-                    });
+                    };
+                    claim.report(outcome);
                     continue;
                 }
             };
@@ -67,15 +71,12 @@ impl LogWorker {
                     max_retries = self.max_retries,
                     "maximum retry attempts exceeded; bouncing"
                 );
-                let outcome = self
-                    .worker
-                    .bounce_claim_for_retry_limit(&job, &body)
-                    .await;
+                let outcome = self.worker.bounce_claim_for_retry_limit(job, &body).await;
                 claim.report(outcome);
                 continue;
             }
 
-            let outcome = self.worker.process_claim(&job, &body).await;
+            let outcome = self.worker.process_claim(job, &body).await;
             claim.report(outcome);
         }
         tracing::debug!("log worker stopped: dispatcher closed");

@@ -98,17 +98,36 @@ pub struct RecordParams<'a> {
     pub body: &'a [u8],
 }
 
-/// Encoded size of a record, or an error if any field exceeds format limits.
-pub fn encoded_len(params: &RecordParams<'_>) -> Result<u32, QueueError> {
-    let header = header_len(params)?;
-    let total = header as u64 + params.body.len() as u64;
+/// The encoded sizes of a record. Computing these walks the recipient list,
+/// so the append path measures once and threads the result through to the
+/// encoder instead of recomputing per stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordSizes {
+    /// Offset of the body within the record.
+    pub header_len: u32,
+    /// Total record size: header plus body.
+    pub record_len: u32,
+}
+
+/// Encoded sizes of a record, or an error if any field exceeds format limits.
+pub fn encoded_sizes(params: &RecordParams<'_>) -> Result<RecordSizes, QueueError> {
+    let header_len = header_len(params)?;
+    let total = header_len as u64 + params.body.len() as u64;
     if total > MAX_RECORD_LEN as u64 {
         return Err(QueueError::RecordTooLarge {
             len: total,
             limit: MAX_RECORD_LEN as u64,
         });
     }
-    Ok(total as u32)
+    Ok(RecordSizes {
+        header_len,
+        record_len: total as u32,
+    })
+}
+
+/// Encoded size of a record, or an error if any field exceeds format limits.
+pub fn encoded_len(params: &RecordParams<'_>) -> Result<u32, QueueError> {
+    Ok(encoded_sizes(params)?.record_len)
 }
 
 fn header_len(params: &RecordParams<'_>) -> Result<u32, QueueError> {
@@ -148,12 +167,45 @@ fn header_len(params: &RecordParams<'_>) -> Result<u32, QueueError> {
     Ok(len as u32)
 }
 
-/// Encode a complete record into a fresh buffer.
-pub fn encode(params: &RecordParams<'_>) -> Result<Vec<u8>, QueueError> {
-    let header_len = header_len(params)?;
-    let record_len = encoded_len(params)?;
+/// Encode just the header of a record whose sizes have already been
+/// measured. The body is left where it is: the append path hands header and
+/// body to the kernel as adjacent iovecs, so nothing copies the message
+/// (up to the configured maximum, tens of megabytes) merely to make the
+/// record contiguous in userspace.
+pub fn encode_header(
+    params: &RecordParams<'_>,
+    sizes: RecordSizes,
+) -> Result<Vec<u8>, QueueError> {
+    let mut buf = Vec::with_capacity(sizes.header_len as usize);
+    write_header(&mut buf, params, sizes)?;
+    Ok(buf)
+}
 
-    let mut buf = Vec::with_capacity(record_len as usize);
+/// Encode a complete record into a fresh contiguous buffer. Callers on the
+/// append path use [`encode_header`]; this is for readers, tests and tools
+/// that want the whole record in one buffer.
+pub fn encode(params: &RecordParams<'_>) -> Result<Vec<u8>, QueueError> {
+    let sizes = encoded_sizes(params)?;
+    let mut buf = Vec::with_capacity(sizes.record_len as usize);
+    write_header(&mut buf, params, sizes)?;
+    buf.extend_from_slice(params.body);
+    debug_assert_eq!(buf.len(), sizes.record_len as usize);
+    Ok(buf)
+}
+
+/// Append the fixed header and envelope to `buf`, which must be empty (the
+/// crc is patched at a fixed offset from the start).
+fn write_header(
+    buf: &mut Vec<u8>,
+    params: &RecordParams<'_>,
+    sizes: RecordSizes,
+) -> Result<(), QueueError> {
+    debug_assert!(buf.is_empty());
+    let RecordSizes {
+        header_len,
+        record_len,
+    } = sizes;
+
     buf.extend_from_slice(&MAGIC);
     buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes()); // flags
@@ -174,14 +226,22 @@ pub fn encode(params: &RecordParams<'_>) -> Result<Vec<u8>, QueueError> {
         buf.extend_from_slice(&(rcpt.len() as u16).to_le_bytes());
         buf.extend_from_slice(rcpt.as_bytes());
     }
-    debug_assert_eq!(buf.len(), header_len as usize);
 
-    let crc = header_crc(&buf, header_len as usize);
+    // `sizes` is measured separately from the encode, so disagreement means
+    // the two saw different params. The length fields already written would
+    // then frame the record wrongly on disk (and an over-long address would
+    // have been silently truncated by the `as u16` casts above), so refuse
+    // rather than emit a record that no reader can trust.
+    if buf.len() != header_len as usize {
+        return Err(QueueError::InvalidRecord(format!(
+            "header encoded to {} bytes but was measured as {header_len}",
+            buf.len()
+        )));
+    }
+
+    let crc = header_crc(buf, header_len as usize);
     buf[16..20].copy_from_slice(&crc.to_le_bytes());
-
-    buf.extend_from_slice(params.body);
-    debug_assert_eq!(buf.len(), record_len as usize);
-    Ok(buf)
+    Ok(())
 }
 
 /// crc32 over the header with the `header_crc` field itself excluded.
@@ -353,6 +413,37 @@ mod tests {
         assert_eq!(h.recipients, rcpts);
         assert_eq!(h.body_len() as usize, body.len());
         verify_body(&h, &buf[h.header_len as usize..]).unwrap();
+    }
+
+    #[test]
+    fn header_only_encoding_matches_contiguous_encoding() {
+        let rcpts = vec!["a@example.com".to_string(), "b@example.org".to_string()];
+        let body = b"Subject: hi\r\n\r\nhello world";
+        let p = params(body, &rcpts);
+        let sizes = encoded_sizes(&p).unwrap();
+        let whole = encode(&p).unwrap();
+        let header = encode_header(&p, sizes).unwrap();
+
+        assert_eq!(header.len(), sizes.header_len as usize);
+        assert_eq!(header, whole[..sizes.header_len as usize]);
+        // Header plus body must decode exactly like the contiguous form.
+        let joined = [header.as_slice(), body].concat();
+        assert_eq!(joined, whole);
+        let h = decode_header(&header, MAX_RECORD_LEN).unwrap();
+        assert_eq!(h.record_len, sizes.record_len);
+        verify_body(&h, body).unwrap();
+    }
+
+    #[test]
+    fn header_encoding_rejects_mismatched_sizes() {
+        let rcpts = vec!["a@example.com".to_string()];
+        let p = params(b"body", &rcpts);
+        let mut sizes = encoded_sizes(&p).unwrap();
+        sizes.header_len += 1;
+        assert!(matches!(
+            encode_header(&p, sizes),
+            Err(QueueError::InvalidRecord(_))
+        ));
     }
 
     #[test]

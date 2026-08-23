@@ -1,6 +1,9 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use hyper::service::{make_service_fn, service_fn};
@@ -26,7 +29,7 @@ struct MetricsHandles {
     emails_dropped: IntCounter,
     worker_jobs_processed: IntCounter,
     worker_job_duration: Histogram,
-    send_latency: HistogramVec,
+    send_latency: Histogram,
     send_outcomes: IntCounterVec,
     mta_sts_policy_fetch: IntCounterVec,
     mta_sts_enforcement: IntCounterVec,
@@ -116,16 +119,15 @@ static METRICS: Lazy<MetricsHandles> = Lazy::new(|| MetricsHandles {
         vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]
     )
     .expect("register hedwig_worker_job_duration_seconds histogram"),
-    send_latency: register_histogram_vec!(
+    send_latency: register_histogram!(
         "hedwig_send_latency_seconds",
-        "Latency to hand off email to upstream MX servers, labelled by recipient domain.",
-        &["domain"],
+        "Latency to hand off email to upstream MX servers, across all recipient domains.",
         vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
     )
-    .expect("register hedwig_send_latency_seconds histogram vec"),
+    .expect("register hedwig_send_latency_seconds histogram"),
     send_outcomes: register_int_counter_vec!(
         "hedwig_send_attempts_total",
-        "Total send attempts grouped by domain and outcome (success/failure).",
+        "Total send attempts by domain and outcome; over-budget domains report as \"other\".",
         &["domain", "status"]
     )
     .expect("register hedwig_send_attempts_total counter vec"),
@@ -373,30 +375,140 @@ pub fn job_processing_guard() -> JobProcessingGuard {
     JobProcessingGuard::new()
 }
 
-fn normalize_domain(domain: &str) -> String {
-    domain.trim_end_matches('.').to_ascii_lowercase()
+/// Largest number of distinct `domain` label values we will ever report on
+/// `hedwig_send_attempts_total`. A relay talks to an unbounded set of
+/// destinations, and every new label value is a permanent series in the
+/// registry: it costs memory forever and slows every subsequent scrape. The
+/// first domains we see keep their own label, everything after folds into
+/// `DOMAIN_OTHER`, so both costs stay flat.
+const MAX_SEND_DOMAIN_LABELS: usize = 64;
+
+/// Label value used for domains beyond `MAX_SEND_DOMAIN_LABELS`, and for
+/// inputs too long to be a valid domain name.
+const DOMAIN_OTHER: &str = "other";
+
+/// A domain name cannot exceed 255 bytes on the wire (RFC 1035), so
+/// normalisation fits in a stack buffer and the per-delivery path does not
+/// allocate.
+const MAX_DOMAIN_LEN: usize = 255;
+
+/// The two counter children for one admitted domain. Holding the children
+/// keeps the delivery path to a single map lookup instead of re-hashing the
+/// label tuple inside the metric vector on every attempt.
+struct SendDomainCounters {
+    success: IntCounter,
+    failure: IntCounter,
+}
+
+impl SendDomainCounters {
+    fn for_label(label: &str) -> Self {
+        Self {
+            success: METRICS
+                .send_outcomes
+                .with_label_values(&[label, STATUS_SUCCESS]),
+            failure: METRICS
+                .send_outcomes
+                .with_label_values(&[label, STATUS_FAILURE]),
+        }
+    }
+
+    fn counter(&self, success: bool) -> &IntCounter {
+        if success {
+            &self.success
+        } else {
+            &self.failure
+        }
+    }
+}
+
+/// Admitted domains and their counter children. Keys are leaked so they can be
+/// borrowed as `&'static str`; the leak is bounded by
+/// `MAX_SEND_DOMAIN_LABELS`.
+static SEND_DOMAINS: Lazy<RwLock<HashMap<&'static str, SendDomainCounters>>> =
+    Lazy::new(|| RwLock::new(HashMap::with_capacity(MAX_SEND_DOMAIN_LABELS)));
+
+/// Counters for everything that did not win a label slot.
+/// Set once the label budget is spent. Without it, every delivery to a
+/// domain outside the budget would take the write lock below just to be
+/// turned away — the busiest case on a server with a long destination tail.
+static SEND_DOMAINS_SATURATED: AtomicBool = AtomicBool::new(false);
+
+static SEND_DOMAIN_OTHER: Lazy<SendDomainCounters> =
+    Lazy::new(|| SendDomainCounters::for_label(DOMAIN_OTHER));
+
+/// Lowercases `domain` and strips the root dot into `buf`, returning the
+/// normalised view. Oversized input is reported as `DOMAIN_OTHER` rather than
+/// truncated, since a truncated name would be a misleading label.
+fn normalize_domain_into<'a>(domain: &str, buf: &'a mut [u8; MAX_DOMAIN_LEN]) -> &'a str {
+    let trimmed = domain.trim_end_matches('.');
+    if trimmed.len() > MAX_DOMAIN_LEN {
+        return DOMAIN_OTHER;
+    }
+
+    let bytes = &mut buf[..trimmed.len()];
+    bytes.copy_from_slice(trimmed.as_bytes());
+    bytes.make_ascii_lowercase();
+    // `trimmed` was valid UTF-8 and ASCII lowercasing is byte-wise.
+    std::str::from_utf8(bytes).expect("ascii-lowercased domain stays valid utf-8")
+}
+
+/// Bumps the success or failure counter for `domain`, folding into
+/// `DOMAIN_OTHER` once the label budget is spent.
+fn record_send_outcome(domain: &str, success: bool) {
+    let mut buf = [0u8; MAX_DOMAIN_LEN];
+    let normalized = normalize_domain_into(domain, &mut buf);
+
+    // A poisoned lock means some other thread panicked mid-update, not that
+    // the map is unusable: recover it rather than mis-attributing every
+    // later delivery to `other` for the life of the process.
+    let domains = SEND_DOMAINS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(counters) = domains.get(normalized) {
+        counters.counter(success).inc();
+        return;
+    }
+    if SEND_DOMAINS_SATURATED.load(Ordering::Relaxed) {
+        drop(domains);
+        SEND_DOMAIN_OTHER.counter(success).inc();
+        return;
+    }
+    drop(domains);
+
+    let mut domains = SEND_DOMAINS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Another thread may have admitted this domain between the two locks.
+    if let Some(counters) = domains.get(normalized) {
+        counters.counter(success).inc();
+        return;
+    }
+
+    if normalized == DOMAIN_OTHER || domains.len() >= MAX_SEND_DOMAIN_LABELS {
+        if domains.len() >= MAX_SEND_DOMAIN_LABELS {
+            SEND_DOMAINS_SATURATED.store(true, Ordering::Relaxed);
+        }
+        drop(domains);
+        SEND_DOMAIN_OTHER.counter(success).inc();
+        return;
+    }
+
+    let label: &'static str = Box::leak(normalized.to_owned().into_boxed_str());
+    let counters = SendDomainCounters::for_label(label);
+    counters.counter(success).inc();
+    domains.insert(label, counters);
 }
 
 /// Records a successful upstream delivery, including latency.
 pub fn record_send_success(domain: &str, duration: Duration) {
-    let normalized = normalize_domain(domain);
-    METRICS
-        .send_latency
-        .with_label_values(&[normalized.as_str()])
-        .observe(duration.as_secs_f64());
-    METRICS
-        .send_outcomes
-        .with_label_values(&[normalized.as_str(), STATUS_SUCCESS])
-        .inc();
+    METRICS.send_latency.observe(duration.as_secs_f64());
+    record_send_outcome(domain, true);
 }
 
 /// Records a failed upstream delivery attempt.
 pub fn record_send_failure(domain: &str) {
-    let normalized = normalize_domain(domain);
-    METRICS
-        .send_outcomes
-        .with_label_values(&[normalized.as_str(), STATUS_FAILURE])
-        .inc();
+    record_send_outcome(domain, false);
 }
 
 /// Records a successful MTA-STS policy fetch.
@@ -442,16 +554,28 @@ const COMPACTION_FAILED: &str = "failed";
 const COMPACTION_READ: &str = "read";
 const COMPACTION_WRITTEN: &str = "written";
 
-/// Formats a shard index as the label value used by log-queue metrics.
-fn shard_label(shard: u16) -> String {
-    shard.to_string()
+/// Shard labels are needed on the append hot path, so the strings are built
+/// once instead of being formatted per record. The shard count is fixed at
+/// startup and small; a configuration beyond the table still works, it just
+/// formats on the fly.
+const INTERNED_SHARD_LABELS: u16 = 256;
+
+static SHARD_LABELS: Lazy<Vec<String>> =
+    Lazy::new(|| (0..INTERNED_SHARD_LABELS).map(|s| s.to_string()).collect());
+
+/// Returns the label value used by log-queue metrics for a shard index.
+fn shard_label(shard: u16) -> Cow<'static, str> {
+    match SHARD_LABELS.get(usize::from(shard)) {
+        Some(label) => Cow::Borrowed(label.as_str()),
+        None => Cow::Owned(shard.to_string()),
+    }
 }
 
 /// Records the duration of a log-queue append operation for a shard.
 pub fn logqueue_append_duration_observe(shard: u16, duration: Duration) {
     METRICS
         .logqueue_append_duration
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .observe(duration.as_secs_f64());
 }
 
@@ -464,7 +588,7 @@ pub fn logqueue_pending_append_bytes_set(bytes: u64) {
 pub fn logqueue_records_appended(shard: u16, count: u64) {
     METRICS
         .logqueue_records_appended
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .inc_by(count);
 }
 
@@ -472,7 +596,7 @@ pub fn logqueue_records_appended(shard: u16, count: u64) {
 pub fn logqueue_bytes_appended(shard: u16, bytes: u64) {
     METRICS
         .logqueue_bytes_appended
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .inc_by(bytes);
 }
 
@@ -485,7 +609,7 @@ pub fn logqueue_append_error() {
 pub fn logqueue_active_segment_bytes_set(shard: u16, bytes: u64) {
     METRICS
         .logqueue_active_segment_bytes
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .set(bytes as i64);
 }
 
@@ -493,7 +617,7 @@ pub fn logqueue_active_segment_bytes_set(shard: u16, bytes: u64) {
 pub fn logqueue_segment_rotation(shard: u16) {
     METRICS
         .logqueue_segment_rotations
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .inc();
 }
 
@@ -516,7 +640,7 @@ pub fn logqueue_inflight_jobs_set(count: i64) {
 pub fn logqueue_dispatcher_lag_bytes_set(shard: u16, lag: i64) {
     METRICS
         .logqueue_dispatcher_lag_bytes
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .set(lag);
 }
 
@@ -650,6 +774,7 @@ async fn handle_metrics_request(req: Request<Body>) -> Result<Response<Body>, In
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prometheus::core::Collector;
     use std::thread;
 
     // NOTE: every counter/gauge here is process-global and other tests in
@@ -708,51 +833,89 @@ mod tests {
         assert!(METRICS.worker_job_duration.get_sample_count() > before_samples);
     }
 
+    /// Sums `hedwig_send_attempts_total` across every domain label for one
+    /// status. Whether a given domain kept its own label or folded into
+    /// `other` depends on which tests ran first, so assertions have to look at
+    /// the total rather than at one child.
+    fn send_attempts_total(status: &str) -> u64 {
+        let mut total = 0;
+        for family in METRICS.send_outcomes.collect() {
+            for metric in family.get_metric() {
+                let matches_status = metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.get_name() == "status" && label.get_value() == status);
+                if matches_status {
+                    total += metric.get_counter().get_value() as u64;
+                }
+            }
+        }
+        total
+    }
+
+    /// Collects the distinct `domain` label values currently present on
+    /// `hedwig_send_attempts_total`.
+    fn send_domain_labels() -> std::collections::HashSet<String> {
+        let mut labels = std::collections::HashSet::new();
+        for family in METRICS.send_outcomes.collect() {
+            for metric in family.get_metric() {
+                for label in metric.get_label() {
+                    if label.get_name() == "domain" {
+                        labels.insert(label.get_value().to_string());
+                    }
+                }
+            }
+        }
+        labels
+    }
+
+    #[test]
+    fn normalize_domain_lowercases_and_strips_root_dot() {
+        let mut buf = [0u8; MAX_DOMAIN_LEN];
+        assert_eq!(
+            normalize_domain_into("Example.COM.", &mut buf),
+            "example.com"
+        );
+
+        // Oversized input would make a misleading label, so it folds instead.
+        let long = "a".repeat(MAX_DOMAIN_LEN + 1);
+        assert_eq!(normalize_domain_into(&long, &mut buf), DOMAIN_OTHER);
+    }
+
     #[test]
     fn record_send_success_updates_metrics() {
-        let domain = "Example.COM.";
-        let normalized = normalize_domain(domain);
-        let before_success = METRICS
-            .send_outcomes
-            .with_label_values(&[normalized.as_str(), STATUS_SUCCESS])
-            .get();
-        let before_latency = METRICS
-            .send_latency
-            .with_label_values(&[normalized.as_str()])
-            .get_sample_count();
-        record_send_success(domain, Duration::from_millis(20));
-        assert_eq!(
-            METRICS
-                .send_outcomes
-                .with_label_values(&[normalized.as_str(), STATUS_SUCCESS])
-                .get(),
-            before_success + 1
-        );
-        assert!(
-            METRICS
-                .send_latency
-                .with_label_values(&[normalized.as_str()])
-                .get_sample_count()
-                > before_latency
-        );
+        let before_success = send_attempts_total(STATUS_SUCCESS);
+        let before_latency = METRICS.send_latency.get_sample_count();
+        record_send_success("Example.COM.", Duration::from_millis(20));
+        assert!(send_attempts_total(STATUS_SUCCESS) > before_success);
+        assert!(METRICS.send_latency.get_sample_count() > before_latency);
     }
 
     #[test]
     fn record_send_failure_increments_counter() {
-        let domain = "Failure.Test";
-        let normalized = normalize_domain(domain);
-        let before_failure = METRICS
-            .send_outcomes
-            .with_label_values(&[normalized.as_str(), STATUS_FAILURE])
-            .get();
-        record_send_failure(domain);
-        assert_eq!(
-            METRICS
-                .send_outcomes
-                .with_label_values(&[normalized.as_str(), STATUS_FAILURE])
-                .get(),
-            before_failure + 1
+        let before_failure = send_attempts_total(STATUS_FAILURE);
+        record_send_failure("Failure.Test");
+        assert!(send_attempts_total(STATUS_FAILURE) > before_failure);
+    }
+
+    #[test]
+    fn send_domain_labels_stay_bounded() {
+        // Far more destinations than the budget: the registry must not grow
+        // one series per domain.
+        for i in 0..(MAX_SEND_DOMAIN_LABELS * 8) {
+            record_send_success(&format!("bound-{i}.example."), Duration::from_millis(1));
+            record_send_failure(&format!("bound-fail-{i}.example."));
+        }
+
+        let labels = send_domain_labels();
+        assert!(
+            labels.len() <= MAX_SEND_DOMAIN_LABELS + 1,
+            "domain label cardinality escaped the bound: {} values",
+            labels.len()
         );
+        // Saturation is reached long before the loop ends, so the overflow
+        // label must be carrying the tail.
+        assert!(labels.contains(DOMAIN_OTHER));
     }
 
     #[test]

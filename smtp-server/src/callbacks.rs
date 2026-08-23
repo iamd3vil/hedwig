@@ -95,12 +95,61 @@ impl LogQueueTap {
     }
 }
 
+/// The domain allow/deny rules for one [`FilterType`], flattened out of
+/// `cfg.filters` and ASCII-lowercased once at construction.
+///
+/// The config never changes while the server runs, but the filters are
+/// consulted once per `MAIL FROM` and once per `RCPT TO` — up to
+/// `MAX_RECIPIENTS` times for a single message — so deriving them per command
+/// is pure allocation and scanning for a fixed answer.
+#[derive(Default)]
+struct DomainFilters {
+    deny: Vec<String>,
+    allow: Vec<String>,
+    /// Whether any allow rule of this type was configured. An allow entry with
+    /// an empty domain list still forces the allow-list check, so this cannot
+    /// be derived from `allow` being non-empty.
+    has_allow_rules: bool,
+}
+
+impl DomainFilters {
+    fn build(cfg: &Cfg, is_wanted: impl Fn(&FilterType) -> bool) -> Self {
+        let mut this = Self::default();
+        for filter in cfg.filters.iter().flatten().filter(|f| is_wanted(&f.typ)) {
+            // ASCII-only lowercasing, matching the `eq_ignore_ascii_case`
+            // comparison this replaces: a non-ASCII uppercase codepoint in a
+            // configured domain never matched before and must not start now.
+            let domains = filter.domain.iter().map(|d| d.to_ascii_lowercase());
+            match filter.action {
+                FilterAction::Deny => this.deny.extend(domains),
+                FilterAction::Allow => {
+                    this.has_allow_rules = true;
+                    this.allow.extend(domains);
+                }
+            }
+        }
+        this
+    }
+
+    /// `domain` must already be lowercased, as `extract_domain_from_path`
+    /// guarantees.
+    fn is_denied(&self, domain: &str) -> bool {
+        self.deny.iter().any(|d| d == domain)
+    }
+
+    fn is_allowed(&self, domain: &str) -> bool {
+        self.allow.iter().any(|d| d == domain)
+    }
+}
+
 /// The Callbacks struct holds the configuration, storage, and sender channel.
 pub struct Callbacks {
     cfg: Cfg,
     auth_mapping: Mutex<HashMap<String, String>>,
     storage: Arc<dyn Storage>,
     sender_channel: async_channel::Sender<worker::Job>,
+    from_domain_filters: DomainFilters,
+    to_domain_filters: DomainFilters,
     /// `Some` when the log-queue backend is active: DATA goes to the append
     /// log and the legacy storage/channel path is bypassed.
     log_queue: Option<LogQueueTap>,
@@ -244,6 +293,10 @@ impl Callbacks {
         let callbacks = Callbacks {
             storage,
             sender_channel,
+            from_domain_filters: DomainFilters::build(&cfg, |t| {
+                matches!(t, FilterType::FromDomain)
+            }),
+            to_domain_filters: DomainFilters::build(&cfg, |t| matches!(t, FilterType::ToDomain)),
             cfg,
             auth_mapping: Mutex::new(auth_mapping),
             log_queue: None,
@@ -275,6 +328,10 @@ impl Callbacks {
         let callbacks = Callbacks {
             storage,
             sender_channel,
+            from_domain_filters: DomainFilters::build(&cfg, |t| {
+                matches!(t, FilterType::FromDomain)
+            }),
+            to_domain_filters: DomainFilters::build(&cfg, |t| matches!(t, FilterType::ToDomain)),
             cfg,
             auth_mapping: Mutex::new(auth_mapping),
             log_queue: Some(tap),
@@ -513,151 +570,64 @@ impl SmtpCallbacks for Callbacks {
     ) -> Result<(), SmtpError> {
         let from_path = &from_command.address;
         let sender_domain_opt: Option<String> = extract_domain_from_path(from_path);
+        let filters = &self.from_domain_filters;
 
-        if let Some(filters) = &self.cfg.filters {
-            let from_domain_filters: Vec<_> = filters
-                .iter()
-                .filter(|f| matches!(f.typ, FilterType::FromDomain))
-                .collect();
-
-            if from_domain_filters.is_empty() {
-                // No FromDomain filters specifically, so this check passes.
-                return Ok(());
+        // Deny wins over allow. A sender with no parsable domain cannot match a
+        // deny rule, but it also cannot satisfy an allow list.
+        if let Some(ref sender_domain) = sender_domain_opt {
+            if filters.is_denied(sender_domain) {
+                let message = format!("Sender domain {} is denied.", sender_domain);
+                tracing::warn!("Denying email from [{}]: {}", from_path, message);
+                return Err(SmtpError::MailFromDenied { message });
             }
-
-            // 1. Check DENY rules
-            if let Some(ref sender_domain) = sender_domain_opt {
-                for filter in &from_domain_filters {
-                    if matches!(filter.action, FilterAction::Deny)
-                        && filter
-                            .domain
-                            .iter()
-                            .any(|d| d.eq_ignore_ascii_case(sender_domain))
-                    {
-                        let message = format!("Sender domain {} is denied.", sender_domain);
-                        tracing::warn!("Denying email from [{}]: {}", from_path, message);
-                        return Err(SmtpError::MailFromDenied { message });
-                    }
-                }
-            }
-            // If sender_domain_opt is None, it cannot be denied by a specific domain DENY rule.
-
-            // 2. Check ALLOW rules, if any FromDomain Allow rules exist
-            let has_from_domain_allow_rules = from_domain_filters
-                .iter()
-                .any(|f| matches!(f.action, FilterAction::Allow));
-
-            if has_from_domain_allow_rules {
-                let mut explicitly_allowed = false;
-                if let Some(ref sender_domain) = sender_domain_opt {
-                    for filter in &from_domain_filters {
-                        if matches!(filter.action, FilterAction::Allow)
-                            && filter
-                                .domain
-                                .iter()
-                                .any(|d| d.eq_ignore_ascii_case(sender_domain))
-                        {
-                            explicitly_allowed = true;
-                            break;
-                        }
-                    }
-                }
-                // If no domain could be parsed, or if a domain was parsed but didn't match any allow rule,
-                // then it's not explicitly allowed.
-                if !explicitly_allowed {
-                    let message = if let Some(ref sd) = sender_domain_opt {
-                        // Ensure 'sd' is used as a reference if sender_domain_opt contained a String
-                        format!("Sender domain {} is not in the allowed list.", sd)
-                    } else {
-                        format!("Sender address '{}' (no domain/unparsable) is not in the allowed list.", from_path)
-                    };
-                    tracing::warn!("Denying email from [{}]: {}", from_path, message);
-                    return Err(SmtpError::MailFromDenied { message });
-                }
-            }
-            // If we reached here:
-            // - No DENY rule matched (or sender had no domain to match against specific DENY rules).
-            // - AND ( (there are no FromDomain ALLOW rules) OR (an ALLOW rule matched) ).
-            // So, allow.
         }
 
-        // If self.cfg.filters is None, or if it's Some but contains no FromDomain filters,
-        // or if it passed all applicable FromDomain filters.
+        let allowed = sender_domain_opt
+            .as_deref()
+            .is_some_and(|d| filters.is_allowed(d));
+        if filters.has_allow_rules && !allowed {
+            let message = match &sender_domain_opt {
+                Some(sd) => format!("Sender domain {} is not in the allowed list.", sd),
+                None => format!(
+                    "Sender address '{}' (no domain/unparsable) is not in the allowed list.",
+                    from_path
+                ),
+            };
+            tracing::warn!("Denying email from [{}]: {}", from_path, message);
+            return Err(SmtpError::MailFromDenied { message });
+        }
+
         Ok(())
     }
 
     // Handles the RCPT TO command.
     async fn on_rcpt_to(&self, rcpt_path: &str) -> Result<(), SmtpError> {
         let recipient_domain_opt: Option<String> = extract_domain_from_path(rcpt_path);
+        let filters = &self.to_domain_filters;
 
-        if let Some(filters) = &self.cfg.filters {
-            let to_domain_filters: Vec<_> = filters
-                .iter()
-                .filter(|f| matches!(f.typ, FilterType::ToDomain))
-                .collect();
-
-            if to_domain_filters.is_empty() {
-                // No ToDomain filters specifically, so this check passes.
-                return Ok(());
+        if let Some(ref recipient_domain) = recipient_domain_opt {
+            if filters.is_denied(recipient_domain) {
+                let message = format!("Recipient domain {} is denied.", recipient_domain);
+                tracing::warn!("Denying email to [{}]: {}", rcpt_path, message);
+                return Err(SmtpError::RcptToDenied { message });
             }
-
-            // 1. Check DENY rules
-            if let Some(ref recipient_domain) = recipient_domain_opt {
-                for filter in &to_domain_filters {
-                    if matches!(filter.action, FilterAction::Deny)
-                        && filter
-                            .domain
-                            .iter()
-                            .any(|d| d.eq_ignore_ascii_case(recipient_domain))
-                    {
-                        let message = format!("Recipient domain {} is denied.", recipient_domain);
-                        tracing::warn!("Denying email to [{}]: {}", rcpt_path, message);
-                        return Err(SmtpError::RcptToDenied { message });
-                    }
-                }
-            }
-            // If recipient_domain_opt is None, it cannot be denied by a specific domain DENY rule.
-
-            // 2. Check ALLOW rules, if any ToDomain Allow rules exist
-            let has_to_domain_allow_rules = to_domain_filters
-                .iter()
-                .any(|f| matches!(f.action, FilterAction::Allow));
-
-            if has_to_domain_allow_rules {
-                let mut explicitly_allowed = false;
-                if let Some(ref recipient_domain) = recipient_domain_opt {
-                    for filter in &to_domain_filters {
-                        if matches!(filter.action, FilterAction::Allow)
-                            && filter
-                                .domain
-                                .iter()
-                                .any(|d| d.eq_ignore_ascii_case(recipient_domain))
-                        {
-                            explicitly_allowed = true;
-                            break;
-                        }
-                    }
-                }
-                // If no domain could be parsed, or if a domain was parsed but didn't match any allow rule,
-                // then it's not explicitly allowed.
-                if !explicitly_allowed {
-                    let message = if let Some(ref rd) = recipient_domain_opt {
-                        format!("Recipient domain {} is not in the allowed list.", rd)
-                    } else {
-                        format!("Recipient address '{}' (no domain/unparsable) is not in the allowed list.", rcpt_path)
-                    };
-                    tracing::warn!("Denying email to [{}]: {}", rcpt_path, message);
-                    return Err(SmtpError::RcptToDenied { message });
-                }
-            }
-            // If we reached here:
-            // - No DENY rule matched (or recipient had no domain to match against specific DENY rules).
-            // - AND ( (there are no ToDomain ALLOW rules) OR (an ALLOW rule matched) ).
-            // So, allow.
         }
 
-        // If self.cfg.filters is None, or if it's Some but contains no ToDomain filters,
-        // or if it passed all applicable ToDomain filters.
+        let allowed = recipient_domain_opt
+            .as_deref()
+            .is_some_and(|d| filters.is_allowed(d));
+        if filters.has_allow_rules && !allowed {
+            let message = match &recipient_domain_opt {
+                Some(rd) => format!("Recipient domain {} is not in the allowed list.", rd),
+                None => format!(
+                    "Recipient address '{}' (no domain/unparsable) is not in the allowed list.",
+                    rcpt_path
+                ),
+            };
+            tracing::warn!("Denying email to [{}]: {}", rcpt_path, message);
+            return Err(SmtpError::RcptToDenied { message });
+        }
+
         Ok(())
     }
 
@@ -1204,6 +1174,71 @@ mod tests {
             assert_eq!(message, "Recipient domain bad.com is denied.");
         } else {
             panic!("Expected RcptToDenied error for user@bad.com");
+        }
+    }
+
+    // The configured domains are lowercased once at construction and compared
+    // for equality, so an uppercase config entry (or an uppercase address) must
+    // still match.
+    #[tokio::test]
+    async fn test_on_mail_from_filter_domains_are_case_insensitive() {
+        let filters = vec![
+            CfgFilter {
+                typ: FilterType::FromDomain,
+                domain: vec!["EXAMPLE.COM".to_string()],
+                action: FilterAction::Allow,
+            },
+            CfgFilter {
+                typ: FilterType::FromDomain,
+                domain: vec!["BAD.COM".to_string()],
+                action: FilterAction::Deny,
+            },
+        ];
+        let callbacks = create_test_callbacks(Some(filters)).await;
+
+        for address in ["user@example.com", "user@EXAMPLE.COM", "User@Example.Com"] {
+            let result = callbacks
+                .on_mail_from(&create_mail_from_command(address))
+                .await;
+            assert!(result.is_ok(), "expected {address} to be allowed");
+        }
+
+        let result = callbacks
+            .on_mail_from(&create_mail_from_command("user@Bad.COM"))
+            .await;
+        if let Err(SmtpError::MailFromDenied { message }) = result {
+            assert_eq!(message, "Sender domain bad.com is denied.");
+        } else {
+            panic!("Expected MailFromDenied error for user@Bad.COM");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_rcpt_to_filter_domains_are_case_insensitive() {
+        let filters = vec![
+            CfgFilter {
+                typ: FilterType::ToDomain,
+                domain: vec!["EXAMPLE.COM".to_string()],
+                action: FilterAction::Allow,
+            },
+            CfgFilter {
+                typ: FilterType::ToDomain,
+                domain: vec!["BAD.COM".to_string()],
+                action: FilterAction::Deny,
+            },
+        ];
+        let callbacks = create_test_callbacks(Some(filters)).await;
+
+        for address in ["user@example.com", "user@EXAMPLE.COM", "User@Example.Com"] {
+            let result = callbacks.on_rcpt_to(address).await;
+            assert!(result.is_ok(), "expected {address} to be allowed");
+        }
+
+        let result = callbacks.on_rcpt_to("user@Bad.COM").await;
+        if let Err(SmtpError::RcptToDenied { message }) = result {
+            assert_eq!(message, "Recipient domain bad.com is denied.");
+        } else {
+            panic!("Expected RcptToDenied error for user@Bad.COM");
         }
     }
 
