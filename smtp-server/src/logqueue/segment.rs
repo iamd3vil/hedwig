@@ -253,6 +253,16 @@ impl SegmentReader {
         length: u32,
         max_record_len: u32,
     ) -> Result<(RecordHeader, Vec<u8>), QueueError> {
+        // `length` reaches us from a JobLocation, i.e. from a header that
+        // decode_header already bounded or from a CRC-checked journal entry.
+        // Re-check it here anyway so the allocation below cannot be driven
+        // by a bad length that arrived some other way.
+        if length > max_record_len.min(record::MAX_RECORD_LEN) {
+            return Err(QueueError::CorruptRecord {
+                offset,
+                reason: format!("record length {length} exceeds the maximum"),
+            });
+        }
         let mut buf = vec![0u8; length as usize];
         self.read_exact_at(&mut buf, offset)?;
         let header =
