@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -539,16 +540,28 @@ const COMPACTION_FAILED: &str = "failed";
 const COMPACTION_READ: &str = "read";
 const COMPACTION_WRITTEN: &str = "written";
 
-/// Formats a shard index as the label value used by log-queue metrics.
-fn shard_label(shard: u16) -> String {
-    shard.to_string()
+/// Shard labels are needed on the append hot path, so the strings are built
+/// once instead of being formatted per record. The shard count is fixed at
+/// startup and small; a configuration beyond the table still works, it just
+/// formats on the fly.
+const INTERNED_SHARD_LABELS: u16 = 256;
+
+static SHARD_LABELS: Lazy<Vec<String>> =
+    Lazy::new(|| (0..INTERNED_SHARD_LABELS).map(|s| s.to_string()).collect());
+
+/// Returns the label value used by log-queue metrics for a shard index.
+fn shard_label(shard: u16) -> Cow<'static, str> {
+    match SHARD_LABELS.get(usize::from(shard)) {
+        Some(label) => Cow::Borrowed(label.as_str()),
+        None => Cow::Owned(shard.to_string()),
+    }
 }
 
 /// Records the duration of a log-queue append operation for a shard.
 pub fn logqueue_append_duration_observe(shard: u16, duration: Duration) {
     METRICS
         .logqueue_append_duration
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .observe(duration.as_secs_f64());
 }
 
@@ -561,7 +574,7 @@ pub fn logqueue_pending_append_bytes_set(bytes: u64) {
 pub fn logqueue_records_appended(shard: u16, count: u64) {
     METRICS
         .logqueue_records_appended
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .inc_by(count);
 }
 
@@ -569,7 +582,7 @@ pub fn logqueue_records_appended(shard: u16, count: u64) {
 pub fn logqueue_bytes_appended(shard: u16, bytes: u64) {
     METRICS
         .logqueue_bytes_appended
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .inc_by(bytes);
 }
 
@@ -582,7 +595,7 @@ pub fn logqueue_append_error() {
 pub fn logqueue_active_segment_bytes_set(shard: u16, bytes: u64) {
     METRICS
         .logqueue_active_segment_bytes
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .set(bytes as i64);
 }
 
@@ -590,7 +603,7 @@ pub fn logqueue_active_segment_bytes_set(shard: u16, bytes: u64) {
 pub fn logqueue_segment_rotation(shard: u16) {
     METRICS
         .logqueue_segment_rotations
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .inc();
 }
 
@@ -613,7 +626,7 @@ pub fn logqueue_inflight_jobs_set(count: i64) {
 pub fn logqueue_dispatcher_lag_bytes_set(shard: u16, lag: i64) {
     METRICS
         .logqueue_dispatcher_lag_bytes
-        .with_label_values(&[shard_label(shard).as_str()])
+        .with_label_values(&[shard_label(shard).as_ref()])
         .set(lag);
 }
 
