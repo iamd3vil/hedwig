@@ -87,7 +87,7 @@ async fn refresh_all_policies(resolver: &MtaStsResolver) {
                 let max_age = policy.max_age;
 
                 let refreshed_policy = CachedPolicy {
-                    policy,
+                    policy: Arc::new(policy),
                     txt_id: txt_record.id,
                 };
 

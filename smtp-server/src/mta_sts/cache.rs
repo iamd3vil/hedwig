@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use moka::{future::Cache, Expiry};
@@ -9,6 +10,10 @@ use crate::metrics;
 
 const CACHE_CAPACITY: u64 = 10_000;
 const FETCH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// How long "this domain has no MTA-STS record" is remembered. Most
+/// destinations have no policy, so without this every delivery re-runs the
+/// TXT lookup.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Moka expiry that uses each policy's `max_age` as the TTL.
 struct PolicyExpiry;
@@ -27,6 +32,8 @@ impl Expiry<String, CachedPolicy> for PolicyExpiry {
 pub struct MtaStsResolver {
     fetcher: MtaStsFetcher,
     cache: Cache<String, CachedPolicy>,
+    /// Domains recently observed to have no MTA-STS TXT record.
+    negative_cache: Cache<String, ()>,
     failure_cooldowns: Cache<String, Instant>,
 }
 
@@ -36,6 +43,10 @@ impl MtaStsResolver {
             .max_capacity(CACHE_CAPACITY)
             .expire_after(PolicyExpiry)
             .build();
+        let negative_cache = Cache::builder()
+            .max_capacity(CACHE_CAPACITY)
+            .time_to_live(NEGATIVE_CACHE_TTL)
+            .build();
         let failure_cooldowns = Cache::builder()
             .max_capacity(CACHE_CAPACITY)
             .time_to_live(FETCH_FAILURE_COOLDOWN)
@@ -44,39 +55,47 @@ impl MtaStsResolver {
         Self {
             fetcher,
             cache,
+            negative_cache,
             failure_cooldowns,
         }
     }
 
-    pub async fn get_policy(&self, domain: &str) -> Option<MtaStsPolicy> {
+    /// A cached policy is trusted until its `max_age` expiry (RFC 8461 §5.1;
+    /// the background refresher revalidates the TXT id), so the per-delivery
+    /// hot path here does no DNS at all for cached and known-absent domains.
+    pub async fn get_policy(&self, domain: &str) -> Option<Arc<MtaStsPolicy>> {
         let domain = domain.to_ascii_lowercase();
+
+        if let Some(cached) = self.cache.get(&domain).await {
+            metrics::mta_sts_policy_fetch_cached();
+            return Some(cached.policy);
+        }
+        if self.negative_cache.get(&domain).await.is_some() {
+            return None;
+        }
 
         let txt_record = match self.fetcher.lookup_txt(&domain).await {
             Ok(Some(record)) => record,
-            Ok(None) => return self.get_cached_policy(&domain).await,
+            Ok(None) => {
+                self.negative_cache.insert(domain, ()).await;
+                return None;
+            }
             Err(error) => {
-                warn!(%domain, ?error, "failed to lookup MTA-STS TXT record, using cached policy if available");
-                return self.get_cached_policy(&domain).await;
+                warn!(%domain, ?error, "failed to lookup MTA-STS TXT record");
+                return None;
             }
         };
 
-        if let Some(cached) = self.cache.get(&domain).await {
-            if cached.txt_id == txt_record.id {
-                debug!(%domain, txt_id = %txt_record.id, "MTA-STS cache hit with matching TXT id");
-                metrics::mta_sts_policy_fetch_cached();
-                return Some(cached.policy.clone());
-            }
-        }
-
         if self.failure_cooldowns.get(&domain).await.is_some() {
-            debug!(%domain, "MTA-STS fetch cooldown active, using cached policy if available");
-            return self.get_cached_policy(&domain).await;
+            debug!(%domain, "MTA-STS fetch cooldown active");
+            return None;
         }
 
         match self.fetcher.fetch_policy(&domain).await {
             Ok(Some(policy)) => {
+                let policy = Arc::new(policy);
                 let cached_policy = CachedPolicy {
-                    policy: policy.clone(),
+                    policy: Arc::clone(&policy),
                     txt_id: txt_record.id,
                 };
 
@@ -88,27 +107,16 @@ impl MtaStsResolver {
             }
             Ok(None) => {
                 metrics::mta_sts_policy_fetch_failure();
-                self.failure_cooldowns
-                    .insert(domain.clone(), Instant::now())
-                    .await;
-                self.get_cached_policy(&domain).await
+                self.failure_cooldowns.insert(domain, Instant::now()).await;
+                None
             }
             Err(error) => {
                 warn!(%domain, ?error, "failed to fetch MTA-STS policy");
                 metrics::mta_sts_policy_fetch_failure();
-                self.failure_cooldowns
-                    .insert(domain.clone(), Instant::now())
-                    .await;
-                self.get_cached_policy(&domain).await
+                self.failure_cooldowns.insert(domain, Instant::now()).await;
+                None
             }
         }
-    }
-
-    async fn get_cached_policy(&self, domain: &str) -> Option<MtaStsPolicy> {
-        self.cache
-            .get(domain)
-            .await
-            .map(|cached| cached.policy.clone())
     }
 
     pub(crate) fn cache(&self) -> &Cache<String, CachedPolicy> {

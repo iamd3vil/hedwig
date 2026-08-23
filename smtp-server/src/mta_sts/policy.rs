@@ -26,7 +26,9 @@ pub struct MtaStsPolicy {
 
 #[derive(Clone, Debug)]
 pub struct CachedPolicy {
-    pub policy: MtaStsPolicy,
+    /// Shared so per-delivery cache hits are a refcount bump, not a clone
+    /// of the MX pattern list.
+    pub policy: std::sync::Arc<MtaStsPolicy>,
     pub txt_id: String,
 }
 
