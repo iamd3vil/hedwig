@@ -51,6 +51,11 @@ const HEADER_BODY_SEPARATOR: &[u8] = b"\r\n\r\n";
 /// deferring the message instead.
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 const BCC_HEADER_PREFIX: &[u8] = b"Bcc:";
+const DKIM_HEADER_PREFIX: &[u8] = b"DKIM-Signature:";
+/// Header room reserved when building the outbound copy so splicing our
+/// signature in cannot reallocate the whole message. An RSA-2048
+/// `DKIM-Signature` header is about 450 bytes.
+const DKIM_SIGNATURE_RESERVE: usize = 768;
 const DKIM_HEADERS: [&str; 3] = ["From", "Subject", "To"];
 
 struct DeliveryContext<'a> {
@@ -306,7 +311,9 @@ impl Worker {
             Err(e) => return Err(e).wrap_err("failed to get email from storage"),
         };
 
-        let msg = match MessageParser::default().parse(&email.body) {
+        // Only header fields are ever read out of `msg`, so parsing the
+        // whole MIME tree per attempt is wasted work.
+        let msg = match MessageParser::default().parse_headers(&email.body) {
             Some(msg) => msg,
             None => {
                 error!(msg_id = ?job.job_id, "Failed to parse email body");
@@ -482,83 +489,119 @@ impl Worker {
         Ok(())
     }
 
-    /// Removes Bcc headers from raw email bytes.
-    fn remove_bcc_header(raw_email: &[u8]) -> Result<Vec<u8>> {
+    /// Copies `raw_email` minus the headers that must not be transmitted,
+    /// returning the copy and the offset at which a `DKIM-Signature` header
+    /// belongs (the end of the header block). Keeping the copy and the
+    /// signature insertion separate is what lets the signed path build the
+    /// outbound message once instead of once per header rewrite.
+    ///
+    /// Bcc is always dropped. A `DKIM-Signature` already on the message is
+    /// dropped only when we are about to add our own: otherwise it belongs
+    /// to an upstream signer and stripping it would discard an
+    /// authentication result we are merely relaying.
+    ///
+    /// Line endings are preserved verbatim, so the bytes handed to the
+    /// signer are the bytes that go on the wire.
+    fn strip_outbound_headers(
+        raw_email: &[u8],
+        drop_dkim_signature: bool,
+        reserve: usize,
+    ) -> Result<(Vec<u8>, usize)> {
         let boundary = memmem::find(raw_email, HEADER_BODY_SEPARATOR).ok_or_else(|| {
             miette::miette!("Invalid email format: header body boundary not found")
         })?;
 
-        let header_part = &raw_email[..boundary];
-        let body_part = &raw_email[boundary + HEADER_BODY_SEPARATOR.len()..];
+        let is_header = |line: &[u8], name: &[u8]| {
+            line.get(..name.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+        };
 
-        let mut new_email = Vec::with_capacity(raw_email.len()); // Estimate capacity
-
-        for line in header_part.split(|&b| b == b'\n') {
-            // Trim potential trailing '\r' before checking prefix
-            let trimmed_line = if line.ends_with(b"\r") {
-                &line[..line.len() - 1]
-            } else {
-                line
-            };
-
-            // Check if the line starts with "Bcc:" (case-sensitive)
-            // Use eq_ignore_ascii_case for case-insensitive if needed:
-            if !trimmed_line
-                .get(..BCC_HEADER_PREFIX.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(BCC_HEADER_PREFIX))
-            {
-                // Keep the line if it's not a Bcc header
-                new_email.extend_from_slice(line);
-                new_email.push(b'\n'); // Re-add the newline character
+        let mut out = Vec::with_capacity(raw_email.len() + reserve);
+        for line in raw_email[..boundary].split(|&b| b == b'\n') {
+            let trimmed = line.strip_suffix(b"\r").unwrap_or(line);
+            // A folded continuation line is not recognized as part of the
+            // header it continues, so a folded Bcc keeps its continuation
+            // lines. Fixing that needs real header parsing; the behavior is
+            // pinned by `test_strip_outbound_headers_folded_bcc`.
+            let drop = is_header(trimmed, BCC_HEADER_PREFIX)
+                || (drop_dkim_signature && is_header(trimmed, DKIM_HEADER_PREFIX));
+            if !drop {
+                out.extend_from_slice(line);
+                out.push(b'\n');
             }
         }
 
-        // Remove the last '\n' if headers were present and add the separator
-        if !new_email.is_empty() && new_email.last() == Some(&b'\n') {
-            new_email.pop(); // Remove trailing '\n' from last header line
+        // The loop left a terminator on the last kept header; the separator
+        // supplies it instead. Both bytes have to go: when the last kept
+        // header is followed by a dropped one it still carries its CR, and
+        // leaving that behind puts a bare CR in the header block.
+        if out.last() == Some(&b'\n') {
+            out.pop();
+            if out.last() == Some(&b'\r') {
+                out.pop();
+            }
         }
-        new_email.extend_from_slice(HEADER_BODY_SEPARATOR);
+        // A signature header goes after the CRLF that ends the last header,
+        // i.e. just inside the separator.
+        let signature_at = out.len() + 2;
+        out.extend_from_slice(HEADER_BODY_SEPARATOR);
+        out.extend_from_slice(&raw_email[boundary + HEADER_BODY_SEPARATOR.len()..]);
 
-        // Append the original body
-        new_email.extend_from_slice(body_part);
+        Ok((out, signature_at))
+    }
 
-        Ok(new_email)
+    /// Inserts a signature header at the offset reported by
+    /// [`Worker::strip_outbound_headers`].
+    fn splice_dkim_signature(out: &mut Vec<u8>, signature_at: usize, signature: &str) {
+        let mut header = Vec::with_capacity(signature.len() + 2);
+        header.extend_from_slice(signature.as_bytes());
+        if !signature.ends_with("\r\n") {
+            header.extend_from_slice(b"\r\n");
+        }
+        out.splice(signature_at..signature_at, header);
     }
 
     /// Strip Bcc headers and DKIM-sign (when configured), producing the
-    /// final outbound bytes.
+    /// final outbound bytes with a single copy of the message.
     fn sign_outbound(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let email_bytes_no_bcc =
-            Self::remove_bcc_header(body).wrap_err("Failed to remove Bcc header")?;
-        match &self.dkim_signer {
-            Some(signer) => {
-                debug!("Signing email with DKIM");
-                let signature = match signer {
-                    DkimSignerType::Rsa(signer) => {
-                        let started = Instant::now();
-                        let header = signer
-                            .sign(&email_bytes_no_bcc)
-                            .into_diagnostic()
-                            .wrap_err("signing email with dkim")?
-                            .to_header();
-                        metrics::observe_dkim_sign_latency(started.elapsed());
-                        header
-                    }
-                    DkimSignerType::Ed25519(signer) => {
-                        let started = Instant::now();
-                        let header = signer
-                            .sign(&email_bytes_no_bcc)
-                            .into_diagnostic()
-                            .wrap_err("signing email with dkim")?
-                            .to_header();
-                        metrics::observe_dkim_sign_latency(started.elapsed());
-                        header
-                    }
-                };
-                Self::insert_dkim_signature(&email_bytes_no_bcc, &signature)
+        let Some(signer) = &self.dkim_signer else {
+            let (out, _) = Self::strip_outbound_headers(body, false, 0)
+                .wrap_err("Failed to remove Bcc header")?;
+            return Ok(out);
+        };
+
+        debug!("Signing email with DKIM");
+        // Reserve the signature's room up front so splicing it in below
+        // cannot reallocate and copy the whole message again.
+        let (mut out, signature_at) =
+            Self::strip_outbound_headers(body, true, DKIM_SIGNATURE_RESERVE)
+                .wrap_err("Failed to remove Bcc header")?;
+        // Signing `out` signs the message exactly as it will be
+        // transmitted: the signature header itself is never covered.
+        let signature = match signer {
+            DkimSignerType::Rsa(signer) => {
+                let started = Instant::now();
+                let header = signer
+                    .sign(&out)
+                    .into_diagnostic()
+                    .wrap_err("signing email with dkim")?
+                    .to_header();
+                metrics::observe_dkim_sign_latency(started.elapsed());
+                header
             }
-            None => Ok(email_bytes_no_bcc),
-        }
+            DkimSignerType::Ed25519(signer) => {
+                let started = Instant::now();
+                let header = signer
+                    .sign(&out)
+                    .into_diagnostic()
+                    .wrap_err("signing email with dkim")?
+                    .to_header();
+                metrics::observe_dkim_sign_latency(started.elapsed());
+                header
+            }
+        };
+        Self::splice_dkim_signature(&mut out, signature_at, &signature);
+        Ok(out)
     }
 
     /// The union of envelope recipients and any Cc/Bcc addresses parsed out
@@ -781,7 +824,9 @@ impl Worker {
             );
         };
 
-        let Some(msg) = MessageParser::default().parse(body) else {
+        // Headers only: this path reads the From address and (on the first
+        // attempt) Cc/Bcc, never the body parts.
+        let Some(msg) = MessageParser::default().parse_headers(body) else {
             error!(msg_id = %job.message_id, "Failed to parse email body");
             return self
                 .bounce_claim(job, body, "unparseable message body".into())
@@ -1210,48 +1255,6 @@ pub(crate) fn classify_smtp_outcome(
     SendOutcome::Defer
 }
 
-impl Worker {
-    /// Inserts a DKIM signature into a raw email body.
-    /// The signature should be inserted after the last existing header but before the message body.
-    pub fn insert_dkim_signature(raw_email: &[u8], dkim_signature: &str) -> Result<Vec<u8>> {
-        // Find the boundary of headers and body.
-        let separator = b"\r\n\r\n";
-        let boundary = memmem::find(raw_email, separator).ok_or_else(|| {
-            miette::miette!("Invalid email format: header body boundary not found")
-        })?;
-
-        // Copy the header part while filtering out any existing "DKIM-Signature:" lines.
-        let mut new_email = Vec::with_capacity(raw_email.len() + dkim_signature.len() + 100);
-        {
-            // Process headers line by line.
-            for line in raw_email[..boundary].split(|&b| b == b'\n') {
-                // Trim trailing carriage returns, if any.
-                if let Some(line) = line.strip_suffix(b"\r") {
-                    if !line.starts_with(b"DKIM-Signature:") {
-                        new_email.extend_from_slice(line);
-                        new_email.extend_from_slice(b"\r\n");
-                    }
-                } else if !line.starts_with(b"DKIM-Signature:") {
-                    new_email.extend_from_slice(line);
-                    new_email.extend_from_slice(b"\r\n");
-                }
-            }
-        }
-
-        // Insert DKIM signature.
-        new_email.extend_from_slice(dkim_signature.as_bytes());
-        if !dkim_signature.ends_with("\r\n") {
-            new_email.extend_from_slice(b"\r\n");
-        }
-        // Add the single blank line (\r\n) that separates headers from the body.
-        new_email.extend_from_slice(b"\r\n");
-
-        // Append the remainder of the email body.
-        new_email.extend_from_slice(&raw_email[boundary + separator.len()..]);
-        Ok(new_email)
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Job {
     pub job_id: String,
@@ -1318,12 +1321,32 @@ mod tests {
         );
     }
 
+    // --- outbound header rewriting ---
+    //
+    // These pin the exact bytes of both outbound paths. `sign_outbound`
+    // needs a fully built Worker, so the helpers below compose the same two
+    // primitives it does, with the signer replaced by a fixed header.
+
+    /// The unsigned path: drop Bcc, leave any upstream signature alone.
+    fn strip_bcc(raw_email: &[u8]) -> Result<Vec<u8>> {
+        Worker::strip_outbound_headers(raw_email, false, 0).map(|(out, _)| out)
+    }
+
+    /// The signed path: drop Bcc and any stale signature, then splice ours
+    /// in where the signer's output would go.
+    fn strip_and_sign(raw_email: &[u8], signature: &str) -> Result<Vec<u8>> {
+        let (mut out, signature_at) =
+            Worker::strip_outbound_headers(raw_email, true, signature.len() + 2)?;
+        Worker::splice_dkim_signature(&mut out, signature_at, signature);
+        Ok(out)
+    }
+
     #[test]
-    fn test_remove_bcc_header_present() {
+    fn test_strip_outbound_headers_bcc_present() {
         let raw_email =
             b"From: a@b.com\r\nTo: c@d.com\r\nBcc: e@f.com\r\nSubject: Test\r\n\r\nBody";
         let expected = b"From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n\r\nBody";
-        let result = Worker::remove_bcc_header(raw_email).unwrap();
+        let result = strip_bcc(raw_email).unwrap();
         assert_eq!(
             str::from_utf8(&result).unwrap(),
             str::from_utf8(expected).unwrap()
@@ -1331,10 +1354,10 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_bcc_header_absent() {
+    fn test_strip_outbound_headers_bcc_absent() {
         let raw_email = b"From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n\r\nBody";
         let expected = b"From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n\r\nBody";
-        let result = Worker::remove_bcc_header(raw_email).unwrap();
+        let result = strip_bcc(raw_email).unwrap();
         assert_eq!(
             str::from_utf8(&result).unwrap(),
             str::from_utf8(expected).unwrap()
@@ -1342,10 +1365,10 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_bcc_header_multiple() {
+    fn test_strip_outbound_headers_multiple_bcc() {
         let raw_email = b"From: a@b.com\r\nBcc: g@h.com\r\nTo: c@d.com\r\nBcc: e@f.com\r\nSubject: Test\r\n\r\nBody";
         let expected = b"From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n\r\nBody";
-        let result = Worker::remove_bcc_header(raw_email).unwrap();
+        let result = strip_bcc(raw_email).unwrap();
         assert_eq!(
             str::from_utf8(&result).unwrap(),
             str::from_utf8(expected).unwrap()
@@ -1353,14 +1376,15 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_bcc_header_folded() {
-        // Folded headers are tricky. This basic implementation won't handle folded Bcc.
-        // A robust solution would need proper header parsing.
+    fn test_strip_outbound_headers_folded_bcc() {
+        // Folded headers are tricky. This line-oriented implementation
+        // won't handle a folded Bcc; a robust solution would need proper
+        // header parsing.
         let raw_email = b"From: a@b.com\r\nTo: c@d.com\r\nBcc: e@f.com,\r\n g@h.com\r\nSubject: Test\r\n\r\nBody";
-        // Current implementation will only remove the first line "Bcc: e@f.com,"
+        // Only the first line "Bcc: e@f.com," is removed.
         let expected_current =
             b"From: a@b.com\r\nTo: c@d.com\r\n g@h.com\r\nSubject: Test\r\n\r\nBody";
-        let result = Worker::remove_bcc_header(raw_email).unwrap();
+        let result = strip_bcc(raw_email).unwrap();
         assert_eq!(
             str::from_utf8(&result).unwrap(),
             str::from_utf8(expected_current).unwrap(),
@@ -1369,10 +1393,10 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_bcc_header_no_body() {
+    fn test_strip_outbound_headers_no_body() {
         let raw_email = b"From: a@b.com\r\nBcc: e@f.com\r\nTo: c@d.com\r\n\r\n";
         let expected = b"From: a@b.com\r\nTo: c@d.com\r\n\r\n";
-        let result = Worker::remove_bcc_header(raw_email).unwrap();
+        let result = strip_bcc(raw_email).unwrap();
         assert_eq!(
             str::from_utf8(&result).unwrap(),
             str::from_utf8(expected).unwrap()
@@ -1380,10 +1404,25 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_bcc_header_no_boundary() {
+    fn test_strip_outbound_headers_no_boundary() {
         let raw_email = b"From: a@b.com\r\nBcc: e@f.com"; // Missing \r\n\r\n
-        let result = Worker::remove_bcc_header(raw_email);
-        assert!(result.is_err());
+        assert!(strip_bcc(raw_email).is_err());
+        assert!(strip_and_sign(raw_email, "DKIM-Signature: test-signature").is_err());
+    }
+
+    #[test]
+    fn test_strip_outbound_headers_keeps_upstream_signature_when_unsigned() {
+        // With no signer configured we are relaying, not re-signing: the
+        // upstream signature must survive or its authentication result dies
+        // with it.
+        let raw_email =
+            b"From: a@b.com\r\nDKIM-Signature: upstream\r\nBcc: e@f.com\r\n\r\nBody";
+        let expected = b"From: a@b.com\r\nDKIM-Signature: upstream\r\n\r\nBody";
+        let result = strip_bcc(raw_email).unwrap();
+        assert_eq!(
+            str::from_utf8(&result).unwrap(),
+            str::from_utf8(expected).unwrap()
+        );
     }
 
     #[test]
@@ -1392,15 +1431,8 @@ mod tests {
         let raw_email = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Email\r\n\r\nThis is the email body.";
         let dkim_signature = "DKIM-Signature: test-signature";
 
-        // Call the function.
-        let result = Worker::insert_dkim_signature(raw_email, dkim_signature);
-        assert!(
-            result.is_ok(),
-            "Expected to successfully insert DKIM signature"
-        );
-
-        let new_email = result.unwrap();
-        // Use the returned Vec<u8> immediately and convert to &str.
+        let new_email = strip_and_sign(raw_email, dkim_signature)
+            .expect("Expected to successfully insert DKIM signature");
         let new_email_str = std::str::from_utf8(&new_email).expect("valid utf8");
 
         // The expected output should have the DKIM signature header inserted
@@ -1425,13 +1457,8 @@ mod tests {
         let raw_email = b"From: sender@example.com\r\nDKIM-Signature: old-signature\r\nSubject: Another Test\r\n\r\nThe email body.";
         let dkim_signature = "DKIM-Signature: new-signature";
 
-        let result = Worker::insert_dkim_signature(raw_email, dkim_signature);
-        assert!(
-            result.is_ok(),
-            "Expected to successfully insert DKIM signature even with existing one"
-        );
-
-        let new_email = result.unwrap();
+        let new_email = strip_and_sign(raw_email, dkim_signature)
+            .expect("Expected to successfully insert DKIM signature even with existing one");
         let new_email_str = std::str::from_utf8(&new_email).expect("valid utf8");
 
         // The expected headers should not include the obsolete DKIM header.
@@ -1447,17 +1474,64 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_dkim_signature_missing_boundary() {
-        // Email without the required \r\n\r\n boundary.
-        let raw_email = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Missing Boundary\r\nThis is all header (missing boundary)";
-        let dkim_signature = "DKIM-Signature: test-signature";
+    fn test_signed_message_drops_bcc_and_carries_one_signature() {
+        let raw_email = b"From: sender@example.com\r\nTo: r@example.com\r\nBcc: hidden@example.com\r\ndkim-signature: stale\r\nSubject: Test\r\n\r\nBody";
+        let signed = strip_and_sign(raw_email, "DKIM-Signature: fresh").unwrap();
+        let signed = std::str::from_utf8(&signed).unwrap();
 
-        let result = Worker::insert_dkim_signature(raw_email, dkim_signature);
-        // We expect an error because the header to body boundary is missing.
         assert!(
-            result.is_err(),
-            "Expected an error when there is no header-body separator"
+            !signed.to_ascii_lowercase().contains("bcc:"),
+            "Bcc must never be transmitted: {signed:?}"
         );
+        assert_eq!(
+            signed.to_ascii_lowercase().matches("dkim-signature:").count(),
+            1,
+            "exactly one signature must survive: {signed:?}"
+        );
+        assert!(signed.contains("DKIM-Signature: fresh\r\n\r\nBody"));
+        assert!(signed.contains("Subject: Test\r\n"));
+    }
+
+    #[test]
+    fn test_header_only_parse_matches_full_parse() {
+        // The delivery paths read nothing but header fields, so they parse
+        // headers only. Anything that changes across that boundary would be
+        // a silent behavior change.
+        let raw_email = concat!(
+            "From: \"Sender\" <sender@example.com>\r\n",
+            "To: r@example.com\r\n",
+            "Cc: cc1@example.com, cc2@example.com\r\n",
+            "Bcc: =?utf-8?q?B=C3=B6b?= <bcc@example.com>\r\n",
+            "Subject: =?utf-8?q?Re=3A_caf=C3=A9_=E2=80=94_r=C3=A9sum=C3=A9?=\r\n",
+            "Content-Type: multipart/alternative; boundary=\"sep\"\r\n",
+            "\r\n",
+            "--sep\r\nContent-Type: text/plain\r\n\r\nplain\r\n",
+            "--sep\r\nContent-Type: text/html\r\n\r\n<p>html</p>\r\n",
+            "--sep--\r\n",
+        )
+        .as_bytes();
+
+        let full = MessageParser::default().parse(raw_email).unwrap();
+        let headers = MessageParser::default().parse_headers(raw_email).unwrap();
+
+        assert_eq!(headers.subject(), full.subject());
+        assert_eq!(headers.subject(), Some("Re: café — résumé"));
+        fn addresses(list: Option<&mail_parser::Address<'_>>) -> Vec<String> {
+            list.into_iter()
+                .flat_map(|list| list.as_list())
+                .flatten()
+                .filter_map(|addr| addr.address().map(str::to_owned))
+                .collect()
+        }
+        assert_eq!(addresses(headers.from()), addresses(full.from()));
+        assert_eq!(addresses(headers.cc()), addresses(full.cc()));
+        assert_eq!(addresses(headers.bcc()), addresses(full.bcc()));
+        assert_eq!(addresses(headers.from()), vec!["sender@example.com"]);
+        assert_eq!(
+            addresses(headers.cc()),
+            vec!["cc1@example.com", "cc2@example.com"]
+        );
+        assert_eq!(addresses(headers.bcc()), vec!["bcc@example.com"]);
     }
 
     // --- classify_smtp_outcome ---
