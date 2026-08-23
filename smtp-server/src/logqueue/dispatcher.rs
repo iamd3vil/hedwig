@@ -642,7 +642,9 @@ impl Dispatcher {
             // id is already tracked but whose relocation generation is
             // higher is a compaction copy that must win (crash between
             // relocation and checkpoint leaves both copies on disk).
-            let mut discovered: Vec<(MessageId, JobLocation, i64)> = Vec::new();
+            #[allow(clippy::type_complexity)]
+            let mut discovered: Vec<(MessageId, JobLocation, i64, (String, Vec<String>))> =
+                Vec::new();
             let mut relocations: Vec<(MessageId, JobLocation)> = Vec::new();
             let shard_no = shard.shard;
             let tombstones = &shard.tombstones;
@@ -667,7 +669,15 @@ impl Dispatcher {
                 let dead = tombstones.get(&seg).is_some_and(|s| s.contains(&h.message_id));
                 if !dead {
                     match jobs.get(&h.message_id) {
-                        None => discovered.push((h.message_id, location, h.enqueue_ms)),
+                        // decode_header already materialized the envelope,
+                        // so keep it instead of paying a second read plus
+                        // decode at dispatch time.
+                        None => discovered.push((
+                            h.message_id,
+                            location,
+                            h.enqueue_ms,
+                            (h.sender, h.recipients),
+                        )),
                         Some(job) if h.generation > job.location.generation => {
                             relocations.push((h.message_id, location));
                         }
@@ -679,7 +689,7 @@ impl Dispatcher {
             shard.cursor = Some((seg, stopped));
 
             let made_progress = stopped > off || !discovered.is_empty();
-            for (id, location, enqueue_ms) in discovered {
+            for (id, location, enqueue_ms, envelope) in discovered {
                 self.jobs.insert(
                     id,
                     Job {
@@ -688,7 +698,7 @@ impl Dispatcher {
                         enqueue_ms,
                         remaining: None,
                         last_error: None,
-                        envelope: None,
+                        envelope: Some(envelope),
                         state: JobState::Ready,
                     },
                 );
