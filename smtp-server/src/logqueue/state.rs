@@ -34,6 +34,10 @@ const ENTRY_FRAME: usize = 8;
 /// writer's envelope allowance (1 MiB) plus the persisted-error cap keeps
 /// every legal entry far below this.
 const MAX_ENTRY_LEN: u32 = 16 * 1024 * 1024;
+/// Capacity the journal writer's reusable encode buffer may keep between
+/// appends. Comfortably above a normal entry, so the steady state never
+/// reallocates, while a rare huge one is not held for the process lifetime.
+const MAX_RETAINED_BUF: usize = 64 * 1024;
 
 /// Log sequence number: position in the shard's journal stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,12 +84,11 @@ pub enum StateEntry {
 // ---------------------------------------------------------------------------
 // Minimal binary codec shared by journal entries and checkpoints.
 
-struct Enc(Vec<u8>);
+/// Appends to a caller-owned buffer so the journal writer can encode
+/// straight into the buffer it hands to `write_all`.
+struct Enc<'a>(&'a mut Vec<u8>);
 
-impl Enc {
-    fn new() -> Self {
-        Enc(Vec::new())
-    }
+impl Enc<'_> {
     fn u8(&mut self, v: u8) {
         self.0.push(v);
     }
@@ -181,8 +184,10 @@ const KIND_DELIVERED: u8 = 2;
 const KIND_BOUNCED: u8 = 3;
 const KIND_RELOCATED: u8 = 4;
 
-fn encode_entry(entry: &StateEntry) -> Vec<u8> {
-    let mut e = Enc::new();
+/// Appends the entry's payload encoding to `out`, leaving whatever `out`
+/// already holds (the journal writer's framing header) untouched.
+fn encode_entry(entry: &StateEntry, out: &mut Vec<u8>) {
+    let mut e = Enc(out);
     match entry {
         StateEntry::Deferred {
             id,
@@ -232,7 +237,6 @@ fn encode_entry(entry: &StateEntry) -> Vec<u8> {
             e.location(new);
         }
     }
-    e.0
 }
 
 fn decode_entry(buf: &[u8]) -> Result<StateEntry, QueueError> {
@@ -312,6 +316,9 @@ struct JournalWriter {
     path: PathBuf,
     ordinal: u64,
     len: u64,
+    /// Scratch space for the framed entry, reused across appends so the
+    /// dispatcher does not allocate per delivery outcome.
+    buf: Vec<u8>,
 }
 
 impl JournalWriter {
@@ -327,6 +334,7 @@ impl JournalWriter {
             path,
             ordinal,
             len: 0,
+            buf: Vec::new(),
         })
     }
 
@@ -341,20 +349,48 @@ impl JournalWriter {
             path,
             ordinal,
             len,
+            buf: Vec::new(),
         })
     }
 
     /// Append one entry; returns the LSN one past it (replay resumes there).
-    fn append(&mut self, payload: &[u8]) -> Result<Lsn, QueueError> {
-        let mut framed = Vec::with_capacity(ENTRY_FRAME + payload.len());
-        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        framed.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
-        framed.extend_from_slice(payload);
-        if let Err(e) = self.file.write_all(&framed) {
+    fn append(&mut self, entry: &StateEntry) -> Result<Lsn, QueueError> {
+        // Reserve the frame before encoding so the payload lands in its
+        // final position; the length and crc are filled in afterwards, once
+        // the payload extent is known. `clear` keeps the capacity but drops
+        // the previous entry's bytes, so a shorter entry cannot inherit a
+        // longer one's tail.
+        self.buf.clear();
+        if self.buf.capacity() > MAX_RETAINED_BUF {
+            // Give back the capacity a pathological entry (tens of thousands
+            // of recipients) demanded instead of holding megabytes per shard
+            // for every later append.
+            self.buf.shrink_to(MAX_RETAINED_BUF);
+        }
+        self.buf.extend_from_slice(&[0u8; ENTRY_FRAME]);
+        encode_entry(entry, &mut self.buf);
+        let payload = &self.buf[ENTRY_FRAME..];
+
+        // Replay treats anything above MAX_ENTRY_LEN as corruption, so an
+        // oversized entry must never reach the file: written, it would
+        // truncate replay at this point (silently discarding this entry and
+        // every later one) or hard-fail recovery of a rotated journal.
+        if payload.len() > MAX_ENTRY_LEN as usize {
+            return Err(QueueError::InvalidRecord(format!(
+                "state entry is {} bytes, exceeds the {MAX_ENTRY_LEN} byte replay limit",
+                payload.len()
+            )));
+        }
+        let len_le = (payload.len() as u32).to_le_bytes();
+        let crc_le = crc32fast::hash(payload).to_le_bytes();
+        self.buf[0..4].copy_from_slice(&len_le);
+        self.buf[4..8].copy_from_slice(&crc_le);
+
+        if let Err(e) = self.file.write_all(&self.buf) {
             let _ = self.file.set_len(self.len);
             return Err(QueueError::io(&self.path, e));
         }
-        self.len += framed.len() as u64;
+        self.len += self.buf.len() as u64;
         Ok(Lsn {
             journal: self.ordinal,
             offset: self.len,
@@ -521,7 +557,8 @@ pub struct Checkpoint {
 }
 
 fn encode_checkpoint(cp: &Checkpoint, replay_from: Lsn) -> Vec<u8> {
-    let mut e = Enc::new();
+    let mut buf = Vec::new();
+    let mut e = Enc(&mut buf);
     e.u64(replay_from.journal);
     e.u64(replay_from.offset);
     match cp.cursor {
@@ -571,7 +608,7 @@ fn encode_checkpoint(cp: &Checkpoint, replay_from: Lsn) -> Vec<u8> {
         e.u32(s.dead_records);
         e.u64(s.dead_bytes);
     }
-    e.0
+    buf
 }
 
 fn decode_checkpoint(buf: &[u8]) -> Result<(Checkpoint, Lsn), QueueError> {
@@ -965,19 +1002,9 @@ impl ShardStateStore {
     /// Persist one state transition (page-cache durability). The caller
     /// applies the transition to in-memory state only after this returns.
     pub fn append(&mut self, entry: &StateEntry) -> Result<Lsn, QueueError> {
-        let payload = encode_entry(entry);
-        // Replay treats anything above MAX_ENTRY_LEN as corruption, so an
-        // oversized entry must never reach the file: written, it would
-        // truncate replay at this point (silently discarding this entry and
-        // every later one) or hard-fail recovery of a rotated journal.
-        if payload.len() > MAX_ENTRY_LEN as usize {
-            return Err(QueueError::InvalidRecord(format!(
-                "state entry is {} bytes, exceeds the {MAX_ENTRY_LEN} byte replay limit",
-                payload.len()
-            )));
-        }
-        let lsn = self.journal.append(&payload)?;
-        self.bytes_since_checkpoint += (ENTRY_FRAME + payload.len()) as u64;
+        let before = self.journal.len;
+        let lsn = self.journal.append(entry)?;
+        self.bytes_since_checkpoint += self.journal.len - before;
         Ok(lsn)
     }
 
@@ -1178,7 +1205,8 @@ mod tests {
                 reason: "550 no such user".into(),
             },
         ] {
-            let buf = encode_entry(&entry);
+            let mut buf = Vec::new();
+            encode_entry(&entry, &mut buf);
             assert_eq!(decode_entry(&buf).unwrap(), entry);
         }
     }
@@ -1544,5 +1572,137 @@ mod tests {
         assert_eq!(readonly.deferred, recovered.deferred);
         assert_eq!(readonly.tombstones, recovered.tombstones);
         assert_eq!(readonly.segment_stats, recovered.segment_stats);
+    }
+
+    fn golden_entries() -> Vec<StateEntry> {
+        fn gloc(segment: u64, offset: u64) -> JobLocation {
+            JobLocation {
+                shard: 3,
+                segment,
+                offset,
+                length: 512,
+                ordinal: 7,
+                generation: 2,
+            }
+        }
+        vec![
+            StateEntry::Deferred {
+                id: id(1),
+                location: gloc(1, 512),
+                attempts: 4,
+                next_attempt_ms: 1_752_000_100_000,
+                remaining_recipients: vec![
+                    "long-recipient-one@example.com".into(),
+                    "long-recipient-two@example.com".into(),
+                ],
+                last_error: "451 4.3.0 temporary local problem, please retry later".into(),
+            },
+            StateEntry::Delivered {
+                id: id(2),
+                location: gloc(2, 1024),
+                timestamp_ms: 1_752_000_200_000,
+            },
+            StateEntry::Bounced {
+                id: id(3),
+                location: gloc(2, 1536),
+                timestamp_ms: 1_752_000_300_000,
+                reason: "550 no such user".into(),
+            },
+            StateEntry::Relocated {
+                id: id(4),
+                old: gloc(3, 0),
+                new: gloc(9, 4096),
+            },
+        ]
+    }
+
+    /// One entry of each kind as written by the journal, hex-encoded:
+    /// `u32 payload length | u32 crc32(payload) | payload`, little-endian,
+    /// entries back to back with no padding or trailer. Pinned as literal
+    /// bytes because a journal is replayed by later builds after a crash —
+    /// any drift in framing or field order turns existing journals into
+    /// lost or duplicated mail.
+    const GOLDEN_JOURNAL: &str = "\
+        bc000000b2023807010000000000010000000000000000001203000100000000000000000200000000000000\
+        020000070000000200000004000000a0f657eb97010000020000001e0000006c6f6e672d726563697069656e\
+        742d6f6e65406578616d706c652e636f6d1e0000006c6f6e672d726563697069656e742d74776f406578616d\
+        706c652e636f6d3500000034353120342e332e302074656d706f72617279206c6f63616c2070726f626c656d\
+        2c20706c65617365207265747279206c61746572370000000afbe3c102000000000002000000000000000000\
+        1f030002000000000000000004000000000000000200000700000002000000407d59eb970100004b00000033\
+        f7c2ed030000000000030000000000000000002c030002000000000000000006000000000000000200000700\
+        000002000000e0035beb9701000010000000353530206e6f207375636820757365724d0000008e0479b50400\
+        0000000004000000000000000000390300030000000000000000000000000000000002000007000000020000\
+        00030009000000000000000010000000000000000200000700000002000000";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let digits: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        digits
+            .chunks(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn journal_framing_is_byte_stable() {
+        let golden = unhex(GOLDEN_JOURNAL);
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (mut store, _) = ShardStateStore::recover(dir.path(), 0).unwrap();
+            for e in golden_entries() {
+                store.append(&e).unwrap();
+            }
+        }
+        let written = std::fs::read(dir.path().join(journal_file_name(1))).unwrap();
+        assert_eq!(written, golden, "journal byte format changed");
+
+        // Same bytes as a journal left by an earlier build: it must replay
+        // back to exactly the entries that produced it.
+        let old = tempfile::tempdir().unwrap();
+        let path = old.path().join(journal_file_name(1));
+        std::fs::write(&path, &golden).unwrap();
+        let mut replayed = Vec::new();
+        let end = replay_journal(&path, 0, TornTail::HardError, |e| replayed.push(e)).unwrap();
+        assert_eq!(end, golden.len() as u64, "replay stopped short");
+        assert_eq!(replayed, golden_entries());
+    }
+
+    #[test]
+    fn short_entry_after_long_one_is_framed_independently() {
+        let long = StateEntry::Deferred {
+            id: id(1),
+            location: loc(1, 512),
+            attempts: 1,
+            next_attempt_ms: 1_752_000_100_000,
+            remaining_recipients: (0..64)
+                .map(|i| format!("rcpt-{i:04}@example.com"))
+                .collect(),
+            last_error: "451 ".to_string() + &"e".repeat(2048),
+        };
+        let short = delivered(2);
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (mut store, _) = ShardStateStore::recover(dir.path(), 0).unwrap();
+            store.append(&long).unwrap();
+            store.append(&short).unwrap();
+        }
+
+        // The reused encode buffer must not leave the long entry's tail
+        // inside the short entry's frame.
+        let bytes = std::fs::read(dir.path().join(journal_file_name(1))).unwrap();
+        let mut expected_long = Vec::new();
+        encode_entry(&long, &mut expected_long);
+        let mut expected_short = Vec::new();
+        encode_entry(&short, &mut expected_short);
+        let second = ENTRY_FRAME + expected_long.len();
+        assert_eq!(
+            bytes.len(),
+            second + ENTRY_FRAME + expected_short.len(),
+            "trailing bytes from the longer entry"
+        );
+        assert_eq!(&bytes[second + ENTRY_FRAME..], &expected_short[..]);
+
+        let (_, state) = ShardStateStore::recover(dir.path(), 0).unwrap();
+        assert_eq!(state.deferred[&id(1)].last_error.len(), 2052);
+        assert!(state.is_terminal(1, &id(2)));
     }
 }
