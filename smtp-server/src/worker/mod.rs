@@ -47,6 +47,9 @@ pub mod rate_limiter;
 use rate_limiter::{RateLimitConfig, RateLimitResult, RateLimiter};
 
 const HEADER_BODY_SEPARATOR: &[u8] = b"\r\n\r\n";
+/// How long the legacy worker will park on a throttled destination before
+/// deferring the message instead.
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 const BCC_HEADER_PREFIX: &[u8] = b"Bcc:";
 const DKIM_HEADERS: [&str; 3] = ["From", "Subject", "To"];
 
@@ -587,6 +590,18 @@ impl Worker {
             .collect()
     }
 
+    /// Block until this domain has a token, consuming it. Used only by the
+    /// legacy channel worker, which has nowhere to report "throttled" and so
+    /// parks its slot; the log backend's `process_claim` reports
+    /// `RateLimited` to the dispatcher instead and never waits.
+    ///
+    /// Bounded by [`MAX_RATE_LIMIT_WAIT`]: if the domain is still starved
+    /// after that (other workers winning every refilled token), the message
+    /// is deferred rather than sent over the limit.
+    async fn await_rate_limit(&self, domain: &str) -> Result<()> {
+        await_rate_limit_within(&self.rate_limiter, domain, MAX_RATE_LIMIT_WAIT).await
+    }
+
     /// Attempt delivery of one recipient through its MX servers, applying
     /// MTA-STS policy. Rate limiting and outcome logging stay with the
     /// caller. `Err` is reserved for infrastructure failures (MX lookup,
@@ -973,20 +988,13 @@ impl Worker {
             };
             let domain = parsed_email_id.get_domain();
 
-            // Check rate limit for this domain
-            match self.rate_limiter.check_rate_limit(domain).await {
-                RateLimitResult::Allowed => {
-                    debug!(domain = ?domain, "Rate limit check passed");
-                }
-                RateLimitResult::RateLimited { retry_after } => {
-                    info!(
-                        domain = ?domain,
-                        retry_after_ms = retry_after.as_millis(),
-                        "Rate limited, waiting before sending"
-                    );
-                    tokio::time::sleep(retry_after).await;
-                }
-            }
+            // Check rate limit for this domain. The old code slept once and
+            // then fell through to send *without* re-checking, so every
+            // sleep handed out a message the limiter had refused: the
+            // configured limit was silently exceeded whenever this path was
+            // hit. Wait and re-check instead, so transmission always follows
+            // a token this attempt actually consumed.
+            self.await_rate_limit(domain).await?;
 
             match self
                 .deliver_recipient(&raw_email, from, to_trimmed, &parsed_email_id)
@@ -1112,6 +1120,51 @@ pub(crate) enum SendOutcome {
 pub(crate) struct ClassifiedSendError {
     pub(crate) outcome: SendOutcome,
     pub(crate) smtp_response: String,
+}
+
+/// Wait until `domain` has a token and consume it, giving up after
+/// `budget` of cumulative waiting with a defer-classified error.
+///
+/// Free-standing and budget-parameterized so tests exercise this exact
+/// loop without standing up a Worker or sleeping for a real minute.
+pub(crate) async fn await_rate_limit_within(
+    limiter: &RateLimiter,
+    domain: &str,
+    budget: Duration,
+) -> Result<()> {
+    let mut waited = Duration::ZERO;
+    loop {
+        match limiter.check_rate_limit(domain).await {
+            RateLimitResult::Allowed => {
+                debug!(domain = ?domain, "Rate limit check passed");
+                return Ok(());
+            }
+            RateLimitResult::RateLimited { retry_after } => {
+                if waited >= budget {
+                    info!(
+                        domain = ?domain,
+                        waited_ms = waited.as_millis(),
+                        "still rate limited after waiting; deferring"
+                    );
+                    // Report::new, not into_diagnostic, so process_job can
+                    // downcast this and defer (see ClassifiedSendError).
+                    return Err(miette::Report::new(ClassifiedSendError {
+                        outcome: SendOutcome::Defer,
+                        smtp_response: format!(
+                            "locally rate limited for destination domain {domain}"
+                        ),
+                    }));
+                }
+                info!(
+                    domain = ?domain,
+                    retry_after_ms = retry_after.as_millis(),
+                    "Rate limited, waiting before sending"
+                );
+                tokio::time::sleep(retry_after).await;
+                waited += retry_after;
+            }
+        }
+    }
 }
 
 /// Classify an SMTP delivery failure into defer-vs-bounce.
@@ -1522,6 +1575,50 @@ mod tests {
         let recovered = report.downcast_ref::<MtaStsEnforcementError>();
         assert!(recovered.is_some());
         assert_eq!(recovered.unwrap().domain, "example.com");
+    }
+
+    /// The legacy path used to sleep once on a rate-limit refusal and then
+    /// send anyway, exceeding the configured limit every time that path was
+    /// hit. The wait loop must keep re-checking until it has actually
+    /// consumed a token, and give up with a deferrable error rather than
+    /// letting the message through.
+    #[tokio::test]
+    async fn await_rate_limit_waits_for_a_token_then_defers_when_starved() {
+        use crate::worker::rate_limiter::{RateLimitConfig, RateLimiter};
+
+        // 6000/min == one token per 10ms, so the waits below are quick.
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enabled: true,
+            default_limit: Some(6_000),
+            domain_limits: std::collections::HashMap::new(),
+        });
+        let budget = Duration::from_millis(50);
+
+        // A domain with tokens to spare is allowed straight through.
+        await_rate_limit_within(&limiter, "example.com", budget)
+            .await
+            .expect("tokens are available");
+
+        // Drain the bucket, then confirm the loop waits and still refuses to
+        // send over the limit, reporting a defer instead. (The bucket only
+        // refills on whole-second boundaries, so nothing arrives within the
+        // budget here.)
+        while !matches!(
+            limiter.check_rate_limit("example.com").await,
+            RateLimitResult::RateLimited { .. }
+        ) {}
+        let started = Instant::now();
+        let err = await_rate_limit_within(&limiter, "example.com", budget)
+            .await
+            .expect_err("a starved domain must not be allowed through");
+        assert!(
+            started.elapsed() >= Duration::from_millis(10),
+            "must wait for a token rather than falling through to a send"
+        );
+        let classified = err
+            .downcast_ref::<ClassifiedSendError>()
+            .expect("must be downcastable so process_job can defer");
+        assert_eq!(classified.outcome, SendOutcome::Defer);
     }
 
     #[test]
