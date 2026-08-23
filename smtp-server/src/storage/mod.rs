@@ -55,6 +55,13 @@ impl Default for CleanupConfig {
 pub trait Storage: Send + Sync {
     async fn get(&self, key: &str, status: Status) -> Result<Option<StoredEmail>>;
     async fn put(&self, email: StoredEmail, status: Status) -> Result<()>;
+    /// Whether a message body is present, without reading or decoding it.
+    ///
+    /// The default implementation reads the whole message; backends that can
+    /// answer from metadata alone should override it.
+    async fn exists(&self, key: &str, status: Status) -> Result<bool> {
+        Ok(self.get(key, status).await?.is_some())
+    }
     async fn get_meta(&self, key: &str) -> Result<Option<EmailMetadata>>;
     async fn put_meta(&self, key: &str, meta: &EmailMetadata) -> Result<()>;
     async fn delete_meta(&self, key: &str) -> Result<()>;

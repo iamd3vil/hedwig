@@ -47,10 +47,28 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    hash::{Hash, Hasher},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+
+/// Number of independently locked bucket maps. Checks hash their domain to
+/// one of these, so unrelated destinations never serialize against each
+/// other. A critical section is pure arithmetic on one bucket — no I/O and
+/// never an await — so a std Mutex is the right primitive.
+const BUCKET_SHARDS: usize = 16;
+
+/// Buckets untouched for this long are dropped by the sweep below.
+const BUCKET_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// A shard sweeps idle buckets when it grows past this many entries. Without
+/// it the map keeps one bucket per distinct recipient domain forever.
+const SWEEP_THRESHOLD: usize = 1024;
+
+/// Minimum gap between sweeps of the same shard. A sweep is O(shard), so
+/// without this a flood of never-seen-again domains would make every miss
+/// rescan a shard whose entries are all too young to evict.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Configuration for rate limiting email sending.
 ///
@@ -81,6 +99,9 @@ struct TokenBucket {
     last_refill: Instant,
     /// Rate at which tokens are refilled (tokens per minute)
     refill_rate: u32,
+    /// Last time this bucket was consulted, for idle eviction. Distinct
+    /// from `last_refill`, which only moves when tokens are actually added.
+    last_seen: Instant,
 }
 
 impl TokenBucket {
@@ -90,11 +111,13 @@ impl TokenBucket {
     /// * `capacity` - Maximum number of tokens the bucket can hold
     /// * `refill_rate` - Rate at which tokens are added (tokens per minute)
     fn new(capacity: u32, refill_rate: u32) -> Self {
+        let now = Instant::now();
         Self {
             tokens: capacity,
             capacity,
-            last_refill: Instant::now(),
+            last_refill: now,
             refill_rate,
+            last_seen: now,
         }
     }
 
@@ -145,6 +168,83 @@ impl TokenBucket {
     }
 }
 
+/// One independently locked group of buckets.
+struct Shard {
+    buckets: HashMap<String, TokenBucket>,
+    /// When this shard last dropped idle buckets.
+    last_sweep: Instant,
+}
+
+/// Per-domain token buckets, split across independently locked shards.
+struct Buckets {
+    shards: Vec<Mutex<Shard>>,
+}
+
+impl Buckets {
+    fn new() -> Self {
+        Self {
+            shards: (0..BUCKET_SHARDS)
+                .map(|_| {
+                    Mutex::new(Shard {
+                        buckets: HashMap::new(),
+                        last_sweep: Instant::now(),
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn shard_for(&self, domain: &str) -> &Mutex<Shard> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        domain.hash(&mut hasher);
+        &self.shards[hasher.finish() as usize % self.shards.len()]
+    }
+
+    /// Run `f` against `domain`'s bucket, creating it on first use.
+    ///
+    /// The hit path looks the bucket up by `&str`, so a check against an
+    /// existing domain allocates nothing. A poisoned lock is recovered from
+    /// rather than propagated: the worst case is one bucket with stale
+    /// token accounting, which must not take down mail delivery.
+    fn with_bucket<R>(
+        &self,
+        domain: &str,
+        limit: u32,
+        f: impl FnOnce(&mut TokenBucket) -> R,
+    ) -> R {
+        let mut shard = self
+            .shard_for(domain)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        if let Some(bucket) = shard.buckets.get_mut(domain) {
+            bucket.last_seen = now;
+            return f(bucket);
+        }
+        if shard.buckets.len() >= SWEEP_THRESHOLD
+            && now.duration_since(shard.last_sweep) >= SWEEP_INTERVAL
+        {
+            shard
+                .buckets
+                .retain(|_, b| now.duration_since(b.last_seen) < BUCKET_IDLE_TTL);
+            shard.last_sweep = now;
+        }
+        let bucket = shard
+            .buckets
+            .entry(domain.to_string())
+            .or_insert_with(|| TokenBucket::new(limit, limit));
+        f(bucket)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.lock().expect("test locks are not poisoned").buckets.len())
+            .sum()
+    }
+}
+
 /// Rate limiter for controlling email sending rates per domain.
 ///
 /// The RateLimiter maintains a collection of token buckets, one for each domain,
@@ -153,7 +253,7 @@ impl TokenBucket {
 pub struct RateLimiter {
     config: RateLimitConfig,
     /// Thread-safe storage for per-domain token buckets
-    buckets: Arc<RwLock<HashMap<String, TokenBucket>>>,
+    buckets: Arc<Buckets>,
 }
 
 impl RateLimiter {
@@ -161,8 +261,22 @@ impl RateLimiter {
     pub fn new(config: RateLimitConfig) -> Self {
         Self {
             config,
-            buckets: Arc::new(RwLock::new(HashMap::new())),
+            buckets: Arc::new(Buckets::new()),
         }
+    }
+
+    /// The configured limit for `domain`, or `None` when it is unlimited.
+    fn limit_for(&self, domain: &str) -> Option<u32> {
+        if !self.config.enabled {
+            return None;
+        }
+        let limit = self
+            .config
+            .domain_limits
+            .get(domain)
+            .copied()
+            .or(self.config.default_limit)?;
+        (limit > 0).then_some(limit)
     }
 
     /// Checks if an email can be sent to the specified domain.
@@ -177,65 +291,31 @@ impl RateLimiter {
     /// * `RateLimitResult::Allowed` - Email can be sent immediately
     /// * `RateLimitResult::RateLimited { retry_after }` - Must wait before sending
     pub async fn check_rate_limit(&self, domain: &str) -> RateLimitResult {
-        if !self.config.enabled {
-            return RateLimitResult::Allowed;
-        }
-
-        let Some(limit) = self
-            .config
-            .domain_limits
-            .get(domain)
-            .copied()
-            .or(self.config.default_limit)
-        else {
+        let Some(limit) = self.limit_for(domain) else {
             return RateLimitResult::Allowed;
         };
 
-        if limit == 0 {
-            return RateLimitResult::Allowed;
-        }
-
-        let mut buckets = self.buckets.write().await;
-        let bucket = buckets
-            .entry(domain.to_string())
-            .or_insert_with(|| TokenBucket::new(limit, limit));
-
-        if bucket.try_consume() {
-            RateLimitResult::Allowed
-        } else {
-            let delay = bucket.time_until_token_available();
-            RateLimitResult::RateLimited { retry_after: delay }
-        }
+        self.buckets.with_bucket(domain, limit, |bucket| {
+            if bucket.try_consume() {
+                RateLimitResult::Allowed
+            } else {
+                RateLimitResult::RateLimited {
+                    retry_after: bucket.time_until_token_available(),
+                }
+            }
+        })
     }
 
     /// Non-consuming availability check used by the log-queue dispatcher to
     /// gate claims: `None` when a token is available (or the domain is not
-    /// limited), otherwise roughly how long until one is. Never blocks — if
-    /// the bucket map is contended it optimistically allows, because the
-    /// worker's consuming check before transmission is authoritative.
+    /// limited), otherwise roughly how long until one is. The worker's
+    /// consuming check before transmission remains authoritative.
     pub fn peek_sync(&self, domain: &str) -> Option<Duration> {
-        if !self.config.enabled {
-            return None;
-        }
-        let limit = self
-            .config
-            .domain_limits
-            .get(domain)
-            .copied()
-            .or(self.config.default_limit)?;
-        if limit == 0 {
-            return None;
-        }
-        let mut buckets = self.buckets.try_write().ok()?;
-        let bucket = buckets
-            .entry(domain.to_string())
-            .or_insert_with(|| TokenBucket::new(limit, limit));
-        let wait = bucket.time_until_token_available();
-        if wait.is_zero() {
-            None
-        } else {
-            Some(wait)
-        }
+        let limit = self.limit_for(domain)?;
+        self.buckets.with_bucket(domain, limit, |bucket| {
+            let wait = bucket.time_until_token_available();
+            (!wait.is_zero()).then_some(wait)
+        })
     }
 }
 
@@ -408,6 +488,59 @@ mod tests {
             limiter.check_rate_limit("limited.com").await,
             RateLimitResult::RateLimited { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_idle_buckets_are_swept_once_a_shard_grows() {
+        // The sweep only runs on a miss in a shard past SWEEP_THRESHOLD, so
+        // drive the retain predicate directly with an already-elapsed TTL.
+        let buckets = Buckets::new();
+        buckets.with_bucket("a.example", 10, |b| b.try_consume());
+        buckets.with_bucket("b.example", 10, |b| b.try_consume());
+        assert_eq!(buckets.len(), 2);
+
+        for shard in &buckets.shards {
+            let mut shard = shard.lock().unwrap();
+            let now = Instant::now();
+            shard
+                .buckets
+                .retain(|_, b| now.duration_since(b.last_seen) < Duration::ZERO);
+        }
+        assert_eq!(buckets.len(), 0, "idle buckets must not accumulate");
+    }
+
+    #[tokio::test]
+    async fn test_repeated_checks_reuse_one_bucket_per_domain() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enabled: true,
+            default_limit: Some(100),
+            domain_limits: HashMap::new(),
+        });
+        for _ in 0..50 {
+            limiter.check_rate_limit("example.com").await;
+            limiter.peek_sync("example.com");
+        }
+        assert_eq!(limiter.buckets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_peek_sync_reports_exhaustion_without_consuming() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enabled: true,
+            default_limit: Some(1),
+            domain_limits: HashMap::new(),
+        });
+
+        // Peeking must not consume the only token, however often it runs.
+        for _ in 0..5 {
+            assert!(limiter.peek_sync("example.com").is_none());
+        }
+        assert!(matches!(
+            limiter.check_rate_limit("example.com").await,
+            RateLimitResult::Allowed
+        ));
+        // Now exhausted, the gate reports a wait instead of allowing.
+        assert!(limiter.peek_sync("example.com").is_some());
     }
 
     #[tokio::test]

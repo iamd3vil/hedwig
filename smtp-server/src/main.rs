@@ -282,11 +282,8 @@ async fn run_server(config_path: &str) -> Result<()> {
             });
         }
 
-        let tap = callbacks::LogQueueTap {
-            append: writers.handle(),
-            spool_root,
-            disk_reserve_bytes: qcfg.disk_reserve_bytes(),
-        };
+        let tap =
+            callbacks::LogQueueTap::new(writers.handle(), spool_root, qcfg.disk_reserve_bytes());
         let (callbacks, worker_resources, mta_sts_resolver) =
             callbacks::Callbacks::new_log(Arc::clone(&storage), tap, cfg.clone())
                 .await
@@ -479,6 +476,13 @@ async fn run_server(config_path: &str) -> Result<()> {
                                 continue;
                             }
                         };
+
+                        // Replies are small and written one batch per read;
+                        // Nagle would sit on them waiting for the delayed
+                        // ACK, adding up to 40ms per round trip.
+                        if let Err(e) = socket.set_nodelay(true) {
+                            debug!(%listener_addr, "could not set TCP_NODELAY: {}", e);
+                        }
 
                         // Enforce the connection limit. If we're at capacity, reject immediately.
                         let permit = match conn_semaphore.clone().try_acquire_owned() {

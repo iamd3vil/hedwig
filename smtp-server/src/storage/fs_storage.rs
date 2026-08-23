@@ -359,6 +359,15 @@ impl Storage for FileSystemStorage {
         Ok(Some(decode_email(contents)?))
     }
 
+    /// Answers from a single `stat`, without reading or decoding the body.
+    async fn exists(&self, key: &str, status: Status) -> Result<bool> {
+        match fs::metadata(self.file_path(key, &status)).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).into_diagnostic(),
+        }
+    }
+
     /// Stores an email with the specified status.
     ///
     /// # Arguments

@@ -181,14 +181,35 @@ impl SegmentReader {
             .map_err(|e| QueueError::io(&self.path, e))
     }
 
+    /// Read up to `buf.len()` bytes at `offset`, stopping early at EOF.
+    /// Returns the number of bytes read.
+    fn read_up_to(&self, buf: &mut [u8], offset: u64) -> Result<usize, QueueError> {
+        let mut read = 0;
+        while read < buf.len() {
+            match self.file.read_at(&mut buf[read..], offset + read as u64) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(QueueError::io(&self.path, e)),
+            }
+        }
+        Ok(read)
+    }
+
     /// Decode the record header at `offset`.
     pub fn read_header_at(
         &self,
         offset: u64,
         max_record_len: u32,
     ) -> Result<RecordHeader, QueueError> {
-        let mut buf = vec![0u8; FIXED_HEADER_LEN];
-        self.read_exact_at(&mut buf, offset)?;
+        // header_len always exceeds FIXED_HEADER_LEN (the envelope follows),
+        // so start with enough room for a typical envelope to decode in one
+        // read; short reads at EOF are fine, the decoder reports what it
+        // still needs.
+        const INITIAL_READ: usize = 1024;
+        let mut buf = vec![0u8; INITIAL_READ];
+        let n = self.read_up_to(&mut buf, offset)?;
+        buf.truncate(n);
         loop {
             match record::decode_header(&buf, max_record_len) {
                 Ok(h) => return Ok(h),
@@ -222,6 +243,43 @@ impl SegmentReader {
         Ok((header, body))
     }
 
+    /// Read a record whose total length is already known (from a
+    /// `JobLocation`) in a single positioned read, then decode and verify
+    /// it. Returns the header and the full record buffer; the body is
+    /// `buf[header.header_len..]`.
+    pub fn read_record_exact(
+        &self,
+        offset: u64,
+        length: u32,
+        max_record_len: u32,
+    ) -> Result<(RecordHeader, Vec<u8>), QueueError> {
+        // `length` reaches us from a JobLocation, i.e. from a header that
+        // decode_header already bounded or from a CRC-checked journal entry.
+        // Re-check it here anyway so the allocation below cannot be driven
+        // by a bad length that arrived some other way.
+        if length > max_record_len.min(record::MAX_RECORD_LEN) {
+            return Err(QueueError::CorruptRecord {
+                offset,
+                reason: format!("record length {length} exceeds the maximum"),
+            });
+        }
+        let mut buf = vec![0u8; length as usize];
+        self.read_exact_at(&mut buf, offset)?;
+        let header =
+            record::decode_header(&buf, max_record_len).map_err(|e| e.into_queue_error(offset))?;
+        if header.record_len != length {
+            return Err(QueueError::CorruptRecord {
+                offset,
+                reason: format!(
+                    "record length {} does not match expected length {length}",
+                    header.record_len
+                ),
+            });
+        }
+        record::verify_body(&header, &buf[header.header_len as usize..])?;
+        Ok((header, buf))
+    }
+
     fn file_len(&self) -> Result<u64, QueueError> {
         Ok(self
             .file
@@ -250,6 +308,8 @@ struct Scanner<'a> {
     max_record_len: u32,
     verify_bodies: bool,
     buf: Vec<u8>,
+    /// File offset of `buf[0]`; the buffer holds `[buf_start, buf_start + buf.len())`.
+    buf_start: u64,
 }
 
 impl<'a> Scanner<'a> {
@@ -267,12 +327,28 @@ impl<'a> Scanner<'a> {
             max_record_len,
             verify_bodies,
             buf: Vec::new(),
+            buf_start: start,
         }
     }
 
-    fn read_window(&mut self, len: usize) -> Result<(), QueueError> {
-        self.buf.resize(len, 0);
-        self.reader.read_exact_at(&mut self.buf, self.offset)
+    /// The buffered window starting at `self.offset`, guaranteed to hold at
+    /// least `needed` bytes (clamped to the scan end). Issues a positioned
+    /// read only when the current buffer doesn't already cover the range,
+    /// reading a full SCAN_CHUNK so successive headers decode from memory.
+    fn window(&mut self, needed: usize) -> Result<&[u8], QueueError> {
+        let remaining = (self.end - self.offset) as usize;
+        let needed = needed.min(remaining);
+        // `offset` only moves forward and `buf_start` is always set to a
+        // past value of it, so this cannot underflow.
+        let rel = (self.offset - self.buf_start) as usize;
+        if rel > self.buf.len() || self.buf.len() - rel < needed {
+            let len = needed.max(SCAN_CHUNK).min(remaining);
+            self.buf.resize(len, 0);
+            self.reader.read_exact_at(&mut self.buf, self.offset)?;
+            self.buf_start = self.offset;
+            return Ok(&self.buf);
+        }
+        Ok(&self.buf[rel..])
     }
 
     fn next(&mut self) -> Result<ScanStep, QueueError> {
@@ -287,21 +363,22 @@ impl<'a> Scanner<'a> {
             });
         }
 
-        let window = SCAN_CHUNK.min(remaining as usize);
-        self.read_window(window)?;
+        let mut needed = FIXED_HEADER_LEN;
+        let max_record_len = self.max_record_len;
         let header = loop {
-            match record::decode_header(&self.buf, self.max_record_len) {
+            let window = self.window(needed)?;
+            match record::decode_header(window, max_record_len) {
                 Ok(h) => break h,
-                Err(DecodeError::Incomplete { needed }) => {
-                    if needed as u64 > remaining {
+                Err(DecodeError::Incomplete { needed: more }) => {
+                    if more as u64 > remaining {
                         return Ok(ScanStep::Invalid {
                             offset: self.offset,
                             reason: format!(
-                                "record needs {needed} header bytes but only {remaining} remain"
+                                "record needs {more} header bytes but only {remaining} remain"
                             ),
                         });
                     }
-                    if needed <= self.buf.len() {
+                    if more <= window.len() {
                         // decode_header asked for bytes we already have:
                         // internal inconsistency, treat as corrupt.
                         return Ok(ScanStep::Invalid {
@@ -309,7 +386,7 @@ impl<'a> Scanner<'a> {
                             reason: "header decoder made no progress".into(),
                         });
                     }
-                    self.read_window(needed)?;
+                    needed = more;
                 }
                 Err(DecodeError::UnsupportedVersion(v)) => {
                     return Ok(ScanStep::Invalid {
