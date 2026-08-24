@@ -143,6 +143,9 @@ pub struct AppendMessage {
 
 struct AppendRequest {
     msg: AppendMessage,
+    /// Computed by the concurrent admission task so the single shard writer
+    /// does not serially checksum every large body before writing it.
+    payload_crc: u32,
     /// Measured at admission and reused by the writer: computing the header
     /// length walks the recipient list, and nothing about the record changes
     /// between the two (the writer only stamps the ordinal, which is fixed
@@ -248,11 +251,17 @@ impl AppendHandle {
             self.pending_limit - self.pending_bytes.available_permits() as u64,
         );
 
+        // Do the body-sized CPU work on the concurrent admission tasks,
+        // rather than serializing it on the shard's single writer. The body
+        // is immutable Bytes, so the checksum remains valid after queueing.
+        let payload_crc = crc32fast::hash(&msg.body);
+
         let (tx, rx) = oneshot::channel();
         self.shards[shard as usize]
             .tx
             .send(WriterMsg::Append(AppendRequest {
                 msg,
+                payload_crc,
                 sizes,
                 completion: tx,
             }))
@@ -552,7 +561,7 @@ impl ShardWriter {
             // Header only: the kernel gathers it with the body, so a
             // multi-megabyte message is never copied to make the record
             // contiguous.
-            match record::encode_header(&params, req.sizes) {
+            match record::encode_header_with_payload_crc(&params, req.sizes, req.payload_crc) {
                 Ok(header) => headers.push(header),
                 // Admission measured these sizes, so this is unreachable.
                 // Were it not, the offending record must not take the rest
@@ -950,10 +959,12 @@ mod tests {
             body: &msg.body,
         };
         let sizes = record::encoded_sizes(&params).unwrap();
+        let payload_crc = crc32fast::hash(&msg.body);
         let (tx, rx) = oneshot::channel();
         (
             AppendRequest {
                 msg,
+                payload_crc,
                 sizes,
                 completion: tx,
             },

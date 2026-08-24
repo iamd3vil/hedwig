@@ -176,8 +176,21 @@ pub fn encode_header(
     params: &RecordParams<'_>,
     sizes: RecordSizes,
 ) -> Result<Vec<u8>, QueueError> {
+    encode_header_with_payload_crc(params, sizes, crc32fast::hash(params.body))
+}
+
+/// Encode a header with a payload checksum computed by the caller.
+///
+/// The append path uses this to move body-sized CPU work off the shard's
+/// single writer. The body is immutable while queued, so the checksum cannot
+/// become stale between admission and the write.
+pub(super) fn encode_header_with_payload_crc(
+    params: &RecordParams<'_>,
+    sizes: RecordSizes,
+    payload_crc: u32,
+) -> Result<Vec<u8>, QueueError> {
     let mut buf = Vec::with_capacity(sizes.header_len as usize);
-    write_header(&mut buf, params, sizes)?;
+    write_header(&mut buf, params, sizes, payload_crc)?;
     Ok(buf)
 }
 
@@ -187,7 +200,7 @@ pub fn encode_header(
 pub fn encode(params: &RecordParams<'_>) -> Result<Vec<u8>, QueueError> {
     let sizes = encoded_sizes(params)?;
     let mut buf = Vec::with_capacity(sizes.record_len as usize);
-    write_header(&mut buf, params, sizes)?;
+    write_header(&mut buf, params, sizes, crc32fast::hash(params.body))?;
     buf.extend_from_slice(params.body);
     debug_assert_eq!(buf.len(), sizes.record_len as usize);
     Ok(buf)
@@ -199,6 +212,7 @@ fn write_header(
     buf: &mut Vec<u8>,
     params: &RecordParams<'_>,
     sizes: RecordSizes,
+    payload_crc: u32,
 ) -> Result<(), QueueError> {
     debug_assert!(buf.is_empty());
     let RecordSizes {
@@ -212,7 +226,7 @@ fn write_header(
     buf.extend_from_slice(&record_len.to_le_bytes());
     buf.extend_from_slice(&header_len.to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes()); // header_crc placeholder
-    buf.extend_from_slice(&crc32fast::hash(params.body).to_le_bytes());
+    buf.extend_from_slice(&payload_crc.to_le_bytes());
     buf.extend_from_slice(&params.message_id.0);
     buf.extend_from_slice(&params.enqueue_ms.to_le_bytes());
     buf.extend_from_slice(&params.generation.to_le_bytes());
@@ -423,7 +437,10 @@ mod tests {
         let sizes = encoded_sizes(&p).unwrap();
         let whole = encode(&p).unwrap();
         let header = encode_header(&p, sizes).unwrap();
+        let precomputed =
+            encode_header_with_payload_crc(&p, sizes, crc32fast::hash(body)).unwrap();
 
+        assert_eq!(precomputed, header);
         assert_eq!(header.len(), sizes.header_len as usize);
         assert_eq!(header, whole[..sizes.header_len as usize]);
         // Header plus body must decode exactly like the contiguous form.
@@ -432,6 +449,18 @@ mod tests {
         let h = decode_header(&header, MAX_RECORD_LEN).unwrap();
         assert_eq!(h.record_len, sizes.record_len);
         verify_body(&h, body).unwrap();
+    }
+
+    #[test]
+    fn precomputed_payload_crc_is_verified_on_read() {
+        let rcpts = vec!["a@example.com".to_string()];
+        let body = b"body";
+        let p = params(body, &rcpts);
+        let sizes = encoded_sizes(&p).unwrap();
+        let header = encode_header_with_payload_crc(&p, sizes, 0).unwrap();
+        let decoded = decode_header(&header, MAX_RECORD_LEN).unwrap();
+
+        assert!(verify_body(&decoded, body).is_err());
     }
 
     #[test]
