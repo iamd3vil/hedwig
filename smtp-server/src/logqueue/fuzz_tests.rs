@@ -71,9 +71,7 @@ fn fuzz_record_round_trip() {
     for _ in 0..2_000 {
         let sender = random_string(&mut rng, 200);
         let n_rcpt = rng.gen_range(1..=40);
-        let recipients: Vec<String> = (0..n_rcpt)
-            .map(|_| random_string(&mut rng, 120))
-            .collect();
+        let recipients: Vec<String> = (0..n_rcpt).map(|_| random_string(&mut rng, 120)).collect();
         let body: Vec<u8> = (0..rng.gen_range(0..4096)).map(|_| rng.gen()).collect();
         let p = random_params(&mut rng, &sender, &recipients, &body);
 
@@ -222,7 +220,8 @@ fn fuzz_active_tail_corruption_recovery() {
                     let at = rng.gen_range(0..len_now);
                     let mut b = [0u8; 1];
                     f.read_exact_at(&mut b, at).unwrap();
-                    f.write_all_at(&[b[0] ^ (1 << rng.gen_range(0..8))], at).unwrap();
+                    f.write_all_at(&[b[0] ^ (1 << rng.gen_range(0..8))], at)
+                        .unwrap();
                 }
             }
             if mode == 2 {
@@ -369,12 +368,12 @@ fn fuzz_journal_corruption_recovers_a_prefix() {
                         let at = rng.gen_range(0..full_len);
                         let mut b = [0u8; 1];
                         f.read_exact_at(&mut b, at).unwrap();
-                        f.write_all_at(&[b[0] ^ (1 << rng.gen_range(0..8))], at).unwrap();
+                        f.write_all_at(&[b[0] ^ (1 << rng.gen_range(0..8))], at)
+                            .unwrap();
                     }
                 }
                 2 => {
-                    let garbage: Vec<u8> =
-                        (0..rng.gen_range(1..200)).map(|_| rng.gen()).collect();
+                    let garbage: Vec<u8> = (0..rng.gen_range(1..200)).map(|_| rng.gen()).collect();
                     f.write_all_at(&garbage, full_len).unwrap();
                 }
                 _ => {} // no corruption: the full state must survive
@@ -383,7 +382,9 @@ fn fuzz_journal_corruption_recovers_a_prefix() {
 
         let (mut store, recovered) = ShardStateStore::recover(dir.path(), 0)
             .unwrap_or_else(|e| panic!("iter {iter}: recovery errored: {e}"));
-        let matched = (0..=n).rev().find(|&k| state_eq(&recovered, &prefix_state(&entries, k)));
+        let matched = (0..=n)
+            .rev()
+            .find(|&k| state_eq(&recovered, &prefix_state(&entries, k)));
         let Some(k) = matched else {
             panic!("iter {iter}: recovered state is not any prefix of the written entries");
         };
@@ -498,9 +499,7 @@ fn fuzz_repeated_crash_cycles() {
                 let newest = std::fs::read_dir(dir.path())
                     .unwrap()
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_name().to_string_lossy().starts_with("journal-")
-                    })
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("journal-"))
                     .max_by_key(|e| e.file_name());
                 if let Some(entry) = newest {
                     let len = entry.metadata().unwrap().len();

@@ -1,10 +1,10 @@
 use clap::Parser;
+use futures::StreamExt;
 use hedwig::config::CfgStorage;
 use hedwig::mta_sts::refresher;
 use hedwig::storage::{fs_storage::FileSystemStorage, Status, Storage};
 use hedwig::worker::{deferred_worker::DeferredWorker, Job};
 use hedwig::{callbacks, config, dkim, health, logqueue, metrics, queue_cli, worker};
-use futures::StreamExt;
 use miette::{bail, Context, IntoDiagnostic, Result};
 use rustls::pki_types::CertificateDer;
 use smtp::{MaybeTlsStream, SmtpServer, SmtpStream};
@@ -241,7 +241,11 @@ async fn run_server(config_path: &str) -> Result<()> {
 
     // Log-queue runtime pieces that outlive setup. The Spool must live
     // until exit: dropping it releases the exclusive spool lock.
-    let mut log_runtime: Option<(logqueue::spool::Spool, logqueue::writer::LogWriters, JoinHandle<()>)> = None;
+    let mut log_runtime: Option<(
+        logqueue::spool::Spool,
+        logqueue::writer::LogWriters,
+        JoinHandle<()>,
+    )> = None;
 
     let (callbacks, worker_handles, mta_sts_resolver) = if is_log_backend {
         let qcfg = cfg.queue();
@@ -268,12 +272,10 @@ async fn run_server(config_path: &str) -> Result<()> {
 
         let mut shard_inits = Vec::new();
         for shard_dir in spool.shards() {
-            let (store, recovered) = logqueue::state::ShardStateStore::recover(
-                shard_dir.path(),
-                shard_dir.shard(),
-            )
-            .map_err(miette::Report::new)
-            .wrap_err_with(|| format!("error recovering shard {}", shard_dir.shard()))?;
+            let (store, recovered) =
+                logqueue::state::ShardStateStore::recover(shard_dir.path(), shard_dir.shard())
+                    .map_err(miette::Report::new)
+                    .wrap_err_with(|| format!("error recovering shard {}", shard_dir.shard()))?;
             shard_inits.push(logqueue::dispatcher::ShardInit {
                 dir: shard_dir.path().to_path_buf(),
                 shared: writers.handle().shard_shared(shard_dir.shard()),

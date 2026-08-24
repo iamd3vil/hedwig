@@ -133,9 +133,8 @@ impl Spool {
 /// `path`. Drives the disk-reserve acceptance check (PLAN §20).
 pub fn disk_free_bytes(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
-    })?;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
     let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut vfs) } != 0 {
         return Err(std::io::Error::last_os_error());
@@ -175,7 +174,9 @@ mod tests {
             assert!(root.join("shard-0000").is_dir());
             assert!(root.join("shard-0001").is_dir());
             assert_eq!(
-                std::fs::read_to_string(root.join(VERSION_FILE)).unwrap().trim(),
+                std::fs::read_to_string(root.join(VERSION_FILE))
+                    .unwrap()
+                    .trim(),
                 "1"
             );
         }
@@ -221,11 +222,7 @@ mod tests {
         let root = dir.path().join("spool");
         {
             let spool = Spool::open(&root, 4).unwrap();
-            std::fs::write(
-                spool.shard(3).path().join(sealed_file_name(1)),
-                b"",
-            )
-            .unwrap();
+            std::fs::write(spool.shard(3).path().join(sealed_file_name(1)), b"").unwrap();
         }
         // Shard 3 still holds a segment: shrinking to 2 must fail.
         assert!(matches!(Spool::open(&root, 2), Err(QueueError::Layout(_))));

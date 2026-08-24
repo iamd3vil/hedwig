@@ -206,12 +206,7 @@ impl Buckets {
     /// existing domain allocates nothing. A poisoned lock is recovered from
     /// rather than propagated: the worst case is one bucket with stale
     /// token accounting, which must not take down mail delivery.
-    fn with_bucket<R>(
-        &self,
-        domain: &str,
-        limit: u32,
-        f: impl FnOnce(&mut TokenBucket) -> R,
-    ) -> R {
+    fn with_bucket<R>(&self, domain: &str, limit: u32, f: impl FnOnce(&mut TokenBucket) -> R) -> R {
         let mut shard = self
             .shard_for(domain)
             .lock()

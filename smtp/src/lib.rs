@@ -462,8 +462,7 @@ impl SmtpServer {
                     &mut data_oversized,
                 )
                 .await?;
-                buffered_commands =
-                    session.state != SessionState::ReceivingData && !buf.is_empty();
+                buffered_commands = session.state != SessionState::ReceivingData && !buf.is_empty();
                 continue;
             }
 
@@ -549,7 +548,10 @@ impl SmtpServer {
                     }
                     Ok(cmd) => {
                         let starttls = stream.supports_starttls();
-                        match self.handle_command(session, cmd, starttls, &mut reply).await {
+                        match self
+                            .handle_command(session, cmd, starttls, &mut reply)
+                            .await
+                        {
                             Ok(true) => {
                                 stream.write_all(&reply).await.into_diagnostic()?;
                                 return Ok(());
@@ -590,8 +592,7 @@ impl SmtpServer {
                     &mut data_oversized,
                 )
                 .await?;
-                buffered_commands =
-                    session.state != SessionState::ReceivingData && !buf.is_empty();
+                buffered_commands = session.state != SessionState::ReceivingData && !buf.is_empty();
             }
         }
     }
@@ -1361,10 +1362,7 @@ mod tests {
         run_session_with(DEFAULT_MAX_MESSAGE_SIZE, writes).await
     }
 
-    async fn run_session_with(
-        max_message_size: usize,
-        writes: &[&[u8]],
-    ) -> (String, Vec<Email>) {
+    async fn run_session_with(max_message_size: usize, writes: &[&[u8]]) -> (String, Vec<Email>) {
         let callbacks = Arc::new(RecordingCallbacks {
             emails: StdMutex::new(Vec::new()),
         });
@@ -1445,7 +1443,10 @@ mod tests {
             "the accepted message must be the small one, got {:?}",
             emails[0].body
         );
-        assert!(replies.contains("221"), "session must stay usable: {replies:?}");
+        assert!(
+            replies.contains("221"),
+            "session must stay usable: {replies:?}"
+        );
     }
 
     /// RFC 5321 permits an empty message body: the client sends the
@@ -1462,8 +1463,15 @@ mod tests {
         .await;
 
         assert_eq!(emails.len(), 1, "empty body must be accepted: {replies:?}");
-        assert!(emails[0].body.is_empty(), "body must be empty, got {:?}", emails[0].body);
-        assert!(replies.contains("221"), "session must continue: {replies:?}");
+        assert!(
+            emails[0].body.is_empty(),
+            "body must be empty, got {:?}",
+            emails[0].body
+        );
+        assert!(
+            replies.contains("221"),
+            "session must continue: {replies:?}"
+        );
     }
 
     /// The last body line's CRLF is consumed as part of the end-of-data
@@ -1494,12 +1502,8 @@ mod tests {
     /// until the idle timeout instead of being told it was malformed.
     #[tokio::test]
     async fn test_bare_cr_in_command_does_not_stall() {
-        let (replies, _) = run_pipelined_session(&[
-            b"EHLO client.test\r\n",
-            b"NOOP\rNOOP\r\n",
-            b"QUIT\r\n",
-        ])
-        .await;
+        let (replies, _) =
+            run_pipelined_session(&[b"EHLO client.test\r\n", b"NOOP\rNOOP\r\n", b"QUIT\r\n"]).await;
 
         assert!(
             replies.contains("500"),
@@ -1554,7 +1558,10 @@ mod tests {
             "both messages must be accepted, got {} -- {replies:?}",
             emails.len()
         );
-        assert!(replies.contains("221"), "QUIT must be answered: {replies:?}");
+        assert!(
+            replies.contains("221"),
+            "QUIT must be answered: {replies:?}"
+        );
     }
 
     /// PIPELINING must be advertised, since the command loop handles batched

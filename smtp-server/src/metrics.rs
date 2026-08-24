@@ -61,7 +61,8 @@ struct MetricsHandles {
 }
 
 /// Global registry for all metrics exposed by the server.
-static METRICS: Lazy<MetricsHandles> = Lazy::new(|| MetricsHandles {
+static METRICS: Lazy<MetricsHandles> = Lazy::new(|| {
+    MetricsHandles {
     queue_depth: register_int_gauge!(
         "hedwig_queue_depth",
         "Number of emails currently queued for delivery."
@@ -262,6 +263,7 @@ static METRICS: Lazy<MetricsHandles> = Lazy::new(|| MetricsHandles {
         "Free disk space in bytes available to the log queue."
     )
     .expect("register logqueue_disk_free_bytes gauge"),
+}
 });
 
 const STATUS_SUCCESS: &str = "success";

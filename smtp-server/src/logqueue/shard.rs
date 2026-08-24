@@ -55,7 +55,11 @@ impl ShardDir {
             let entry = entry.map_err(|e| QueueError::io(&self.path, e))?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
-                tracing::warn!(shard = self.shard, ?name, "ignoring non-UTF-8 file in shard dir");
+                tracing::warn!(
+                    shard = self.shard,
+                    ?name,
+                    "ignoring non-UTF-8 file in shard dir"
+                );
                 continue;
             };
             let Some((ordinal, kind)) = segment::parse_file_name(name) else {
@@ -145,10 +149,7 @@ mod tests {
         let shard = ShardDir::open_or_create(dir.path(), 0).unwrap();
         std::fs::write(shard.path().join(active_file_name(1)), b"").unwrap();
         std::fs::write(shard.path().join(active_file_name(2)), b"").unwrap();
-        assert!(matches!(
-            shard.list_segments(),
-            Err(QueueError::Layout(_))
-        ));
+        assert!(matches!(shard.list_segments(), Err(QueueError::Layout(_))));
     }
 
     #[test]
@@ -157,9 +158,6 @@ mod tests {
         let shard = ShardDir::open_or_create(dir.path(), 0).unwrap();
         std::fs::write(shard.path().join(active_file_name(1)), b"").unwrap();
         std::fs::write(shard.path().join(sealed_file_name(1)), b"").unwrap();
-        assert!(matches!(
-            shard.list_segments(),
-            Err(QueueError::Layout(_))
-        ));
+        assert!(matches!(shard.list_segments(), Err(QueueError::Layout(_))));
     }
 }

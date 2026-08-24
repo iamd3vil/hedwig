@@ -140,8 +140,13 @@ async fn cmd_migrate(args: MigrateArgs) -> Result<()> {
         pending_append_bytes: qcfg.pending_append_bytes(),
     };
 
-    let summary = crate::migrate::migrate(&legacy_base_path, &spool_root, qcfg.append_writers(), writer_config)
-        .await?;
+    let summary = crate::migrate::migrate(
+        &legacy_base_path,
+        &spool_root,
+        qcfg.append_writers(),
+        writer_config,
+    )
+    .await?;
 
     summary.print();
 
@@ -162,19 +167,25 @@ async fn cmd_migrate(args: MigrateArgs) -> Result<()> {
 
 fn check_format_version(spool_root: &Path) -> Result<()> {
     let path = spool_root.join(FORMAT_VERSION_FILE);
-    let contents = std::fs::read_to_string(&path).into_diagnostic().wrap_err_with(|| {
-        format!(
-            "could not read {}; is {} a hedwig log-queue spool root?",
-            path.display(),
-            spool_root.display()
-        )
-    })?;
-    let found: u16 = contents.trim().parse().into_diagnostic().wrap_err_with(|| {
-        format!(
-            "{} does not contain a version number: {contents:?}",
-            path.display()
-        )
-    })?;
+    let contents = std::fs::read_to_string(&path)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "could not read {}; is {} a hedwig log-queue spool root?",
+                path.display(),
+                spool_root.display()
+            )
+        })?;
+    let found: u16 = contents
+        .trim()
+        .parse()
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "{} does not contain a version number: {contents:?}",
+                path.display()
+            )
+        })?;
     if found != FORMAT_VERSION {
         bail!(
             "spool at {} has format version {found}, this build of hedwig supports {FORMAT_VERSION}",
@@ -242,7 +253,10 @@ fn list_segment_files(shard_dir: &Path) -> Result<Vec<SegmentFile>, QueueError> 
         let Some((ordinal, kind)) = segment::parse_file_name(&name) else {
             continue;
         };
-        let len = entry.metadata().map_err(|e| QueueError::io(shard_dir, e))?.len();
+        let len = entry
+            .metadata()
+            .map_err(|e| QueueError::io(shard_dir, e))?
+            .len();
         out.push(SegmentFile { ordinal, kind, len });
     }
     out.sort_unstable_by_key(|s| s.ordinal);
@@ -406,7 +420,9 @@ struct LiveMessage {
 }
 
 fn shard_live_messages(shard: &ShardData) -> Vec<LiveMessage> {
-    let mut out = Vec::with_capacity(shard.state.ready.len() + shard.state.deferred.len() + shard.scanned.len());
+    let mut out = Vec::with_capacity(
+        shard.state.ready.len() + shard.state.deferred.len() + shard.scanned.len(),
+    );
     for r in shard.state.ready.values() {
         out.push(LiveMessage {
             id: r.id,
@@ -486,16 +502,26 @@ fn cmd_list(args: ListArgs) -> Result<()> {
             [
                 m.id.to_string(),
                 m.state.as_str().to_string(),
-                m.enqueue_ms.map_or_else(|| "-".to_string(), |ms| humanize_age(now - ms)),
+                m.enqueue_ms
+                    .map_or_else(|| "-".to_string(), |ms| humanize_age(now - ms)),
                 m.attempts.to_string(),
-                m.next_attempt_ms.map_or_else(|| "-".to_string(), format_iso8601),
+                m.next_attempt_ms
+                    .map_or_else(|| "-".to_string(), format_iso8601),
                 m.shard.to_string(),
                 m.location.segment.to_string(),
             ]
         })
         .collect();
     print_table(
-        &["MESSAGE ID", "STATE", "AGE", "ATTEMPTS", "NEXT-ATTEMPT (UTC)", "SHARD", "SEGMENT"],
+        &[
+            "MESSAGE ID",
+            "STATE",
+            "AGE",
+            "ATTEMPTS",
+            "NEXT-ATTEMPT (UTC)",
+            "SHARD",
+            "SEGMENT",
+        ],
         &rows,
     );
     Ok(())
@@ -531,7 +557,8 @@ fn cmd_show(args: ShowArgs) -> Result<()> {
                 .map(|s| (s.location, MsgState::Ready, 0, None, None, None))
         };
 
-        let Some((location, state, attempts, next_attempt_ms, remaining, last_error)) = found else {
+        let Some((location, state, attempts, next_attempt_ms, remaining, last_error)) = found
+        else {
             continue;
         };
 
@@ -634,14 +661,23 @@ fn cmd_stats(args: StatsArgs) -> Result<()> {
             .collect();
         if !rows.is_empty() {
             print_table(
-                &["SEGMENT", "TOTAL BYTES", "DEAD BYTES", "DEAD RATIO", "TOMBSTONES"],
+                &[
+                    "SEGMENT",
+                    "TOTAL BYTES",
+                    "DEAD BYTES",
+                    "DEAD RATIO",
+                    "TOMBSTONES",
+                ],
                 &rows,
             );
         }
 
         let live = shard_live_messages(&data);
         let shard_ready = live.iter().filter(|m| m.state == MsgState::Ready).count();
-        let shard_deferred = live.iter().filter(|m| m.state == MsgState::Deferred).count();
+        let shard_deferred = live
+            .iter()
+            .filter(|m| m.state == MsgState::Deferred)
+            .count();
         println!(
             "  shard totals: {shard_total_bytes} bytes, {shard_dead_bytes} dead, {shard_ready} ready, {shard_deferred} deferred"
         );
@@ -833,8 +869,7 @@ mod tests {
 
         let live = shard_live_messages(&data);
         assert_eq!(live.len(), 3);
-        let live_by_id: HashMap<MessageId, &LiveMessage> =
-            live.iter().map(|m| (m.id, m)).collect();
+        let live_by_id: HashMap<MessageId, &LiveMessage> = live.iter().map(|m| (m.id, m)).collect();
         assert_eq!(live_by_id[&m1_id].state, MsgState::Ready);
         assert_eq!(live_by_id[&m1_id].enqueue_ms, Some(base));
         assert_eq!(live_by_id[&m2_id].state, MsgState::Deferred);

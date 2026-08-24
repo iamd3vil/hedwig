@@ -136,11 +136,17 @@ pub async fn migrate(
     // payload record in its shard now that the writer has flushed and
     // finished. Run this even if earlier steps already recorded failures, so
     // the report is complete.
-    verify_migrated(&spool, &migrated, writer_config.max_record_len, &mut summary)
-        .wrap_err("verifying migrated messages")?;
+    verify_migrated(
+        &spool,
+        &migrated,
+        writer_config.max_record_len,
+        &mut summary,
+    )
+    .wrap_err("verifying migrated messages")?;
 
     if summary.failed.is_empty() {
-        rename_legacy_dirs(legacy_base_path).wrap_err("renaming legacy spool directories to backups")?;
+        rename_legacy_dirs(legacy_base_path)
+            .wrap_err("renaming legacy spool directories to backups")?;
     } else {
         println!(
             "migration had failures; legacy queued/deferred directories were left in place \
@@ -216,9 +222,10 @@ async fn migrate_status(
         let stored = match item {
             Ok(s) => s,
             Err(e) => {
-                summary
-                    .failed
-                    .push(("<unknown>".to_string(), format!("listing legacy spool: {e:#}")));
+                summary.failed.push((
+                    "<unknown>".to_string(),
+                    format!("listing legacy spool: {e:#}"),
+                ));
                 continue;
             }
         };
@@ -331,7 +338,9 @@ async fn migrate_one(
     }
 
     migrated.push((id, location.shard));
-    Ok(Outcome::Migrated { deferred: is_deferred })
+    Ok(Outcome::Migrated {
+        deferred: is_deferred,
+    })
 }
 
 /// Attempts/next-attempt/last-error for a deferred `StateEntry`, from legacy
@@ -521,7 +530,8 @@ mod tests {
         if !dir.exists() {
             return counts;
         }
-        let shard_dir = crate::logqueue::shard::ShardDir::open_or_create(spool_root, shard).unwrap();
+        let shard_dir =
+            crate::logqueue::shard::ShardDir::open_or_create(spool_root, shard).unwrap();
         let segs = shard_dir.list_segments().unwrap();
         for (ordinal, path) in segs.sealed.iter().chain(segs.active.iter()) {
             let reader = open_segment_reader(&dir, *ordinal).unwrap();
@@ -535,13 +545,18 @@ mod tests {
         counts
     }
 
-    async fn find_ready(spool_root: &Path, shard_count: u16, id: MessageId) -> Option<(String, String, Vec<u8>)> {
+    async fn find_ready(
+        spool_root: &Path,
+        shard_count: u16,
+        id: MessageId,
+    ) -> Option<(String, String, Vec<u8>)> {
         for shard in 0..shard_count {
             let dir = spool_root.join(crate::logqueue::shard::shard_dir_name(shard));
             if !dir.exists() {
                 continue;
             }
-            let shard_dir = crate::logqueue::shard::ShardDir::open_or_create(spool_root, shard).unwrap();
+            let shard_dir =
+                crate::logqueue::shard::ShardDir::open_or_create(spool_root, shard).unwrap();
             let segs = shard_dir.list_segments().unwrap();
             for (ordinal, path) in segs.sealed.iter().chain(segs.active.iter()) {
                 let reader = open_segment_reader(&dir, *ordinal).unwrap();
@@ -565,7 +580,11 @@ mod tests {
         None
     }
 
-    fn deferred_entry(spool_root: &Path, shard_count: u16, id: MessageId) -> Option<crate::logqueue::state::DeferredJob> {
+    fn deferred_entry(
+        spool_root: &Path,
+        shard_count: u16,
+        id: MessageId,
+    ) -> Option<crate::logqueue::state::DeferredJob> {
         for shard in 0..shard_count {
             let dir = spool_root.join(crate::logqueue::shard::shard_dir_name(shard));
             if !dir.exists() {
@@ -590,7 +609,10 @@ mod tests {
         // A plain queued message, never retried.
         let q1_id = new_ulid();
         legacy
-            .put(email(&q1_id, &["r1@example.com"], "queued body"), Status::Queued)
+            .put(
+                email(&q1_id, &["r1@example.com"], "queued body"),
+                Status::Queued,
+            )
             .await
             .unwrap();
 
@@ -598,24 +620,42 @@ mod tests {
         // meta file records a prior failed attempt.
         let q2_id = new_ulid();
         legacy
-            .put(email(&q2_id, &["r2@example.com"], "mid-retry body"), Status::Queued)
+            .put(
+                email(&q2_id, &["r2@example.com"], "mid-retry body"),
+                Status::Queued,
+            )
             .await
             .unwrap();
-        legacy.put_meta(&q2_id, &meta(&q2_id, 2, Some("451 try later"))).await.unwrap();
+        legacy
+            .put_meta(&q2_id, &meta(&q2_id, 2, Some("451 try later")))
+            .await
+            .unwrap();
 
         // A fully deferred message.
         let d1_id = new_ulid();
         legacy
-            .put(email(&d1_id, &["r3@example.com"], "deferred body"), Status::Deferred)
+            .put(
+                email(&d1_id, &["r3@example.com"], "deferred body"),
+                Status::Deferred,
+            )
             .await
             .unwrap();
-        legacy.put_meta(&d1_id, &meta(&d1_id, 3, Some("450 backoff"))).await.unwrap();
+        legacy
+            .put_meta(&d1_id, &meta(&d1_id, 3, Some("450 backoff")))
+            .await
+            .unwrap();
 
-        let summary = migrate(&legacy_base, &spool_root, 2, writer_config()).await.unwrap();
+        let summary = migrate(&legacy_base, &spool_root, 2, writer_config())
+            .await
+            .unwrap();
         assert_eq!(summary.migrated_queued, 1, "{summary:?}");
         assert_eq!(summary.migrated_deferred, 2);
         assert_eq!(summary.skipped, 0);
-        assert!(summary.failed.is_empty(), "unexpected failures: {:?}", summary.failed);
+        assert!(
+            summary.failed.is_empty(),
+            "unexpected failures: {:?}",
+            summary.failed
+        );
 
         let q1 = MessageId::parse(&q1_id).unwrap();
         let (sender, rcpts, body) = find_ready(&spool_root, 2, q1).await.unwrap();
@@ -626,7 +666,8 @@ mod tests {
 
         let q2 = MessageId::parse(&q2_id).unwrap();
         assert!(find_ready(&spool_root, 2, q2).await.is_some());
-        let d = deferred_entry(&spool_root, 2, q2).expect("mid-retry meta migrates as deferred state");
+        let d =
+            deferred_entry(&spool_root, 2, q2).expect("mid-retry meta migrates as deferred state");
         assert_eq!(d.attempts, 2);
         assert_eq!(d.remaining_recipients, vec!["r2@example.com".to_string()]);
         assert_eq!(d.last_error, "451 try later");
@@ -665,15 +706,22 @@ mod tests {
 
         let legacy = FileSystemStorage::new(&legacy_base).await.unwrap();
         let id = new_ulid();
-        legacy.put(email(&id, &["r@example.com"], "body"), Status::Queued).await.unwrap();
+        legacy
+            .put(email(&id, &["r@example.com"], "body"), Status::Queued)
+            .await
+            .unwrap();
 
-        let first = migrate(&legacy_base, &spool_root, 1, writer_config()).await.unwrap();
+        let first = migrate(&legacy_base, &spool_root, 1, writer_config())
+            .await
+            .unwrap();
         assert_eq!(first.migrated_queued, 1);
         assert!(first.failed.is_empty());
 
         // Nothing left in queued/ (renamed away), so a second run finds
         // nothing new to migrate and nothing to skip either.
-        let second = migrate(&legacy_base, &spool_root, 1, writer_config()).await.unwrap();
+        let second = migrate(&legacy_base, &spool_root, 1, writer_config())
+            .await
+            .unwrap();
         assert_eq!(second.migrated_queued, 0);
         assert_eq!(second.migrated_deferred, 0);
         assert_eq!(second.skipped, 0);
@@ -694,7 +742,10 @@ mod tests {
 
         let legacy = FileSystemStorage::new(&legacy_base).await.unwrap();
         let id = new_ulid();
-        legacy.put(email(&id, &["r@example.com"], "body"), Status::Queued).await.unwrap();
+        legacy
+            .put(email(&id, &["r@example.com"], "body"), Status::Queued)
+            .await
+            .unwrap();
 
         // Pre-seed the new spool with this id's payload record directly, as
         // if a prior migration run had appended it before crashing.
@@ -716,7 +767,9 @@ mod tests {
             writers.shutdown().await;
         }
 
-        let summary = migrate(&legacy_base, &spool_root, 1, writer_config()).await.unwrap();
+        let summary = migrate(&legacy_base, &spool_root, 1, writer_config())
+            .await
+            .unwrap();
         assert_eq!(summary.migrated_queued, 0);
         assert_eq!(summary.skipped, 1);
         assert!(summary.failed.is_empty());
@@ -735,11 +788,16 @@ mod tests {
 
         let legacy = FileSystemStorage::new(&legacy_base).await.unwrap();
         legacy
-            .put(email("not-a-ulid", &["r@example.com"], "body"), Status::Queued)
+            .put(
+                email("not-a-ulid", &["r@example.com"], "body"),
+                Status::Queued,
+            )
             .await
             .unwrap();
 
-        let summary = migrate(&legacy_base, &spool_root, 1, writer_config()).await.unwrap();
+        let summary = migrate(&legacy_base, &spool_root, 1, writer_config())
+            .await
+            .unwrap();
         assert_eq!(summary.migrated_queued, 1);
         assert!(summary.failed.is_empty());
     }

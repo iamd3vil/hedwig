@@ -220,7 +220,10 @@ enum JobState {
     InFlight(u64),
     /// Waiting for a due time: a persisted deferral (real attempt) or an
     /// in-memory rate-limit hold (never persisted).
-    Delayed { due_ms: i64, persisted: bool },
+    Delayed {
+        due_ms: i64,
+        persisted: bool,
+    },
 }
 
 struct Job {
@@ -333,7 +336,12 @@ impl Dispatcher {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (cp_tx, cp_rx) = mpsc::unbounded_channel();
 
-        let shard_dirs = Arc::new(shard_inits.iter().map(|s| s.dir.clone()).collect::<Vec<_>>());
+        let shard_dirs = Arc::new(
+            shard_inits
+                .iter()
+                .map(|s| s.dir.clone())
+                .collect::<Vec<_>>(),
+        );
         let worker_readers: WorkerReaderCache = Arc::default();
         let handle = DispatcherHandle {
             claim_tx,
@@ -384,7 +392,10 @@ impl Dispatcher {
         //    on disk; the append was never completed-and-acknowledged (or
         //    was lost within the accepted page-cache window), so drop it.
         let committed_of = |segment: u64| -> Option<u64> {
-            chain.iter().find(|h| h.segment == segment).map(|h| h.committed)
+            chain
+                .iter()
+                .find(|h| h.segment == segment)
+                .map(|h| h.committed)
         };
         if let Some((seg, off)) = recovered.cursor {
             match committed_of(seg) {
@@ -648,8 +659,12 @@ impl Dispatcher {
             // higher is a compaction copy that must win (crash between
             // relocation and checkpoint leaves both copies on disk).
             #[allow(clippy::type_complexity)]
-            let mut discovered: Vec<(MessageId, JobLocation, i64, (Arc<str>, Arc<[String]>))> =
-                Vec::new();
+            let mut discovered: Vec<(
+                MessageId,
+                JobLocation,
+                i64,
+                (Arc<str>, Arc<[String]>),
+            )> = Vec::new();
             let mut relocations: Vec<(MessageId, JobLocation)> = Vec::new();
             let shard_no = shard.shard;
             let tombstones = &shard.tombstones;
@@ -671,7 +686,9 @@ impl Dispatcher {
                     ordinal: h.ordinal,
                     generation: h.generation,
                 };
-                let dead = tombstones.get(&seg).is_some_and(|s| s.contains(&h.message_id));
+                let dead = tombstones
+                    .get(&seg)
+                    .is_some_and(|s| s.contains(&h.message_id));
                 if !dead {
                     match jobs.get(&h.message_id) {
                         // decode_header already materialized the envelope,
@@ -1100,7 +1117,11 @@ impl Dispatcher {
             }
         }
         crate::metrics::logqueue_segments_deleted(1);
-        tracing::info!(shard = self.shards[shard_idx].shard, segment, "deleted fully dead segment");
+        tracing::info!(
+            shard = self.shards[shard_idx].shard,
+            segment,
+            "deleted fully dead segment"
+        );
     }
 
     /// Sweep backstop for event-driven deletion (PLAN §17.1): a segment
@@ -1835,11 +1856,7 @@ mod tests {
             blocked: Mutex::new(Some(Duration::from_millis(40))),
         });
         let dir = tempfile::tempdir().unwrap();
-        let h = start(
-            dir.path(),
-            gate,
-            DispatcherConfig::default(),
-        );
+        let h = start(dir.path(), gate, DispatcherConfig::default());
         let append = h.writers.handle();
         append.append(message(1, "r1@example.com")).await.unwrap();
 
@@ -1863,7 +1880,11 @@ mod tests {
         let root = dir.path().to_path_buf();
 
         let (deferred_id, delivered_id) = {
-            let h = start(dir.path(), Arc::new(NoRateGate), DispatcherConfig::default());
+            let h = start(
+                dir.path(),
+                Arc::new(NoRateGate),
+                DispatcherConfig::default(),
+            );
             let append = h.writers.handle();
             append.append(message(1, "r1@example.com")).await.unwrap();
             append.append(message(2, "r2@example.com")).await.unwrap();
@@ -1886,8 +1907,7 @@ mod tests {
         // Restart on the same spool.
         let spool = Spool::open(root.join("spool"), 1).unwrap();
         let writers = LogWriters::start(&spool, writer_config()).unwrap();
-        let (store, recovered) =
-            ShardStateStore::recover(spool.shard(0).path(), 0).unwrap();
+        let (store, recovered) = ShardStateStore::recover(spool.shard(0).path(), 0).unwrap();
 
         let d = recovered
             .deferred
@@ -1909,7 +1929,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let id = {
-            let h = start(dir.path(), Arc::new(NoRateGate), DispatcherConfig::default());
+            let h = start(
+                dir.path(),
+                Arc::new(NoRateGate),
+                DispatcherConfig::default(),
+            );
             let append = h.writers.handle();
             append.append(message(1, "r1@example.com")).await.unwrap();
             // Claim and crash while in flight: report nothing, drop nothing
@@ -2157,7 +2181,11 @@ mod tests {
         // Segment 1 is 75% dead but held live by the survivor; compaction
         // relocates the survivor, then segment 1 dies.
         eventually(
-            || !shard_dir.join(crate::logqueue::segment::sealed_file_name(1)).exists(),
+            || {
+                !shard_dir
+                    .join(crate::logqueue::segment::sealed_file_name(1))
+                    .exists()
+            },
             "compacted source segment deleted",
         )
         .await;

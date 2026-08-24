@@ -102,9 +102,7 @@ impl ShardShared {
 
     fn advance_committed(&self, segment: u64, committed: u64) {
         let mut chain = self.chain.lock().unwrap();
-        let head = chain
-            .last_mut()
-            .expect("advance_committed on empty chain");
+        let head = chain.last_mut().expect("advance_committed on empty chain");
         debug_assert_eq!(head.segment, segment);
         debug_assert!(!head.sealed && committed > head.committed);
         head.committed = committed;
@@ -528,7 +526,10 @@ impl ShardWriter {
             }
         }
 
-        let active = self.active.as_mut().expect("rotate keeps an active segment");
+        let active = self
+            .active
+            .as_mut()
+            .expect("rotate keeps an active segment");
         // Records never span segments, so the chunk stops at the segment
         // target and the remainder rotates in the next one. The first record
         // always goes in, whatever its size, or the batch could not drain.
@@ -626,7 +627,10 @@ impl ShardWriter {
     }
 
     fn rotate(&mut self, shared: &ShardShared) -> Result<(), QueueError> {
-        let old = self.active.as_ref().expect("rotate requires an active segment");
+        let old = self
+            .active
+            .as_ref()
+            .expect("rotate requires an active segment");
         let sealed_segment = old.segment();
         // Seal FIRST, create second: a crash in between leaves no active
         // segment (recovery simply creates one) — never two, which would be
@@ -734,15 +738,16 @@ mod tests {
         // segment are dense (offset of ordinal n+1 = offset + length of n).
         for shard in 0..handle.shard_count() {
             let chain = handle.shard_shared(shard).chain();
-            let mut per_seg: Vec<_> = locations
-                .iter()
-                .filter(|l| l.shard == shard)
-                .collect();
+            let mut per_seg: Vec<_> = locations.iter().filter(|l| l.shard == shard).collect();
             per_seg.sort_by_key(|l| (l.segment, l.offset));
             let mut expected_offset = std::collections::HashMap::new();
             for loc in per_seg {
                 let e = expected_offset.entry(loc.segment).or_insert(0u64);
-                assert_eq!(loc.offset, *e, "hole in shard {shard} segment {}", loc.segment);
+                assert_eq!(
+                    loc.offset, *e,
+                    "hole in shard {shard} segment {}",
+                    loc.segment
+                );
                 *e += loc.length as u64;
                 let head = chain.iter().find(|h| h.segment == loc.segment).unwrap();
                 assert!(head.committed >= loc.offset + loc.length as u64);
@@ -947,7 +952,12 @@ mod tests {
     }
 
     /// One queued request, for the batch-collection tests.
-    fn request(seq: u64) -> (AppendRequest, oneshot::Receiver<Result<JobLocation, QueueError>>) {
+    fn request(
+        seq: u64,
+    ) -> (
+        AppendRequest,
+        oneshot::Receiver<Result<JobLocation, QueueError>>,
+    ) {
         let msg = message(seq, b"body");
         let params = RecordParams {
             message_id: msg.message_id,
@@ -1257,10 +1267,16 @@ mod tests {
             .join(crate::logqueue::segment::active_file_name(head.segment));
         let reader = SegmentReader::open(&path).unwrap();
         let mut ordinals = Vec::new();
-        crate::logqueue::segment::scan_headers(&reader, 0, head.committed, MAX_RECORD_LEN, |_, h| {
-            ordinals.push(h.ordinal);
-            true
-        })
+        crate::logqueue::segment::scan_headers(
+            &reader,
+            0,
+            head.committed,
+            MAX_RECORD_LEN,
+            |_, h| {
+                ordinals.push(h.ordinal);
+                true
+            },
+        )
         .unwrap();
         assert_eq!(ordinals.len(), 5);
         ordinals.sort_unstable();

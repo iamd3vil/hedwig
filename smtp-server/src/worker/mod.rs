@@ -835,7 +835,12 @@ impl Worker {
         };
 
         if self.disable_outbound {
-            log_delivery("dropped", &job.recipients.join(","), "outbound disabled", job.attempts);
+            log_delivery(
+                "dropped",
+                &job.recipients.join(","),
+                "outbound disabled",
+                job.attempts,
+            );
             metrics::email_dropped();
             return JobOutcome::Delivered {
                 response: "outbound disabled".into(),
@@ -859,11 +864,7 @@ impl Worker {
                     .await;
             }
         };
-        let Some(from) = msg
-            .from()
-            .and_then(|f| f.first())
-            .and_then(|f| f.address())
-        else {
+        let Some(from) = msg.from().and_then(|f| f.first()).and_then(|f| f.address()) else {
             return self
                 .bounce_claim(job, body, "invalid from address".into())
                 .await;
@@ -887,8 +888,9 @@ impl Worker {
                 RateLimitResult::Allowed => {}
                 RateLimitResult::RateLimited { retry_after } => {
                     remaining.push(to.clone());
-                    rate_limited_wait =
-                        Some(rate_limited_wait.map_or(retry_after, |w: Duration| w.max(retry_after)));
+                    rate_limited_wait = Some(
+                        rate_limited_wait.map_or(retry_after, |w: Duration| w.max(retry_after)),
+                    );
                     continue;
                 }
             }
@@ -1440,8 +1442,7 @@ mod tests {
         // With no signer configured we are relaying, not re-signing: the
         // upstream signature must survive or its authentication result dies
         // with it.
-        let raw_email =
-            b"From: a@b.com\r\nDKIM-Signature: upstream\r\nBcc: e@f.com\r\n\r\nBody";
+        let raw_email = b"From: a@b.com\r\nDKIM-Signature: upstream\r\nBcc: e@f.com\r\n\r\nBody";
         let expected = b"From: a@b.com\r\nDKIM-Signature: upstream\r\n\r\nBody";
         let result = strip_bcc(raw_email).unwrap();
         assert_eq!(
@@ -1509,7 +1510,10 @@ mod tests {
             "Bcc must never be transmitted: {signed:?}"
         );
         assert_eq!(
-            signed.to_ascii_lowercase().matches("dkim-signature:").count(),
+            signed
+                .to_ascii_lowercase()
+                .matches("dkim-signature:")
+                .count(),
             1,
             "exactly one signature must survive: {signed:?}"
         );

@@ -66,7 +66,9 @@ impl RecordHeader {
 pub enum DecodeError {
     /// More bytes are needed; `needed` is the total record prefix length
     /// required to make progress (from the start of the record).
-    Incomplete { needed: usize },
+    Incomplete {
+        needed: usize,
+    },
     Corrupt(String),
     UnsupportedVersion(u16),
 }
@@ -172,10 +174,7 @@ fn header_len(params: &RecordParams<'_>) -> Result<u32, QueueError> {
 /// body to the kernel as adjacent iovecs, so nothing copies the message
 /// (up to the configured maximum, tens of megabytes) merely to make the
 /// record contiguous in userspace.
-pub fn encode_header(
-    params: &RecordParams<'_>,
-    sizes: RecordSizes,
-) -> Result<Vec<u8>, QueueError> {
+pub fn encode_header(params: &RecordParams<'_>, sizes: RecordSizes) -> Result<Vec<u8>, QueueError> {
     encode_header_with_payload_crc(params, sizes, crc32fast::hash(params.body))
 }
 
@@ -437,8 +436,7 @@ mod tests {
         let sizes = encoded_sizes(&p).unwrap();
         let whole = encode(&p).unwrap();
         let header = encode_header(&p, sizes).unwrap();
-        let precomputed =
-            encode_header_with_payload_crc(&p, sizes, crc32fast::hash(body)).unwrap();
+        let precomputed = encode_header_with_payload_crc(&p, sizes, crc32fast::hash(body)).unwrap();
 
         assert_eq!(precomputed, header);
         assert_eq!(header.len(), sizes.header_len as usize);

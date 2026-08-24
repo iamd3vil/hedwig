@@ -403,11 +403,19 @@ impl SegmentReader {
 
 /// One step of a header scan.
 enum ScanStep {
-    Record { header: RecordHeader, offset: u64 },
+    Record {
+        header: RecordHeader,
+        offset: u64,
+    },
     /// Clean end: `end` is the offset one past the last complete record.
-    End { end: u64 },
+    End {
+        end: u64,
+    },
     /// The bytes at `offset` are not a complete valid record.
-    Invalid { offset: u64, reason: String },
+    Invalid {
+        offset: u64,
+        reason: String,
+    },
 }
 
 /// Streaming header scanner over a segment file. Reads headers, skips
@@ -588,7 +596,10 @@ pub struct TailValidation {
 /// the file; bytes after such a hole are discarded with the tail and counted
 /// in `truncated_bytes` (this falls under "recently accepted mail may be
 /// lost", and the truncation is logged loudly by the caller).
-pub fn validate_active_tail(path: &Path, max_record_len: u32) -> Result<TailValidation, QueueError> {
+pub fn validate_active_tail(
+    path: &Path,
+    max_record_len: u32,
+) -> Result<TailValidation, QueueError> {
     let reader = SegmentReader::open(path)?;
     let file_len = reader.file_len()?;
     let mut scanner = Scanner::new(&reader, 0, file_len, max_record_len, true);
@@ -1046,7 +1057,11 @@ mod tests {
         drop(seg);
 
         // Flip a byte inside the final record's body.
-        let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         let mut b = [0u8; 1];
         f.read_exact_at(&mut b, len - 2).unwrap();
         f.write_all_at(&[b[0] ^ 0xff], len - 2).unwrap();

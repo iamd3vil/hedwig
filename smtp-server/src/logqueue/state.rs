@@ -703,7 +703,11 @@ pub struct PendingCheckpoint {
     covered: u64,
 }
 
-pub fn write_checkpoint_file(dir: &Path, cp: &Checkpoint, replay_from: Lsn) -> Result<(), QueueError> {
+pub fn write_checkpoint_file(
+    dir: &Path,
+    cp: &Checkpoint,
+    replay_from: Lsn,
+) -> Result<(), QueueError> {
     let payload = encode_checkpoint(cp, replay_from);
     let mut buf = Vec::with_capacity(payload.len() + 16);
     buf.extend_from_slice(&CHECKPOINT_MAGIC);
@@ -919,8 +923,7 @@ impl ShardStateStore {
 
         // Enumerate journal files at or past the replay position.
         let mut journals: Vec<u64> = Vec::new();
-        let entries =
-            std::fs::read_dir(shard_dir).map_err(|e| QueueError::io(shard_dir, e))?;
+        let entries = std::fs::read_dir(shard_dir).map_err(|e| QueueError::io(shard_dir, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| QueueError::io(shard_dir, e))?;
             if let Some(ordinal) = entry.file_name().to_str().and_then(parse_journal_name) {
@@ -1305,12 +1308,15 @@ mod tests {
                 last_error: "451".into(),
             }],
             tombstones: vec![(1, vec![id(2)])],
-            segment_stats: vec![(1, SegmentStats {
-                total_records: 8,
-                total_bytes: 4096,
-                dead_records: 1,
-                dead_bytes: 512,
-            })],
+            segment_stats: vec![(
+                1,
+                SegmentStats {
+                    total_records: 8,
+                    total_bytes: 4096,
+                    dead_records: 1,
+                    dead_bytes: 512,
+                },
+            )],
         };
         store.write_checkpoint(&cp).unwrap();
         assert_eq!(store.bytes_since_checkpoint(), 0);
@@ -1338,7 +1344,10 @@ mod tests {
             vec!["still-waiting@example.com".to_string()],
             "partial-recipient set survives a ready-state checkpoint"
         );
-        assert!(!state.ready.contains_key(&id(10)), "delivered post-checkpoint");
+        assert!(
+            !state.ready.contains_key(&id(10)),
+            "delivered post-checkpoint"
+        );
         assert!(state.is_terminal(2, &id(10)));
         assert!(state.is_terminal(1, &id(2)), "checkpoint tombstone kept");
         let d = &state.deferred[&id(1)];
@@ -1468,11 +1477,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, _) = ShardStateStore::recover(dir.path(), 0).unwrap();
         store.append(&delivered(1)).unwrap();
-        store.write_checkpoint(&Checkpoint {
-            tombstones: vec![(1, vec![id(1)])],
-            ..Default::default()
-        })
-        .unwrap();
+        store
+            .write_checkpoint(&Checkpoint {
+                tombstones: vec![(1, vec![id(1)])],
+                ..Default::default()
+            })
+            .unwrap();
         drop(store);
 
         // Simulate the crash by resurrecting a stale, covered journal file
