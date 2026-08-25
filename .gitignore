@@ -1,4 +1,5 @@
 /target
+/target-e2e
 /tmp
 /config.toml
 config.huml
