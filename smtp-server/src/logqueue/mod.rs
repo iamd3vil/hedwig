@@ -9,6 +9,8 @@
 pub mod dispatcher;
 #[cfg(test)]
 mod fuzz_tests;
+#[cfg(test)]
+mod model_tests;
 pub mod record;
 pub mod segment;
 pub mod shard;

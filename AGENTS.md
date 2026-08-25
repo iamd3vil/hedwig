@@ -20,6 +20,9 @@ Follow idiomatic Rust with four-space indentation, `snake_case` for modules and 
 ## Testing Guidelines
 Embed `#[cfg(test)] mod tests` in the same file as the code, mirroring `smtp/src/parser.rs` and `smtp-server/src/worker/*.rs`. Cover success and error paths, reuse existing fixtures, and run `cargo test` (via `just test`) before opening a pull request; when adding async flows, drive the Tokio runtime explicitly.
 
+## Log-Queue Model Checking
+`smtp-server/src/logqueue/model_tests.rs` holds a stateright model of the shard crash-recovery protocol (durability boundaries, checkpoint publication, torn-tail reconciliation). It runs as an ordinary test, and it only proves the protocol as encoded there, so any change to that protocol must update the model in the same PR or it silently verifies the old design. That means changes to `Dispatcher::{start, add_shard, shutdown}`, checkpoint or journal write/prune ordering in `state.rs`, recovery or discovery semantics, or segment truncation behavior in `writer.rs`/`segment.rs`. The module doc comment maps each model piece to the real code. After updating the model, run `cargo test -p hedwig --lib crash_recovery_protocol_model`, and verify end-to-end with the dev harness (see the `verify` skill) when the change affects delivery or restart behavior. If the checker prints a counterexample, reproduce it against the real stack in a test (see `stale_checkpoint_cursor_over_recycled_offsets` in `dispatcher.rs`) before deciding whether the bug is in the code or in the model.
+
 ## Commit & Pull Request Guidelines
 Use the conventional commit prefixes present in history (`feat:`, `fix:`, `docs:`, `test:`) and keep messages imperative and focused. Pull requests should state motivation, summarize the approach, reference linked issues, list configuration or migration steps, and note the commands used for verification (e.g. `cargo test`, `just dev`), attaching evidence when behaviour changes.
 

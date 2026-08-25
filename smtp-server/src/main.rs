@@ -306,7 +306,9 @@ async fn run_server(config_path: &str) -> Result<()> {
             gate,
             dispatcher_config,
             shutdown_token.clone(),
-        );
+        )
+        .map_err(miette::Report::new)
+        .wrap_err("error starting log-queue dispatcher")?;
 
         let worker_count = cfg.server.workers.unwrap_or(1).max(1);
         let max_retries = cfg.server.max_retries.unwrap_or(5);

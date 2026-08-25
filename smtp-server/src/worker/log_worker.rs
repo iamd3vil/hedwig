@@ -46,7 +46,11 @@ impl LogWorker {
             // envelope out of the per-delivery allocation path.
             let job = &claim.job;
 
-            let body = match self.dispatcher.read_body(job.location).await {
+            let body = match self
+                .dispatcher
+                .read_body(job.message_id, job.location)
+                .await
+            {
                 Ok(body) => body,
                 Err(e) => {
                     // Unreadable payload: defer with backoff rather than
