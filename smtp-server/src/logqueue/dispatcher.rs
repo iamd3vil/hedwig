@@ -179,8 +179,14 @@ impl DispatcherHandle {
     }
 
     /// Read and verify a message body by its location (blocking I/O runs on
-    /// a blocking task). Returns the body bytes.
-    pub async fn read_body(&self, location: JobLocation) -> Result<bytes::Bytes, QueueError> {
+    /// a blocking task). Returns the body bytes. The record's identity must
+    /// match `message_id`: a checksum-valid record under a different id
+    /// means the location is stale and its offsets were recycled.
+    pub async fn read_body(
+        &self,
+        message_id: MessageId,
+        location: JobLocation,
+    ) -> Result<bytes::Bytes, QueueError> {
         let key = (location.shard, location.segment);
         let cached = self.readers.lock().unwrap().get(&key).cloned();
         let dir = self.shard_dirs[location.shard as usize].clone();
@@ -199,6 +205,15 @@ impl DispatcherHandle {
                 location.length,
                 super::record::MAX_RECORD_LEN,
             )?;
+            if header.message_id != message_id {
+                return Err(QueueError::CorruptRecord {
+                    offset: location.offset,
+                    reason: format!(
+                        "record at {location:?} belongs to {}, not to job {message_id}",
+                        header.message_id
+                    ),
+                });
+            }
             Ok(bytes::Bytes::from(buf).slice(header.header_len as usize..))
         })
         .await
@@ -331,7 +346,7 @@ impl Dispatcher {
         gate: Arc<dyn RateGate>,
         config: DispatcherConfig,
         cancel: CancellationToken,
-    ) -> (DispatcherHandle, tokio::task::JoinHandle<()>) {
+    ) -> Result<(DispatcherHandle, tokio::task::JoinHandle<()>), QueueError> {
         let (claim_tx, claim_rx) = mpsc::channel(1024);
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (cp_tx, cp_rx) = mpsc::unbounded_channel();
@@ -368,9 +383,24 @@ impl Dispatcher {
         for init in shard_inits {
             dispatcher.add_shard(init);
         }
+        // Re-persist every shard's reconciled state before admission opens.
+        // Recovery may have truncated a torn tail, and the checkpoint AND the
+        // journal entries on disk can still reference the truncated offsets
+        // (a stale cursor, a job location, or a superseded deferral that a
+        // later journal tear could resurrect). New appends recycle those
+        // offsets, so any such leftover would alias onto foreign records or
+        // strand mail below a stale cursor after the next crash. Writing a
+        // checkpoint now rewrites the snapshot from the reconciled in-memory
+        // state and prunes the old journals, so nothing durable references
+        // offsets past the validated committed head. This must complete
+        // before the SMTP listener can append (the caller wires the listener
+        // only after this returns).
+        for i in 0..dispatcher.shards.len() {
+            dispatcher.checkpoint_shard_sync(i)?;
+        }
 
         let task = tokio::spawn(dispatcher.run(claim_rx, events_rx, cp_rx, cancel));
-        (handle, task)
+        Ok((handle, task))
     }
 
     fn add_shard(&mut self, init: ShardInit) {
@@ -568,12 +598,16 @@ impl Dispatcher {
             }
         }
 
-        self.shutdown(&mut events_rx).await;
+        self.shutdown(&mut events_rx, &mut cp_rx).await;
     }
 
     /// Graceful shutdown: refuse new claims, wait for in-flight outcomes,
     /// persist everything, checkpoint every shard.
-    async fn shutdown(&mut self, events_rx: &mut mpsc::UnboundedReceiver<WorkerEvent>) {
+    async fn shutdown(
+        &mut self,
+        events_rx: &mut mpsc::UnboundedReceiver<WorkerEvent>,
+        cp_rx: &mut mpsc::UnboundedReceiver<(u16, Result<(), QueueError>)>,
+    ) {
         for waiter in self.waiting.drain(..) {
             let _ = waiter.send(None);
         }
@@ -584,10 +618,17 @@ impl Dispatcher {
             }
         }
         self.retry_pending_persists();
-        for i in 0..self.shards.len() {
-            if self.shards[i].checkpoint.is_some() {
-                continue; // an async checkpoint is mid-flight; journals cover us
+        // Wait for mid-flight async checkpoints: their blocking writes must
+        // not still be touching checkpoint files after shutdown returns, or
+        // they would race whoever opens the spool next (the startup
+        // checkpoint in particular).
+        while self.shards.iter().any(|s| s.checkpoint.is_some()) {
+            match cp_rx.recv().await {
+                Some((shard, result)) => self.finish_checkpoint(shard, result),
+                None => break,
             }
+        }
+        for i in 0..self.shards.len() {
             if let Err(e) = self.checkpoint_shard_sync(i) {
                 tracing::error!(shard = self.shards[i].shard, error = %e,
                     "final checkpoint failed; journals remain authoritative");
@@ -872,6 +913,18 @@ impl Dispatcher {
         let shard = &mut self.shards[location.shard as usize];
         let reader = shard.reader(location.segment)?;
         let header = reader.read_header_at(location.offset, super::record::MAX_RECORD_LEN)?;
+        // A valid record whose identity differs means the job's location is
+        // stale and its offsets were recycled; dispatching it would deliver
+        // someone else's mail under this id.
+        if header.message_id != id {
+            return Err(QueueError::CorruptRecord {
+                offset: location.offset,
+                reason: format!(
+                    "record at {:?} belongs to {}, not to job {id}",
+                    location, header.message_id
+                ),
+            });
+        }
         let job = self.jobs.get_mut(&id).expect("job exists");
         job.enqueue_ms = header.enqueue_ms;
         job.envelope = Some((Arc::from(header.sender), Arc::from(header.recipients)));
@@ -1510,7 +1563,7 @@ mod tests {
         }
         let cancel = CancellationToken::new();
         let (handle, dispatcher_task) =
-            Dispatcher::start(inits, writers.handle(), gate, config, cancel.clone());
+            Dispatcher::start(inits, writers.handle(), gate, config, cancel.clone()).unwrap();
         Harness {
             _spool: spool,
             writers,
@@ -1543,7 +1596,11 @@ mod tests {
         assert_eq!(&*claim.job.sender, "sender@example.com");
         assert_eq!(&*claim.job.recipients, ["r1@example.com".to_string()]);
 
-        let body = h.handle.read_body(claim.job.location).await.unwrap();
+        let body = h
+            .handle
+            .read_body(claim.job.message_id, claim.job.location)
+            .await
+            .unwrap();
         assert_eq!(&body[..], b"body 1");
 
         claim.report(JobOutcome::Delivered {
@@ -1649,7 +1706,8 @@ mod tests {
             Arc::new(NoRateGate),
             config,
             cancel.clone(),
-        );
+        )
+        .unwrap();
 
         let claim = handle.claim().await.expect("retry after restart");
         assert_eq!(claim.job.message_id, id);
@@ -1966,7 +2024,8 @@ mod tests {
             Arc::new(NoRateGate),
             DispatcherConfig::default(),
             cancel.clone(),
-        );
+        )
+        .unwrap();
         let claim = handle.claim().await.expect("redispatched after restart");
         assert_eq!(claim.job.message_id, id);
         claim.report(JobOutcome::Delivered {
@@ -2022,7 +2081,8 @@ mod tests {
             Arc::new(NoRateGate),
             DispatcherConfig::default(),
             cancel.clone(),
-        );
+        )
+        .unwrap();
         let append = writers.handle();
         for i in 0..30u64 {
             let mut m = message(i, "r@example.com");
@@ -2033,7 +2093,10 @@ mod tests {
         for _ in 0..30 {
             let claim = handle.claim().await.expect("all records across segments");
             assert!(seen.insert(claim.job.message_id));
-            let body = handle.read_body(claim.job.location).await.unwrap();
+            let body = handle
+                .read_body(claim.job.message_id, claim.job.location)
+                .await
+                .unwrap();
             assert_eq!(body.len(), 512);
             claim.report(JobOutcome::Delivered {
                 response: "250 ok".into(),
@@ -2091,7 +2154,8 @@ mod tests {
                 ..Default::default()
             },
             cancel.clone(),
-        );
+        )
+        .unwrap();
         let append = writers.handle();
         for i in 0..12u64 {
             let mut m = message(i, "r@example.com");
@@ -2147,7 +2211,8 @@ mod tests {
                 ..Default::default()
             },
             cancel.clone(),
-        );
+        )
+        .unwrap();
         let append = writers.handle();
         // m0..m3 fill segment 1; m4 forces rotation into segment 2.
         for i in 0..5u64 {
@@ -2253,12 +2318,16 @@ mod tests {
             Arc::new(NoRateGate),
             DispatcherConfig::default(),
             cancel.clone(),
-        );
+        )
+        .unwrap();
 
         let claim = handle.claim().await.unwrap();
         assert_eq!(claim.job.message_id, id);
         assert_eq!(claim.job.location, new_loc);
-        let body = handle.read_body(claim.job.location).await.unwrap();
+        let body = handle
+            .read_body(claim.job.message_id, claim.job.location)
+            .await
+            .unwrap();
         assert_eq!(&body[..], b"new copy");
         claim.report(JobOutcome::Delivered {
             response: "250 ok".into(),
@@ -2267,5 +2336,111 @@ mod tests {
         cancel.cancel();
         task.await.unwrap();
         writers.shutdown().await;
+    }
+
+    /// End-to-end reproduction of the counterexample found by the stateright
+    /// model (`logqueue::model_tests`): a durable checkpoint whose cursor
+    /// covers offsets that a torn-tail truncation later recycles.
+    ///
+    /// 1. Accept m1; the shutdown checkpoint durably records
+    ///    `{cursor: past m1, ready: [m1 @ offset 0]}`.
+    /// 2. Power loss: the checkpoint was fsynced but the payload record was
+    ///    page-cache only — the segment tail tears away (simulated by
+    ///    truncating the file). Restart truncates and *reuses* the active
+    ///    segment; startup reconciliation clamps the cursor and drops m1 in
+    ///    memory only — the on-disk checkpoint keeps the stale cursor.
+    /// 3. Accept m2, which lands at the recycled offset 0 with the same
+    ///    record length. Crash again (hard abort) before any new checkpoint.
+    /// 4. Restart: recovery reloads the stale checkpoint. The dispatcher
+    ///    must not resurrect m1 pointing at m2's bytes, and m2 — accepted
+    ///    and present on disk — must be dispatched.
+    #[tokio::test]
+    async fn stale_checkpoint_cursor_over_recycled_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Run 1: accept m1, ensure discovery saw it, shut down gracefully so
+        // the final checkpoint holds it as ready with the cursor past it.
+        let loc1 = {
+            let h = start(
+                dir.path(),
+                Arc::new(NoRateGate),
+                DispatcherConfig::default(),
+            );
+            let append = h.writers.handle();
+            let msg = message(1, "r1@example.com");
+            let m1 = msg.message_id;
+            let loc1 = append.append(msg).await.unwrap();
+            let claim = h.handle.claim().await.unwrap();
+            assert_eq!(claim.job.message_id, m1);
+            drop(claim); // abandoned: returns to ready before the checkpoint
+            stop(h).await;
+            loc1
+        };
+        assert_eq!(loc1.offset, 0);
+
+        // Power loss tears the never-fsynced segment tail; the fsynced
+        // checkpoint survives.
+        let seg_path = dir
+            .path()
+            .join("spool")
+            .join("shard-0000")
+            .join(crate::logqueue::segment::active_file_name(loc1.segment));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&seg_path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+
+        // Run 2: accept m2 into the recycled offset space, then crash hard
+        // (no shutdown checkpoint).
+        let m2 = {
+            let h = start(
+                dir.path(),
+                Arc::new(NoRateGate),
+                DispatcherConfig::default(),
+            );
+            let append = h.writers.handle();
+            let msg = message(2, "r2@example.com");
+            let m2 = msg.message_id;
+            let loc2 = append.append(msg).await.unwrap();
+            assert_eq!(loc2.offset, 0, "m2 must reuse the truncated offset space");
+            assert_eq!(
+                loc2.length, loc1.length,
+                "same encoded size as the torn record"
+            );
+            h.dispatcher_task.abort();
+            let _ = h.dispatcher_task.await;
+            h.writers.shutdown().await;
+            m2
+        };
+
+        // Run 3: whatever gets dispatched must own the bytes it points at,
+        // and m2 must be deliverable.
+        let h = start(
+            dir.path(),
+            Arc::new(NoRateGate),
+            DispatcherConfig::default(),
+        );
+        let claim = tokio::time::timeout(Duration::from_secs(5), h.handle.claim())
+            .await
+            .expect("no job dispatched: accepted on-disk mail is stranded")
+            .unwrap();
+        let reader = SegmentReader::open(&seg_path).unwrap();
+        let header = reader
+            .read_header_at(
+                claim.job.location.offset,
+                crate::logqueue::record::MAX_RECORD_LEN,
+            )
+            .unwrap();
+        assert_eq!(
+            header.message_id, claim.job.message_id,
+            "dispatched job points at a record belonging to a different message"
+        );
+        assert_eq!(claim.job.message_id, m2, "m2 is the only live message");
+        claim.report(JobOutcome::Delivered {
+            response: "250 ok".into(),
+        });
+        stop(h).await;
     }
 }
