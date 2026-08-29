@@ -12,7 +12,7 @@ releases:
       - "LICENSE"
     builds:
       - command: "just build-linux"
-        artifact: "target/x86_64-unknown-linux-musl/release/hedwig"
+        artifact: "target/x86_64-unknown-linux-gnu/release/hedwig"
         bin_name: "hedwig"
         archive_name: "hedwig-{{ meta.tag }}-linux-x86_64"
         name: "Linux build"

@@ -10,7 +10,7 @@ build:
     cargo build
 
 build-linux $RUSTFLAGS="-C target-feature=+crt-static":
-    cargo build --release --target x86_64-unknown-linux-musl
+    cargo build --release --target x86_64-unknown-linux-gnu
 
 build-macos $RUSTFLAGS="-C target-feature=+crt-static":
     #!/usr/bin/env sh
