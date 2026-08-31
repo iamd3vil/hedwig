@@ -4,19 +4,18 @@ use hedwig::config::CfgStorage;
 use hedwig::mta_sts::refresher;
 use hedwig::storage::{fs_storage::FileSystemStorage, Status, Storage};
 use hedwig::worker::{deferred_worker::DeferredWorker, Job};
-use hedwig::{callbacks, config, dkim, health, logqueue, metrics, queue_cli, worker};
+use hedwig::{callbacks, config, dkim, health, inbound, logqueue, metrics, queue_cli, worker};
 use miette::{bail, Context, IntoDiagnostic, Result};
 use rustls::pki_types::CertificateDer;
-use smtp::{MaybeTlsStream, SmtpServer, SmtpStream};
+use smtp::SmtpServer;
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn, Level};
+use tracing::{error, info, warn, Level};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -432,14 +431,11 @@ async fn run_server(config_path: &str) -> Result<()> {
     let max_connections = cfg.server.max_connections.unwrap_or(10_000);
     let conn_semaphore = Arc::new(Semaphore::new(max_connections));
 
-    // Create listeners for each configured address
-    let mut listeners = Vec::new();
+    // Inbound runs on dedicated compio (io_uring) threads; every thread
+    // binds each listener address with SO_REUSEPORT so the kernel spreads
+    // accepted connections across rings.
+    let mut inbound_specs = Vec::new();
     for (i, listener_config) in cfg.server.listeners.iter().enumerate() {
-        let listener = TcpListener::bind(&listener_config.addr)
-            .await
-            .into_diagnostic()
-            .wrap_err_with(|| format!("Failed to bind to address: {}", listener_config.addr))?;
-
         let tls_status = match &listener_config.tls {
             Some(tls) if tls.mode == config::TlsMode::Starttls => "STARTTLS",
             Some(_) => "TLS",
@@ -447,111 +443,30 @@ async fn run_server(config_path: &str) -> Result<()> {
         };
         info!(
             storage_type = cfg.storage.storage_type,
-            "SMTP server listening on {} ({})", listener_config.addr, tls_status
+            "SMTP server listening on {} ({}) [compio/io_uring]", listener_config.addr, tls_status
         );
-
-        listeners.push((listener, i));
-    }
-
-    for (listener, acceptor_index) in listeners {
-        let server_clone = smtp_server.clone();
-        let tls_acceptor = tls_acceptors[acceptor_index].clone();
-        let tls_mode = cfg.server.listeners[acceptor_index]
-            .tls
-            .as_ref()
-            .map(|tls| tls.mode)
-            .unwrap_or_default();
-        let shutdown = shutdown_token.clone();
-        let listener_addr = cfg.server.listeners[acceptor_index].addr.clone();
-        let conn_semaphore = Arc::clone(&conn_semaphore);
-
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        info!(%listener_addr, "listener shutting down");
-                        break;
-                    }
-                    accept_result = listener.accept() => {
-                        let (socket, _) = match accept_result {
-                            Ok(conn) => conn,
-                            Err(e) => {
-                                error!(%listener_addr, "Error accepting tcp connection: {:#}", e);
-                                continue;
-                            }
-                        };
-
-                        // Replies are small and written one batch per read;
-                        // Nagle would sit on them waiting for the delayed
-                        // ACK, adding up to 40ms per round trip.
-                        if let Err(e) = socket.set_nodelay(true) {
-                            debug!(%listener_addr, "could not set TCP_NODELAY: {}", e);
-                        }
-
-                        // Enforce the connection limit. If we're at capacity, reject immediately.
-                        let permit = match conn_semaphore.clone().try_acquire_owned() {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                warn!(%listener_addr, "max connections reached, rejecting");
-                                let mut sock: Box<dyn SmtpStream> = Box::new(socket);
-                                let _ = sock.write_line(b"421 4.7.0 Too many connections, try again later\r\n").await;
-                                continue;
-                            }
-                        };
-
-                        debug!("Accepted connection");
-                        let server_clone = server_clone.clone();
-                        let tls_acceptor = tls_acceptor.clone();
-
-                        tokio::spawn(async move {
-                            // Hold the permit for the lifetime of this connection.
-                            let _permit = permit;
-
-                            let mut boxed_socket: Box<dyn SmtpStream> = match tls_acceptor {
-                                // Implicit TLS: the handshake happens before any SMTP traffic.
-                                // Bounded so a silent client can't hold a connection permit forever.
-                                Some(acceptor) if tls_mode == config::TlsMode::Implicit => {
-                                    match tokio::time::timeout(
-                                        cmd_timeout,
-                                        acceptor.accept(socket),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(tls_stream)) => Box::new(tls_stream),
-                                        Ok(Err(e)) => {
-                                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                                                debug!("TLS handshake failed: {}", e);
-                                            } else {
-                                                error!("TLS handshake failed: {}", e);
-                                            }
-
-                                            return;
-                                        }
-                                        Err(_) => {
-                                            debug!("TLS handshake timed out");
-                                            return;
-                                        }
-                                    }
-                                }
-                                // STARTTLS: start in plaintext, upgrade when the client asks.
-                                Some(acceptor) => {
-                                    Box::new(MaybeTlsStream::Plain(socket, Some(acceptor)))
-                                }
-                                None => Box::new(socket),
-                            };
-
-                            if let Err(e) = server_clone.handle_client(&mut boxed_socket).await {
-                                error!("Error handling client: {:#}", e);
-                            }
-                        });
-                    }
-                }
-            }
-            info!(%listener_addr, "listener stopped");
+        inbound_specs.push(inbound::ListenerSpec {
+            addr: listener_config.addr.clone(),
+            acceptor: tls_acceptors[i].clone(),
+            tls_mode: listener_config
+                .tls
+                .as_ref()
+                .map(|tls| tls.mode)
+                .unwrap_or_default(),
         });
-
-        background_tasks.push(handle);
     }
+
+    let inbound_thread_count = inbound::inbound_thread_count();
+    info!(threads = inbound_thread_count, "starting compio inbound threads");
+    let inbound_threads = inbound::spawn_inbound_threads(
+        inbound_specs,
+        smtp_server,
+        Arc::clone(&conn_semaphore),
+        shutdown_token.clone(),
+        cmd_timeout,
+        inbound_thread_count,
+        tokio::runtime::Handle::current(),
+    )?;
 
     wait_for_shutdown_signal().await?;
     info!("shutdown signal received, beginning graceful shutdown");
@@ -584,6 +499,19 @@ async fn run_server(config_path: &str) -> Result<()> {
                 error!("background task failed: {}", err);
             }
         }
+    }
+
+    // Inbound threads observe the cancellation token; wait for their accept
+    // loops to wind down off the async runtime.
+    let join_inbound = tokio::task::spawn_blocking(move || {
+        for handle in inbound_threads {
+            if handle.join().is_err() {
+                error!("inbound thread panicked");
+            }
+        }
+    });
+    if let Err(err) = join_inbound.await {
+        error!("failed to join inbound threads: {:?}", err);
     }
 
     // Log backend: the dispatcher has drained in-flight outcomes and written

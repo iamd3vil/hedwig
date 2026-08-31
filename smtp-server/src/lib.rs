@@ -7,6 +7,7 @@ pub mod callbacks;
 pub mod config;
 pub mod dkim;
 pub mod health;
+pub mod inbound;
 pub mod logqueue;
 pub mod metrics;
 pub mod migrate;

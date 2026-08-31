@@ -52,7 +52,7 @@ lettre = { version = "0.11.11", features = [
 mail-auth = "0.10.0"
 rustls-pki-types = "1"
 moka = { version = "0.12.10", features = ["future"] }
-tokio-util = { version = "0.7.13", features = ["io"] }
+tokio-util = { version = "0.7.13", features = ["io", "compat"] }
 rustls = { version = "0.23", features = ["ring"], default-features = false }
 rustls-pemfile = "2.2.0"
 clap = { version = "4", features = ["derive"] }
@@ -71,6 +71,8 @@ prometheus = "0.13"
 crc32fast = "1.4"
 bytes = "1"
 libc = "0.2"
+compio = { version = "0.19.2", features = ["io-compat", "net"] }
+socket2 = { version = "0.6.5", features = ["all"] }
 
 [dev-dependencies]
 stateright = "0.31.0"

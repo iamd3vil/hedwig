@@ -18,10 +18,18 @@ use tokio_rustls::{server::TlsStream, TlsAcceptor};
 pub mod parser;
 use parser::{parse_command, SmtpCommand};
 
-#[async_trait]
-pub trait SmtpStream: AsyncRead + AsyncWrite + Unpin + Send {
-    async fn write_line(&mut self, line: &[u8]) -> Result<()> {
+/// Note: not `Send` — on the compio inbound path streams are bound to a
+/// single io_uring worker thread, so sessions run as thread-local tasks.
+#[allow(async_fn_in_trait)]
+pub trait SmtpStream: AsyncRead + AsyncWrite + Unpin {
+    async fn write_line(&mut self, line: &[u8]) -> Result<()>
+    where
+        Self: Sized,
+    {
         self.write_all(line).await.into_diagnostic()?;
+        // Replies must actually hit the wire: buffered adapters (e.g. the
+        // compio compat stream) only submit on flush. No-op for TcpStream.
+        self.flush().await.into_diagnostic()?;
         Ok(())
     }
 
@@ -37,24 +45,22 @@ pub trait SmtpStream: AsyncRead + AsyncWrite + Unpin + Send {
     }
 }
 
-#[async_trait]
 impl SmtpStream for TcpStream {}
 
-#[async_trait]
-impl SmtpStream for TlsStream<TcpStream> {}
+impl<S: AsyncRead + AsyncWrite + Unpin> SmtpStream for TlsStream<S> {}
 
 /// A connection that starts out as plain TCP and may be upgraded to TLS
 /// mid-session via STARTTLS. Carrying the acceptor with the stream lets each
 /// listener decide independently whether to offer STARTTLS.
-pub enum MaybeTlsStream {
-    Plain(TcpStream, Option<TlsAcceptor>),
-    Tls(Box<TlsStream<TcpStream>>),
+pub enum MaybeTlsStream<S = TcpStream> {
+    Plain(S, Option<TlsAcceptor>),
+    Tls(Box<TlsStream<S>>),
     /// Transient state while the TLS handshake runs; only observable if the
     /// handshake fails, after which the connection is unusable.
     Upgrading,
 }
 
-impl AsyncRead for MaybeTlsStream {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeTlsStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -68,7 +74,7 @@ impl AsyncRead for MaybeTlsStream {
     }
 }
 
-impl AsyncWrite for MaybeTlsStream {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -111,8 +117,7 @@ fn upgrading_io_error() -> std::io::Error {
     )
 }
 
-#[async_trait]
-impl SmtpStream for MaybeTlsStream {
+impl<S: AsyncRead + AsyncWrite + Unpin> SmtpStream for MaybeTlsStream<S> {
     fn supports_starttls(&self) -> bool {
         matches!(self, MaybeTlsStream::Plain(_, Some(_)))
     }
@@ -364,7 +369,7 @@ impl SmtpServer {
     /// # Returns
     ///
     /// A `Result` indicating success or failure of the client handling process.
-    pub async fn handle_client(&self, socket: &mut Box<dyn SmtpStream>) -> Result<()> {
+    pub async fn handle_client<S: SmtpStream>(&self, socket: &mut S) -> Result<()> {
         let mut session = SmtpSession::new();
 
         socket
@@ -401,10 +406,10 @@ impl SmtpServer {
         }
     }
 
-    async fn handle_connection(
+    async fn handle_connection<S: SmtpStream>(
         &self,
         session: &mut SmtpSession,
-        stream: &mut Box<dyn SmtpStream>,
+        stream: &mut S,
     ) -> Result<()> {
         let mut buf = BytesMut::with_capacity(32768); // 32kb
         let mut data_buffer = BytesMut::new();
@@ -496,6 +501,7 @@ impl SmtpServer {
                     Ok(s) => s.trim(),
                     Err(err) => {
                         let _ = stream.write_all(&reply).await;
+                        let _ = stream.flush().await;
                         return Err(SmtpError::ParseError {
                             message: format!("Invalid UTF-8 sequence: {}", err),
                             span: (0, line.len()).into(),
@@ -524,6 +530,7 @@ impl SmtpServer {
                             // before the handshake bytes take over the wire.
                             reply.extend_from_slice(b"220 Ready to start TLS\r\n");
                             stream.write_all(&reply).await.into_diagnostic()?;
+                            stream.flush().await.into_diagnostic()?;
                             reply.clear();
                             buf.clear();
                             data_buffer.clear();
@@ -554,6 +561,7 @@ impl SmtpServer {
                         {
                             Ok(true) => {
                                 stream.write_all(&reply).await.into_diagnostic()?;
+                                stream.flush().await.into_diagnostic()?;
                                 return Ok(());
                             }
                             Ok(false) => {}
@@ -561,6 +569,7 @@ impl SmtpServer {
                                 // Deliver replies already owed for earlier
                                 // pipelined commands before the error reply.
                                 let _ = stream.write_all(&reply).await;
+                                let _ = stream.flush().await;
                                 return Err(e);
                             }
                         }
@@ -578,6 +587,7 @@ impl SmtpServer {
             }
             if !reply.is_empty() {
                 stream.write_all(&reply).await.into_diagnostic()?;
+                stream.flush().await.into_diagnostic()?;
             }
             if session.state == SessionState::ReceivingData && !buf.is_empty() {
                 // Content the client sent in the same packet as DATA.
@@ -600,10 +610,10 @@ impl SmtpServer {
     /// Handles bytes accumulated in `data_buffer` during DATA: enforces the
     /// size limit and, once the terminator arrives, unstuffs and delivers
     /// the message.
-    async fn process_data(
+    async fn process_data<S: SmtpStream>(
         &self,
         session: &mut SmtpSession,
-        stream: &mut Box<dyn SmtpStream>,
+        stream: &mut S,
         buf: &mut BytesMut,
         data_buffer: &mut BytesMut,
         data_scanned: &mut usize,
@@ -1202,7 +1212,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl SmtpStream for tokio::io::DuplexStream {}
 
     /// Drives a full session over an in-memory duplex stream, sending the
@@ -1221,7 +1230,7 @@ mod tests {
         };
 
         let (client, server_side) = tokio::io::duplex(4096);
-        let mut server_stream: Box<dyn SmtpStream> = Box::new(server_side);
+        let mut server_stream = server_side;
         let server_task =
             tokio::spawn(async move { server.handle_client(&mut server_stream).await });
 
@@ -1294,7 +1303,7 @@ mod tests {
         };
 
         let (client, server_side) = tokio::io::duplex(4096);
-        let mut server_stream: Box<dyn SmtpStream> = Box::new(server_side);
+        let mut server_stream = server_side;
         let server_task =
             tokio::spawn(async move { server.handle_client(&mut server_stream).await });
         let (mut reader, mut writer) = tokio::io::split(client);
@@ -1375,7 +1384,7 @@ mod tests {
             hostname: "test.local".to_string(),
         };
         let (client, server_side) = tokio::io::duplex(65536);
-        let mut server_stream: Box<dyn SmtpStream> = Box::new(server_side);
+        let mut server_stream = server_side;
         let server_task =
             tokio::spawn(async move { server.handle_client(&mut server_stream).await });
         let (mut reader, mut writer) = tokio::io::split(client);
@@ -1673,7 +1682,7 @@ mod tests {
         };
 
         let (client, server_side) = tokio::io::duplex(4096);
-        let mut server_stream: Box<dyn SmtpStream> = Box::new(server_side);
+        let mut server_stream = server_side;
         let server_task =
             tokio::spawn(async move { server.handle_client(&mut server_stream).await });
 
@@ -1802,7 +1811,7 @@ mod tests {
         };
 
         let (client, server_side) = tokio::io::duplex(4096);
-        let mut server_stream: Box<dyn SmtpStream> = Box::new(server_side);
+        let mut server_stream = server_side;
         let server_task =
             tokio::spawn(async move { server.handle_client(&mut server_stream).await });
 
