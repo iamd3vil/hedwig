@@ -4,7 +4,7 @@ version = "0.12.2"
 edition = "2021"
 
 [dependencies]
-smtp = { path = "../smtp" }
+smtp = { path = "../smtp", features = ["compio"] }
 miette = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -52,7 +52,7 @@ lettre = { version = "0.11.11", features = [
 mail-auth = "0.10.0"
 rustls-pki-types = "1"
 moka = { version = "0.12.10", features = ["future"] }
-tokio-util = { version = "0.7.13", features = ["io", "compat"] }
+tokio-util = { version = "0.7.13", features = ["io"] }
 rustls = { version = "0.23", features = ["ring"], default-features = false }
 rustls-pemfile = "2.2.0"
 clap = { version = "4", features = ["derive"] }
@@ -71,7 +71,7 @@ prometheus = "0.13"
 crc32fast = "1.4"
 bytes = "1"
 libc = "0.2"
-compio = { version = "0.19.2", features = ["io-compat", "net"] }
+compio = { version = "0.19.2", features = ["io", "net", "time", "rustls"] }
 socket2 = { version = "0.6.5", features = ["all"] }
 
 [dev-dependencies]

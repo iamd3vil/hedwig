@@ -1,31 +1,25 @@
 //! Inbound SMTP listeners on compio (io_uring).
 //!
-//! Experiment: inbound socket I/O runs on dedicated compio runtime threads,
-//! one io_uring ring per thread, with SO_REUSEPORT spreading accepts across
-//! them. Everything downstream of the session (log-queue writers, delivery
+//! Inbound socket I/O runs on dedicated compio runtime threads, one io_uring
+//! ring per thread, with SO_REUSEPORT spreading accepts across them.
+//! Everything downstream of the session (log-queue writers, delivery
 //! workers, DNS, HTTP) stays on the tokio runtime. Each compio thread enters
-//! the tokio runtime handle so tokio timers and channels used inside the
-//! session path keep working; sessions themselves are thread-local compio
-//! tasks (their streams are bound to the thread's ring and are not Send).
+//! the tokio runtime handle so tokio timers and channels used by the
+//! callbacks keep working; sessions themselves are thread-local compio tasks
+//! (their streams are bound to the thread's ring and are not Send).
 //!
-//! The compio stream reaches the tokio-trait based `smtp` crate through two
-//! adapters: compio's `compat::AsyncStream` (completion ops -> futures-io,
-//! with an internal buffer flushed explicitly) and `tokio_util::compat`
-//! (futures-io -> tokio traits). Replies only hit the wire on flush, which
-//! `SmtpStream::write_line` and the reply batches in the smtp crate now do.
+//! The smtp crate's stream abstraction is runtime-agnostic, so sessions run
+//! on native compio streams (owned-buffer ops, no adapter copies); TLS goes
+//! through compio_tls over the same rustls ServerConfig the tokio path used.
 
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use compio::io::compat::AsyncStream;
 use miette::{Context, IntoDiagnostic, Result};
-use smtp::{MaybeTlsStream, SmtpServer};
-use tokio::io::AsyncWriteExt;
+use smtp::compio_stream::{CompioTcpStream, TlsAcceptor};
+use smtp::{SmtpServer, SmtpStream};
 use tokio::sync::Semaphore;
-use tokio_rustls::TlsAcceptor;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -35,16 +29,8 @@ use crate::config;
 #[derive(Clone)]
 pub struct ListenerSpec {
     pub addr: String,
-    pub acceptor: Option<TlsAcceptor>,
+    pub tls_config: Option<Arc<rustls::ServerConfig>>,
     pub tls_mode: config::TlsMode,
-}
-
-/// A compio TCP stream adapted to tokio's AsyncRead/AsyncWrite.
-type CompatStream =
-    tokio_util::compat::Compat<Pin<Box<AsyncStream<compio::net::TcpStream>>>>;
-
-fn adapt(socket: compio::net::TcpStream) -> CompatStream {
-    Box::pin(AsyncStream::new(socket)).compat()
 }
 
 /// Number of inbound io_uring threads: HEDWIG_INBOUND_THREADS overrides,
@@ -148,6 +134,7 @@ async fn accept_loop(
     cmd_timeout: Duration,
 ) {
     let listener_addr = spec.addr.clone();
+    let acceptor = spec.tls_config.map(TlsAcceptor::from);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -176,11 +163,10 @@ async fn accept_loop(
                     Err(_) => {
                         warn!(%listener_addr, "max connections reached, rejecting");
                         compio::runtime::spawn(async move {
-                            let mut stream = adapt(socket);
+                            let mut stream = CompioTcpStream::plain(socket, None);
                             let _ = stream
                                 .write_all(b"421 4.7.0 Too many connections, try again later\r\n")
                                 .await;
-                            let _ = stream.flush().await;
                         })
                         .detach();
                         continue;
@@ -189,22 +175,21 @@ async fn accept_loop(
 
                 debug!("Accepted connection");
                 let server = server.clone();
-                let acceptor = spec.acceptor.clone();
+                let acceptor = acceptor.clone();
                 let tls_mode = spec.tls_mode;
 
                 compio::runtime::spawn(async move {
                     // Hold the permit for the lifetime of this connection.
                     let _permit = permit;
-                    let stream = adapt(socket);
 
-                    let mut stream: MaybeTlsStream<CompatStream> = match acceptor {
+                    let mut stream = match acceptor {
                         // Implicit TLS: the handshake happens before any SMTP
                         // traffic. Bounded so a silent client can't hold a
                         // connection permit forever.
                         Some(acceptor) if tls_mode == config::TlsMode::Implicit => {
-                            match tokio::time::timeout(cmd_timeout, acceptor.accept(stream)).await
+                            match compio::time::timeout(cmd_timeout, acceptor.accept(socket)).await
                             {
-                                Ok(Ok(tls_stream)) => MaybeTlsStream::Tls(Box::new(tls_stream)),
+                                Ok(Ok(tls_stream)) => CompioTcpStream::tls(tls_stream),
                                 Ok(Err(e)) => {
                                     if e.kind() == std::io::ErrorKind::UnexpectedEof {
                                         debug!("TLS handshake failed: {}", e);
@@ -220,8 +205,8 @@ async fn accept_loop(
                             }
                         }
                         // STARTTLS: start in plaintext, upgrade on request.
-                        Some(acceptor) => MaybeTlsStream::Plain(stream, Some(acceptor)),
-                        None => MaybeTlsStream::Plain(stream, None),
+                        Some(acceptor) => CompioTcpStream::plain(socket, Some(acceptor)),
+                        None => CompioTcpStream::plain(socket, None),
                     };
 
                     if let Err(e) = server.handle_client(&mut stream).await {

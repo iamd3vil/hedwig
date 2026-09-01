@@ -4,142 +4,22 @@ use async_trait::async_trait;
 use base64::prelude::*;
 use bytes::{Buf, Bytes, BytesMut};
 use memchr::memchr;
-use miette::{bail, Context, Diagnostic, IntoDiagnostic, Result, SourceSpan};
-use std::pin::Pin;
+use miette::{Diagnostic, IntoDiagnostic, Result, SourceSpan};
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
-
-use tokio_rustls::{server::TlsStream, TlsAcceptor};
 
 pub mod parser;
+pub mod stream;
 use parser::{parse_command, SmtpCommand};
+pub use stream::SmtpStream;
 
-/// Note: not `Send` — on the compio inbound path streams are bound to a
-/// single io_uring worker thread, so sessions run as thread-local tasks.
-#[allow(async_fn_in_trait)]
-pub trait SmtpStream: AsyncRead + AsyncWrite + Unpin {
-    async fn write_line(&mut self, line: &[u8]) -> Result<()>
-    where
-        Self: Sized,
-    {
-        self.write_all(line).await.into_diagnostic()?;
-        // Replies must actually hit the wire: buffered adapters (e.g. the
-        // compio compat stream) only submit on flush. No-op for TcpStream.
-        self.flush().await.into_diagnostic()?;
-        Ok(())
-    }
-
-    /// Whether this stream can be upgraded to TLS via STARTTLS.
-    fn supports_starttls(&self) -> bool {
-        false
-    }
-
-    /// Upgrades the stream to TLS in place. Only valid when
-    /// `supports_starttls()` returns true.
-    async fn upgrade_to_tls(&mut self) -> Result<()> {
-        bail!("STARTTLS not supported on this stream")
-    }
-}
-
-impl SmtpStream for TcpStream {}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> SmtpStream for TlsStream<S> {}
-
-/// A connection that starts out as plain TCP and may be upgraded to TLS
-/// mid-session via STARTTLS. Carrying the acceptor with the stream lets each
-/// listener decide independently whether to offer STARTTLS.
-pub enum MaybeTlsStream<S = TcpStream> {
-    Plain(S, Option<TlsAcceptor>),
-    Tls(Box<TlsStream<S>>),
-    /// Transient state while the TLS handshake runs; only observable if the
-    /// handshake fails, after which the connection is unusable.
-    Upgrading,
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeTlsStream<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            MaybeTlsStream::Plain(s, _) => Pin::new(s).poll_read(cx, buf),
-            MaybeTlsStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
-            MaybeTlsStream::Upgrading => Poll::Ready(Err(upgrading_io_error())),
-        }
-    }
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            MaybeTlsStream::Plain(s, _) => Pin::new(s).poll_write(cx, buf),
-            MaybeTlsStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
-            MaybeTlsStream::Upgrading => Poll::Ready(Err(upgrading_io_error())),
-        }
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            MaybeTlsStream::Plain(s, _) => Pin::new(s).poll_flush(cx),
-            MaybeTlsStream::Tls(s) => Pin::new(s).poll_flush(cx),
-            MaybeTlsStream::Upgrading => Poll::Ready(Err(upgrading_io_error())),
-        }
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            MaybeTlsStream::Plain(s, _) => Pin::new(s).poll_shutdown(cx),
-            MaybeTlsStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
-            MaybeTlsStream::Upgrading => Poll::Ready(Err(upgrading_io_error())),
-        }
-    }
-}
-
-fn upgrading_io_error() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::NotConnected,
-        "connection unusable after failed TLS upgrade",
-    )
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> SmtpStream for MaybeTlsStream<S> {
-    fn supports_starttls(&self) -> bool {
-        matches!(self, MaybeTlsStream::Plain(_, Some(_)))
-    }
-
-    async fn upgrade_to_tls(&mut self) -> Result<()> {
-        match std::mem::replace(self, MaybeTlsStream::Upgrading) {
-            MaybeTlsStream::Plain(tcp, Some(acceptor)) => {
-                let tls_stream = acceptor
-                    .accept(tcp)
-                    .await
-                    .into_diagnostic()
-                    .wrap_err("TLS handshake failed during STARTTLS upgrade")?;
-                *self = MaybeTlsStream::Tls(Box::new(tls_stream));
-                Ok(())
-            }
-            other => {
-                *self = other;
-                bail!("STARTTLS not supported on this stream")
-            }
-        }
-    }
-}
+#[cfg(feature = "compio")]
+pub mod compio_stream;
+#[cfg(feature = "tokio")]
+pub mod tokio_stream;
+#[cfg(feature = "tokio")]
+pub use tokio_stream::{MaybeTlsStream, TokioStream};
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum SmtpError {
@@ -373,29 +253,30 @@ impl SmtpServer {
         let mut session = SmtpSession::new();
 
         socket
-            .write_line(format!("220 {} ESMTP server ready\r\n", self.hostname).as_bytes())
-            .await?;
+            .write_all(format!("220 {} ESMTP server ready\r\n", self.hostname).as_bytes())
+            .await
+            .into_diagnostic()?;
 
         let res = self.handle_connection(&mut session, socket).await;
         if let Err(e) = res {
             match e.downcast::<SmtpError>() {
                 Ok(e) => match e {
-                    SmtpError::MailFromDenied { message } => {
-                        socket
-                            .write_line(format!("550 {}", message).as_bytes())
-                            .await
-                    }
-                    SmtpError::RcptToDenied { message } => {
-                        socket
-                            .write_line(format!("550 {}", message).as_bytes())
-                            .await
-                    }
-                    SmtpError::Transient { message } => {
-                        socket
-                            .write_line(format!("452 {}\r\n", message).as_bytes())
-                            .await
-                    }
-                    _ => socket.write_line(b"500 Internal server error\r\n").await,
+                    SmtpError::MailFromDenied { message } => socket
+                        .write_all(format!("550 {}", message).as_bytes())
+                        .await
+                        .into_diagnostic(),
+                    SmtpError::RcptToDenied { message } => socket
+                        .write_all(format!("550 {}", message).as_bytes())
+                        .await
+                        .into_diagnostic(),
+                    SmtpError::Transient { message } => socket
+                        .write_all(format!("452 {}\r\n", message).as_bytes())
+                        .await
+                        .into_diagnostic(),
+                    _ => socket
+                        .write_all(b"500 Internal server error\r\n")
+                        .await
+                        .into_diagnostic(),
                 },
                 _ => Ok(()),
             }
@@ -442,12 +323,14 @@ impl SmtpServer {
                 } else {
                     &mut buf
                 };
-                let n = match tokio::time::timeout(timeout, stream.read_buf(read_target)).await {
-                    Ok(result) => result.into_diagnostic()?,
-                    Err(_) => {
-                        let _ = stream
-                            .write_line(b"421 4.4.2 Connection timed out\r\n")
-                            .await;
+                let n = match stream
+                    .read_buf_timeout(read_target, timeout)
+                    .await
+                    .into_diagnostic()?
+                {
+                    Some(n) => n,
+                    None => {
+                        let _ = stream.write_all(b"421 4.4.2 Connection timed out\r\n").await;
                         return Ok(());
                     }
                 };
@@ -501,7 +384,6 @@ impl SmtpServer {
                     Ok(s) => s.trim(),
                     Err(err) => {
                         let _ = stream.write_all(&reply).await;
-                        let _ = stream.flush().await;
                         return Err(SmtpError::ParseError {
                             message: format!("Invalid UTF-8 sequence: {}", err),
                             span: (0, line.len()).into(),
@@ -530,7 +412,6 @@ impl SmtpServer {
                             // before the handshake bytes take over the wire.
                             reply.extend_from_slice(b"220 Ready to start TLS\r\n");
                             stream.write_all(&reply).await.into_diagnostic()?;
-                            stream.flush().await.into_diagnostic()?;
                             reply.clear();
                             buf.clear();
                             data_buffer.clear();
@@ -538,14 +419,11 @@ impl SmtpServer {
                             data_oversized = false;
                             // Bound the handshake so a client that goes
                             // silent after STARTTLS can't hold the
-                            // connection (and its permit) forever.
-                            match tokio::time::timeout(self.cmd_timeout, stream.upgrade_to_tls())
-                                .await
-                            {
-                                Ok(result) => result?,
-                                // The handshake never completed; the stream
-                                // is unusable, so just drop the connection.
-                                Err(_) => return Ok(()),
+                            // connection (and its permit) forever. `false`
+                            // means it never completed and the stream is
+                            // unusable, so just drop the connection.
+                            if !stream.upgrade_to_tls(self.cmd_timeout).await? {
+                                return Ok(());
                             }
                             // RFC 3207: the session is reset to its initial
                             // state; the client must EHLO again.
@@ -561,7 +439,6 @@ impl SmtpServer {
                         {
                             Ok(true) => {
                                 stream.write_all(&reply).await.into_diagnostic()?;
-                                stream.flush().await.into_diagnostic()?;
                                 return Ok(());
                             }
                             Ok(false) => {}
@@ -569,7 +446,6 @@ impl SmtpServer {
                                 // Deliver replies already owed for earlier
                                 // pipelined commands before the error reply.
                                 let _ = stream.write_all(&reply).await;
-                                let _ = stream.flush().await;
                                 return Err(e);
                             }
                         }
@@ -587,7 +463,6 @@ impl SmtpServer {
             }
             if !reply.is_empty() {
                 stream.write_all(&reply).await.into_diagnostic()?;
-                stream.flush().await.into_diagnostic()?;
             }
             if session.state == SessionState::ReceivingData && !buf.is_empty() {
                 // Content the client sent in the same packet as DATA.
@@ -647,7 +522,10 @@ impl SmtpServer {
         // misparsed as SMTP commands on this connection.
         if *oversized {
             if let Some((_, consumed)) = end {
-                stream.write_line(b"552 5.3.4 Message too big\r\n").await?;
+                stream
+                    .write_all(b"552 5.3.4 Message too big\r\n")
+                    .await
+                    .into_diagnostic()?;
                 // Keep whatever followed the terminator: it is the next
                 // command group, not part of the rejected message.
                 if consumed < data_buffer.len() {
@@ -703,7 +581,7 @@ impl SmtpServer {
                 self.callbacks
                     .on_data(std::mem::take(&mut session.email))
                     .await?;
-                stream.write_line(b"250 OK\r\n").await?;
+                stream.write_all(b"250 OK\r\n").await.into_diagnostic()?;
                 session.state = SessionState::Authenticated;
             }
             None => {
@@ -1212,8 +1090,6 @@ mod tests {
         }
     }
 
-    impl SmtpStream for tokio::io::DuplexStream {}
-
     /// Drives a full session over an in-memory duplex stream, sending the
     /// DATA body in `chunk_size`-byte writes, and returns the received body.
     async fn run_chunked_data_session(body: &str, chunk_size: usize) -> String {
@@ -1230,7 +1106,7 @@ mod tests {
         };
 
         let (client, server_side) = tokio::io::duplex(4096);
-        let mut server_stream = server_side;
+        let mut server_stream = TokioStream(server_side);
         let server_task =
             tokio::spawn(async move { server.handle_client(&mut server_stream).await });
 
@@ -1303,7 +1179,7 @@ mod tests {
         };
 
         let (client, server_side) = tokio::io::duplex(4096);
-        let mut server_stream = server_side;
+        let mut server_stream = TokioStream(server_side);
         let server_task =
             tokio::spawn(async move { server.handle_client(&mut server_stream).await });
         let (mut reader, mut writer) = tokio::io::split(client);
@@ -1384,7 +1260,7 @@ mod tests {
             hostname: "test.local".to_string(),
         };
         let (client, server_side) = tokio::io::duplex(65536);
-        let mut server_stream = server_side;
+        let mut server_stream = TokioStream(server_side);
         let server_task =
             tokio::spawn(async move { server.handle_client(&mut server_stream).await });
         let (mut reader, mut writer) = tokio::io::split(client);
@@ -1682,7 +1558,7 @@ mod tests {
         };
 
         let (client, server_side) = tokio::io::duplex(4096);
-        let mut server_stream = server_side;
+        let mut server_stream = TokioStream(server_side);
         let server_task =
             tokio::spawn(async move { server.handle_client(&mut server_stream).await });
 
@@ -1703,7 +1579,7 @@ mod tests {
         }
 
         /// Requests a CRAM-MD5 challenge and returns it decoded.
-        async fn request_challenge<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+        async fn request_challenge<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
             reader: &mut R,
             writer: &mut W,
         ) -> String {
@@ -1811,7 +1687,7 @@ mod tests {
         };
 
         let (client, server_side) = tokio::io::duplex(4096);
-        let mut server_stream = server_side;
+        let mut server_stream = TokioStream(server_side);
         let server_task =
             tokio::spawn(async move { server.handle_client(&mut server_stream).await });
 

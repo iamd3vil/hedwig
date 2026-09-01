@@ -12,8 +12,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tokio_rustls::rustls::{self, ServerConfig};
-use tokio_rustls::TlsAcceptor;
+use rustls::ServerConfig;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn, Level};
 
@@ -196,8 +195,9 @@ async fn run_server(config_path: &str) -> Result<()> {
         });
         background_tasks.push(handle);
     }
-    // Create TLS acceptors for each listener that has TLS configured
-    let mut tls_acceptors = Vec::new();
+    // Build rustls server configs for each listener that has TLS configured;
+    // the inbound threads turn them into compio TLS acceptors.
+    let mut tls_configs: Vec<Option<Arc<ServerConfig>>> = Vec::new();
     for listener_config in &cfg.server.listeners {
         let tls_acceptor = if let Some(tls_config) = &listener_config.tls {
             let cert_file = tokio::fs::File::open(&tls_config.cert_path)
@@ -225,11 +225,11 @@ async fn run_server(config_path: &str) -> Result<()> {
                 .with_single_cert(certs, key)
                 .into_diagnostic()?;
 
-            Some(TlsAcceptor::from(Arc::new(config)))
+            Some(Arc::new(config))
         } else {
             None
         };
-        tls_acceptors.push(tls_acceptor);
+        tls_configs.push(tls_acceptor);
     }
 
     let auth_enabled = cfg.server.auth.is_some();
@@ -447,7 +447,7 @@ async fn run_server(config_path: &str) -> Result<()> {
         );
         inbound_specs.push(inbound::ListenerSpec {
             addr: listener_config.addr.clone(),
-            acceptor: tls_acceptors[i].clone(),
+            tls_config: tls_configs[i].clone(),
             tls_mode: listener_config
                 .tls
                 .as_ref()
