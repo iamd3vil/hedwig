@@ -23,6 +23,26 @@ use crate::stream::SmtpStream;
 const READ_CHUNK: usize = 64 * 1024;
 const MIN_SPARE: usize = 4 * 1024;
 
+/// Ciphertext-side buffer for the compat stream under rustls. compio_tls's
+/// default is 8KB (half a TLS record per op); 64KB moves ~4 records per op,
+/// which matters for large messages.
+const TLS_COMPAT_BUF: usize = 64 * 1024;
+
+/// Accepts a TLS connection with [`TLS_COMPAT_BUF`]-sized buffers instead of
+/// compio_tls's default. Used for both implicit-TLS accepts and STARTTLS
+/// upgrades.
+pub async fn accept_tls(
+    acceptor: &TlsAcceptor,
+    stream: TcpStream,
+) -> std::io::Result<TlsStream<TcpStream>> {
+    acceptor
+        .accept_compat(compio::io::compat::AsyncStream::with_capacity(
+            TLS_COMPAT_BUF,
+            stream,
+        ))
+        .await
+}
+
 /// Adapts any compio `AsyncRead + AsyncWrite` stream to [`SmtpStream`].
 pub struct CompioStream<S> {
     inner: S,
@@ -131,7 +151,7 @@ impl SmtpStream for CompioTcpStream {
         match std::mem::replace(self, CompioTcpStream::Upgrading) {
             CompioTcpStream::Plain(stream, Some(acceptor)) => {
                 let tcp = stream.into_inner();
-                match compio::time::timeout(timeout, acceptor.accept(tcp)).await {
+                match compio::time::timeout(timeout, accept_tls(&acceptor, tcp)).await {
                     Ok(Ok(tls_stream)) => {
                         *self = CompioTcpStream::tls(tls_stream);
                         Ok(true)

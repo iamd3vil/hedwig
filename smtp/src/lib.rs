@@ -464,6 +464,18 @@ impl SmtpServer {
             if !reply.is_empty() {
                 stream.write_all(&reply).await.into_diagnostic()?;
             }
+            if session.state == SessionState::ReceivingData {
+                // RFC 1870 SIZE: pre-size the message buffer so large
+                // messages don't pay doubling reallocs, each of which
+                // memcpys everything accumulated so far. A lying client
+                // costs only virtual address space: untouched pages are
+                // never faulted in.
+                if let Some(declared) = session.declared_size {
+                    // Slack for the terminator and dot-stuffing.
+                    let want = declared.min(self.max_message_size as u64) as usize + 1024;
+                    data_buffer.reserve(want);
+                }
+            }
             if session.state == SessionState::ReceivingData && !buf.is_empty() {
                 // Content the client sent in the same packet as DATA.
                 data_buffer.extend_from_slice(&buf);
@@ -683,6 +695,7 @@ impl SmtpServer {
             (SessionState::Authenticated, SmtpCommand::MailFrom(from_command)) => {
                 self.callbacks.on_mail_from(&from_command).await?;
                 session.email.from = from_command.address.clone();
+                session.declared_size = from_command.size;
                 reply.extend_from_slice(b"250 OK\r\n");
                 session.state = SessionState::ReceivingMailFrom;
             }
@@ -708,6 +721,7 @@ impl SmtpServer {
                     to: Vec::with_capacity(1),
                     body: Bytes::new(),
                 };
+                session.declared_size = from_command.size;
                 reply.extend_from_slice(b"250 OK\r\n");
                 session.state = SessionState::ReceivingMailFrom;
             }
@@ -903,6 +917,9 @@ fn unstuff_dot_lines(input: &[u8]) -> Vec<u8> {
 struct SmtpSession {
     state: SessionState,
     email: Email,
+    /// RFC 1870 SIZE from MAIL FROM, if the client declared one; used to
+    /// pre-size the DATA buffer.
+    declared_size: Option<u64>,
 }
 
 impl SmtpSession {
@@ -914,6 +931,7 @@ impl SmtpSession {
                 to: Vec::with_capacity(1),
                 body: Bytes::new(),
             },
+            declared_size: None,
         }
     }
 
@@ -923,6 +941,7 @@ impl SmtpSession {
             to: Vec::with_capacity(1),
             body: Bytes::new(),
         };
+        self.declared_size = None;
         // Reset the state, but keep authentication
         if self.state != SessionState::Connected && self.state != SessionState::Greeted {
             self.state = SessionState::Authenticated;
@@ -1245,6 +1264,33 @@ mod tests {
     /// acknowledged. Each write goes out as one segment.
     async fn run_pipelined_session(writes: &[&[u8]]) -> (String, Vec<Email>) {
         run_session_with(DEFAULT_MAX_MESSAGE_SIZE, writes).await
+    }
+
+    /// MAIL FROM with an RFC 1870 SIZE declaration pre-sizes the DATA
+    /// buffer; the transaction must behave exactly like one without it,
+    /// and a declaration above the limit must not allocate past the cap.
+    #[tokio::test]
+    async fn test_size_declaration_accepted_and_message_delivered() {
+        let (replies, emails) = run_session_with(
+            1024 * 1024,
+            &[
+                b"EHLO client.test\r\n",
+                b"MAIL FROM:<a@example.com> SIZE=4096\r\nRCPT TO:<b@example.org>\r\nDATA\r\n",
+                b"Subject: sized\r\n\r\ndeclared ahead\r\n.\r\n",
+                // Declared far above the server cap: reserve must clamp.
+                b"MAIL FROM:<c@example.com> SIZE=99999999999\r\nRCPT TO:<d@example.org>\r\nDATA\r\n",
+                b"Subject: clamped\r\n\r\nstill fine\r\n.\r\nQUIT\r\n",
+            ],
+        )
+        .await;
+
+        assert_eq!(emails.len(), 2, "both messages must arrive -- {replies:?}");
+        assert!(std::str::from_utf8(&emails[0].body)
+            .unwrap()
+            .contains("declared ahead"));
+        assert!(std::str::from_utf8(&emails[1].body)
+            .unwrap()
+            .contains("still fine"));
     }
 
     async fn run_session_with(max_message_size: usize, writes: &[&[u8]]) -> (String, Vec<Email>) {

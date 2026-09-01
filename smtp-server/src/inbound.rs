@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use miette::{Context, IntoDiagnostic, Result};
-use smtp::compio_stream::{CompioTcpStream, TlsAcceptor};
+use smtp::compio_stream::{accept_tls, CompioTcpStream, TlsAcceptor};
 use smtp::{SmtpServer, SmtpStream};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -187,7 +187,7 @@ async fn accept_loop(
                         // traffic. Bounded so a silent client can't hold a
                         // connection permit forever.
                         Some(acceptor) if tls_mode == config::TlsMode::Implicit => {
-                            match compio::time::timeout(cmd_timeout, acceptor.accept(socket)).await
+                            match compio::time::timeout(cmd_timeout, accept_tls(&acceptor, socket)).await
                             {
                                 Ok(Ok(tls_stream)) => CompioTcpStream::tls(tls_stream),
                                 Ok(Err(e)) => {
