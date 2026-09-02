@@ -1,27 +1,15 @@
-# Build Stage
-FROM rust:1.86 AS builder
+# syntax=docker/dockerfile:1
 
-WORKDIR /usr/src/hedwig
-
-# Copy source code
-COPY . .
-
-# Build the application
-RUN cargo build --release
-
-# Runtime Stage
-FROM ubuntu:latest
-
-# Set working directory
+# ---- Builder ----
+FROM rust:1.88 AS builder
 WORKDIR /app
+COPY . .
+RUN cargo build --release --locked
 
-# Install necessary dependencies
+# ---- Runtime ----
+FROM debian:bookworm-slim
 RUN apt-get update && \
-    apt-get install -y libssl-dev ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
-
-# Copy the compiled binary from the builder stage
-COPY --from=builder /usr/src/hedwig/target/release/hedwig .
-
-# Set the entrypoint
-ENTRYPOINT ["./hedwig"]
+COPY --from=builder /app/target/release/hedwig /usr/local/bin/hedwig
+ENTRYPOINT ["hedwig"]

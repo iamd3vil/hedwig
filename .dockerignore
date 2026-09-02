@@ -1,1 +1,15 @@
 target/
+.git
+.github
+.claude
+docs
+dev
+*.png
+.air.toml
+Justfile
+install.sh
+send_email.py
+config.example.huml
+config.example.toml
+changelog.tpl
+rlsr.yml
