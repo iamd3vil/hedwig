@@ -1,1 +1,11 @@
-target/
+**
+!Cargo.toml
+!Cargo.lock
+!smtp/
+!smtp/Cargo.toml
+!smtp/src/
+!smtp/src/**
+!smtp-server/
+!smtp-server/Cargo.toml
+!smtp-server/src/
+!smtp-server/src/**
