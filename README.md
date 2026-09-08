@@ -28,7 +28,7 @@
 
 ## Docs
 
-Documentation lives at https://hedwig.sarat.dev
+Documentation lives at https://hedwig-mail.dev
 
 ## Install (recommended)
 
