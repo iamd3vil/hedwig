@@ -35,7 +35,7 @@ Documentation lives at https://hedwig-mail.dev
 Download the latest release binary from GitHub Releases:
 
 ```bash
-curl -L -o hedwig.zip https://github.com/iamd3vil/hedwig/releases/download/v0.5.2/hedwig-v0.5.2-linux-x86_64.zip
+curl -L -o hedwig.zip https://github.com/iamd3vil/hedwig/releases/download/v0.12.3/hedwig-v0.12.3-linux-x86_64.zip
 unzip hedwig.zip
 chmod +x hedwig
 ```
@@ -43,8 +43,22 @@ chmod +x hedwig
 Checksums:
 
 ```
-https://github.com/iamd3vil/hedwig/releases/download/v0.5.2/checksums.txt
+https://github.com/iamd3vil/hedwig/releases/download/v0.12.3/checksums.txt
 ```
+
+## Docker
+
+Images are published at `ghcr.io/iamd3vil/hedwig` for Linux AMD64 and ARM64.
+Docker selects the matching architecture automatically:
+
+```bash
+docker pull ghcr.io/iamd3vil/hedwig:0.12.3
+```
+
+Use an exact version for a pinned deployment. The `0.12` and `latest` tags are
+updated by release builds. See the [Docker quickstart](https://hedwig-mail.dev/quickstart#run-with-docker)
+for configuration and persistent storage mounts, and the
+[release workflow guide](https://hedwig-mail.dev/reference/releases) for publishing.
 
 ## Build from source
 
