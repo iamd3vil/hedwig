@@ -29,7 +29,6 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::fs;
 use tracing::{debug, error, info, warn};
 
 use crate::mta_sts::cache::MtaStsResolver;
@@ -37,6 +36,7 @@ use crate::mta_sts::policy::{self as mta_sts_policy, MtaStsEnforcementError, Pol
 use crate::{
     config::CfgDKIM,
     metrics,
+    reload::RuntimeConfig,
     storage::{Status, Storage, StoredEmail},
 };
 
@@ -156,7 +156,7 @@ pub struct Worker {
     resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
 
     pool: Arc<PoolManager>,
-    dkim_signer: Option<DkimSignerType>,
+    runtime: Arc<RuntimeConfig>,
 
     // MX Cache
     mx_cache: Cache<String, MxLookup>,
@@ -181,25 +181,11 @@ impl Worker {
     pub async fn new(
         channel: Receiver<Job>,
         storage: Arc<dyn Storage>,
-        dkim: &Option<CfgDKIM>,
+        runtime: Arc<RuntimeConfig>,
         config: WorkerConfig,
         resources: WorkerResources,
     ) -> Result<Self> {
         info!("Initializing SMTP worker");
-
-        // Create DKIM signer if dkim is enabled.
-        let dkim_signer = match dkim {
-            None => None,
-            Some(dkim) => {
-                let priv_key = fs::read_to_string(&dkim.private_key)
-                    .await
-                    .into_diagnostic()
-                    .wrap_err("reading private key")?;
-
-                let signer = Self::create_dkim_signer(dkim, &priv_key)?;
-                Some(signer)
-            }
-        };
 
         let WorkerResources {
             mx_cache,
@@ -218,13 +204,13 @@ impl Worker {
             disable_outbound: config.disable_outbound,
             initial_delay: Duration::from_secs(60),
             max_delay: Duration::from_secs(60 * 60 * 24),
-            dkim_signer,
+            runtime,
             rate_limiter,
             mta_sts,
         })
     }
 
-    fn create_dkim_signer(dkim: &CfgDKIM, priv_key: &str) -> Result<DkimSignerType> {
+    pub(crate) fn create_dkim_signer(dkim: &CfgDKIM, priv_key: &str) -> Result<DkimSignerType> {
         match dkim.key_type {
             DkimKeyType::Rsa => {
                 let pem = pem::parse(priv_key)
@@ -565,7 +551,8 @@ impl Worker {
     /// Strip Bcc headers and DKIM-sign (when configured), producing the
     /// final outbound bytes with a single copy of the message.
     fn sign_outbound(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let Some(signer) = &self.dkim_signer else {
+        let runtime = self.runtime.load();
+        let Some(signer) = &runtime.dkim_signer else {
             let (out, _) = Self::strip_outbound_headers(body, false, 0)
                 .wrap_err("Failed to remove Bcc header")?;
             return Ok(out);

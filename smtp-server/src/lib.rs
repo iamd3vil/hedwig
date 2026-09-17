@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod migrate;
 pub mod mta_sts;
 pub mod queue_cli;
+pub mod reload;
 pub mod storage;
 pub mod worker;
 

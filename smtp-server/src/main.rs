@@ -6,17 +6,16 @@ use hedwig::storage::{fs_storage::FileSystemStorage, Status, Storage};
 use hedwig::worker::{deferred_worker::DeferredWorker, Job};
 use hedwig::{callbacks, config, dkim, health, logqueue, metrics, queue_cli, worker};
 use miette::{bail, Context, IntoDiagnostic, Result};
-use rustls::pki_types::CertificateDer;
 use smtp::{MaybeTlsStream, SmtpServer, SmtpStream};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tokio_rustls::rustls::{self, ServerConfig};
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Level};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -57,6 +56,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run_server(config_path: &str) -> Result<()> {
+    // Register before config I/O or any other startup work so SIGHUP can
+    // never take the process's default terminating action during startup.
+    let signal_streams = register_signal_streams()?;
     // Load the configuration from the file.
     let cfg = config::Cfg::load(config_path).wrap_err("error loading configuration")?;
 
@@ -68,22 +70,42 @@ async fn run_server(config_path: &str) -> Result<()> {
         .wrap_err("error parsing log level")?;
 
     // Initialize the tracing subscriber
-    let ts = tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_target(false)
-        .with_line_number(false)
-        .with_level(true)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("HEDWIG_LOG_LEVEL").unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(format!("hedwig={}", level))
-            }),
-        );
-
+    let (initial_filter, log_env_override) =
+        match tracing_subscriber::EnvFilter::try_from_env("HEDWIG_LOG_LEVEL") {
+            Ok(filter) => (filter, true),
+            Err(_) => (
+                tracing_subscriber::EnvFilter::new(format!("hedwig={level}")),
+                false,
+            ),
+        };
+    let (filter_layer, log_reload) = tracing_subscriber::reload::Layer::new(initial_filter);
     if cfg.log.format == "json" {
-        ts.json().init();
+        tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_target(false)
+                    .with_line_number(false)
+                    .with_level(true),
+            )
+            .init();
     } else {
-        ts.init();
+        tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_line_number(false)
+                    .with_level(true),
+            )
+            .init();
     }
+
+    let runtime = Arc::new(
+        hedwig::reload::RuntimeConfig::new(cfg.clone())
+            .wrap_err("error preparing runtime configuration")?,
+    );
 
     if cfg.server.dkim.is_some() {
         info!("DKIM is enabled");
@@ -197,42 +219,6 @@ async fn run_server(config_path: &str) -> Result<()> {
         });
         background_tasks.push(handle);
     }
-    // Create TLS acceptors for each listener that has TLS configured
-    let mut tls_acceptors = Vec::new();
-    for listener_config in &cfg.server.listeners {
-        let tls_acceptor = if let Some(tls_config) = &listener_config.tls {
-            let cert_file = tokio::fs::File::open(&tls_config.cert_path)
-                .await
-                .into_diagnostic()
-                .wrap_err("Failed to open certificate file")?;
-            let key_file = tokio::fs::File::open(&tls_config.key_path)
-                .await
-                .into_diagnostic()
-                .wrap_err("Failed to open private key file")?;
-
-            let certs: Vec<CertificateDer<'static>> =
-                rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file.into_std().await))
-                    .collect::<std::io::Result<Vec<_>>>()
-                    .into_diagnostic()?;
-
-            let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-                key_file.into_std().await,
-            ))
-            .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("No private key found"))?;
-
-            let config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .into_diagnostic()?;
-
-            Some(TlsAcceptor::from(Arc::new(config)))
-        } else {
-            None
-        };
-        tls_acceptors.push(tls_acceptor);
-    }
-
     let auth_enabled = cfg.server.auth.is_some();
 
     info!("Auth enabled: {}", auth_enabled);
@@ -286,10 +272,14 @@ async fn run_server(config_path: &str) -> Result<()> {
 
         let tap =
             callbacks::LogQueueTap::new(writers.handle(), spool_root, qcfg.disk_reserve_bytes());
-        let (callbacks, worker_resources, mta_sts_resolver) =
-            callbacks::Callbacks::new_log(Arc::clone(&storage), tap, cfg.clone())
-                .await
-                .wrap_err("failed to initialize SMTP callbacks (log backend)")?;
+        let (callbacks, worker_resources, mta_sts_resolver) = callbacks::Callbacks::new_log(
+            Arc::clone(&storage),
+            tap,
+            cfg.clone(),
+            Arc::clone(&runtime),
+        )
+        .await
+        .wrap_err("failed to initialize SMTP callbacks (log backend)")?;
 
         let gate = Arc::new(worker::log_worker::LimiterGate(
             worker_resources.rate_limiter(),
@@ -317,7 +307,7 @@ async fn run_server(config_path: &str) -> Result<()> {
             let delivery_worker = worker::Worker::new(
                 receiver_channel.clone(), // inert on the log path
                 Arc::clone(&storage),
-                &cfg.server.dkim.clone(),
+                Arc::clone(&runtime),
                 worker::WorkerConfig {
                     disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
                 },
@@ -340,11 +330,12 @@ async fn run_server(config_path: &str) -> Result<()> {
         log_runtime = Some((spool, writers, dispatcher_task));
         (callbacks, handles, mta_sts_resolver)
     } else {
-        callbacks::Callbacks::new(
+        callbacks::Callbacks::new_with_runtime(
             Arc::clone(&storage),
             sender_channel.clone(),
             receiver_channel.clone(),
             cfg.clone(),
+            Arc::clone(&runtime),
         )
         .await
         .wrap_err("failed to initialize SMTP callbacks and workers")?
@@ -455,7 +446,6 @@ async fn run_server(config_path: &str) -> Result<()> {
 
     for (listener, acceptor_index) in listeners {
         let server_clone = smtp_server.clone();
-        let tls_acceptor = tls_acceptors[acceptor_index].clone();
         let tls_mode = cfg.server.listeners[acceptor_index]
             .tls
             .as_ref()
@@ -464,6 +454,7 @@ async fn run_server(config_path: &str) -> Result<()> {
         let shutdown = shutdown_token.clone();
         let listener_addr = cfg.server.listeners[acceptor_index].addr.clone();
         let conn_semaphore = Arc::clone(&conn_semaphore);
+        let runtime = Arc::clone(&runtime);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -501,7 +492,10 @@ async fn run_server(config_path: &str) -> Result<()> {
 
                         debug!("Accepted connection");
                         let server_clone = server_clone.clone();
-                        let tls_acceptor = tls_acceptor.clone();
+                        // Capture the current acceptor for this connection. A
+                        // later reload affects only new accepts, including
+                        // STARTTLS upgrades on those new sessions.
+                        let tls_acceptor = runtime.tls_acceptor(acceptor_index);
 
                         tokio::spawn(async move {
                             // Hold the permit for the lifetime of this connection.
@@ -553,7 +547,14 @@ async fn run_server(config_path: &str) -> Result<()> {
         background_tasks.push(handle);
     }
 
-    wait_for_shutdown_signal().await?;
+    wait_for_shutdown_signal(
+        config_path,
+        runtime,
+        log_reload,
+        log_env_override,
+        signal_streams,
+    )
+    .await?;
     info!("shutdown signal received, beginning graceful shutdown");
 
     // Notify every background task to stop accepting new work, then close the queues to
@@ -602,24 +603,104 @@ async fn run_server(config_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Block until an OS signal such as Ctrl+C (and SIGTERM on Unix) is delivered, giving the
-/// server a clear indication it should begin graceful shutdown.
-async fn wait_for_shutdown_signal() -> Result<()> {
+#[cfg(unix)]
+struct SignalStreams {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg(not(unix))]
+struct SignalStreams;
+
+fn register_signal_streams() -> Result<SignalStreams> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
+        Ok(SignalStreams {
+            interrupt: signal(SignalKind::interrupt())
+                .into_diagnostic()
+                .wrap_err("failed to listen for SIGINT")?,
+            terminate: signal(SignalKind::terminate())
+                .into_diagnostic()
+                .wrap_err("failed to listen for SIGTERM")?,
+            hangup: signal(SignalKind::hangup())
+                .into_diagnostic()
+                .wrap_err("failed to listen for SIGHUP")?,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(SignalStreams)
+    }
+}
 
-        let mut sigterm = signal(SignalKind::terminate())
-            .into_diagnostic()
-            .wrap_err("failed to listen for SIGTERM")?;
-
-        tokio::select! {
-            ctrl_c = tokio::signal::ctrl_c() => {
-                ctrl_c
-                    .into_diagnostic()
-                    .wrap_err("failed to wait for ctrl+c")?;
+/// Block until an OS signal such as Ctrl+C (and SIGTERM on Unix) is delivered, giving the
+/// server a clear indication it should begin graceful shutdown.
+async fn wait_for_shutdown_signal(
+    config_path: &str,
+    runtime: Arc<hedwig::reload::RuntimeConfig>,
+    log_reload: tracing_subscriber::reload::Handle<
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::Registry,
+    >,
+    log_env_override: bool,
+    mut signal_streams: SignalStreams,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        loop {
+            tokio::select! {
+                _ = signal_streams.interrupt.recv() => break,
+                _ = signal_streams.terminate.recv() => break,
+                _ = signal_streams.hangup.recv() => {
+                    let candidate = match config::Cfg::load(config_path) {
+                        Ok(candidate) => candidate,
+                        Err(_) => {
+                            // Config parser reports can contain source lines. Never
+                            // put those (and possible credentials) in the log.
+                            error!("configuration reload failed: invalid configuration file");
+                            continue;
+                        }
+                    };
+                    let result = runtime.reload(candidate, |level| {
+                        if log_env_override {
+                            return Ok(());
+                        }
+                        log_reload
+                            .reload(tracing_subscriber::EnvFilter::new(format!("hedwig={level}")))
+                            .into_diagnostic()
+                            .wrap_err("could not apply reload log level")
+                    });
+                    match result {
+                        Ok(()) => info!("configuration reload completed"),
+                        Err(hedwig::reload::ReloadError::Unsupported(fields)) => {
+                            error!(fields = %fields.join(", "), "configuration reload rejected; restart required")
+                        }
+                        Err(hedwig::reload::ReloadError::Preparation(failure)) => {
+                            if let Some(index) = failure.listener_index {
+                                error!(
+                                    component = failure.component,
+                                    stage = failure.stage,
+                                    listener_index = index,
+                                    "configuration reload failed; previous configuration retained"
+                                );
+                            } else {
+                                error!(
+                                    component = failure.component,
+                                    stage = failure.stage,
+                                    "configuration reload failed; previous configuration retained"
+                                );
+                            }
+                        }
+                        Err(hedwig::reload::ReloadError::LogApply) => error!(
+                            component = "log.level",
+                            stage = "apply",
+                            "configuration reload failed; previous configuration retained"
+                        ),
+                    }
+                }
             }
-            _ = sigterm.recv() => {}
         }
     }
 

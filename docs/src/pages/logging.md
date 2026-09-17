@@ -24,6 +24,11 @@ HEDWIG_LOG_LEVEL=debug hedwig -c config.toml
 
 When `HEDWIG_LOG_LEVEL` is not set, Hedwig defaults to `hedwig=info`.
 
+On Unix, `log.level` is applied by `SIGHUP` configuration reloads. A valid
+`HEDWIG_LOG_LEVEL` remains authoritative across reloads; an invalid environment
+value falls back to the configured level and does not prevent later reloads
+from changing it. Changing `log.format` requires a restart.
+
 ## Formats
 
 Use `fmt` for local development:
