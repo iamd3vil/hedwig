@@ -91,3 +91,31 @@ password = "password2"
 For advanced sections, see [DKIM](/dkim), [MTA-STS](/mta-sts), [Rate limiting](/rate-limiting), [Logging](/logging), [Metrics](/metrics), [Health checks](/health-checks), [Storage](/storage), and [Domain filtering](/domain-filtering).
 
 For a full HUML example, see [HUML configuration example](/reference/huml-example).
+
+## Reloading configuration
+
+On Unix, send the running Hedwig process `SIGHUP` to reload configuration from
+the same path supplied at startup:
+
+```bash
+kill -HUP <hedwig-pid>
+```
+
+A reload atomically updates domain filters, authentication credentials,
+`log.level`, DKIM configuration, and TLS certificate/key files. DKIM may be
+enabled or disabled during a reload. TLS listener addresses, TLS modes, and
+whether a listener uses TLS do not change; existing TLS and STARTTLS sessions
+keep the acceptor captured when they connected, while new connections use the
+new certificate. Existing authenticated SMTP sessions remain authenticated;
+new credentials apply on the next authentication attempt.
+
+All files, keys, certificates, and compiled settings are prepared before the
+new configuration is published. If parsing or preparation fails, or any other
+field changed, Hedwig rejects the whole reload and retains the previous
+configuration. Rejection logs name restart-only fields but never configuration
+values. `HEDWIG_LOG_LEVEL`, when valid, continues to override reloaded
+`log.level` values. The log output format is restart-only.
+
+Preparation failures identify the component and stage that failed, including
+the listener index for TLS errors, without logging credentials or key contents.
+Enabling or disabling authentication still requires a restart.

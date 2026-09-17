@@ -5,14 +5,13 @@ use mailparse::MailAddr;
 ///
 /// This module implements the `SmtpCallbacks` trait, providing the logic for
 /// handling SMTP commands such as `EHLO`, `AUTH`, `MAIL FROM`, `RCPT TO`, and `DATA`.
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use hickory_resolver::{lookup::MxLookup, TokioAsyncResolver};
 use miette::{Context, IntoDiagnostic};
 use moka::{future::Cache, Expiry};
 use smtp::{Email, SmtpCallbacks, SmtpError};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use ulid::Ulid;
@@ -21,6 +20,7 @@ use crate::{
     config::{Cfg, FilterAction, FilterType},
     constant_time_eq, metrics,
     mta_sts::{cache::MtaStsResolver, fetcher::MtaStsFetcher},
+    reload::RuntimeConfig,
     storage::{Status, Storage, StoredEmail},
     worker::{self, Job, Worker},
 };
@@ -98,12 +98,12 @@ impl LogQueueTap {
 /// The domain allow/deny rules for one [`FilterType`], flattened out of
 /// `cfg.filters` and ASCII-lowercased once at construction.
 ///
-/// The config never changes while the server runs, but the filters are
-/// consulted once per `MAIL FROM` and once per `RCPT TO` — up to
+/// Each runtime snapshot compiles these once, but the filters are consulted
+/// once per `MAIL FROM` and once per `RCPT TO` — up to
 /// `MAX_RECIPIENTS` times for a single message — so deriving them per command
 /// is pure allocation and scanning for a fixed answer.
 #[derive(Default)]
-struct DomainFilters {
+pub(crate) struct DomainFilters {
     deny: Vec<String>,
     allow: Vec<String>,
     /// Whether any allow rule of this type was configured. An allow entry with
@@ -113,7 +113,7 @@ struct DomainFilters {
 }
 
 impl DomainFilters {
-    fn build(cfg: &Cfg, is_wanted: impl Fn(&FilterType) -> bool) -> Self {
+    pub(crate) fn build(cfg: &Cfg, is_wanted: impl Fn(&FilterType) -> bool) -> Self {
         let mut this = Self::default();
         for filter in cfg.filters.iter().flatten().filter(|f| is_wanted(&f.typ)) {
             // ASCII-only lowercasing, matching the `eq_ignore_ascii_case`
@@ -133,23 +133,20 @@ impl DomainFilters {
 
     /// `domain` must already be lowercased, as `extract_domain_from_path`
     /// guarantees.
-    fn is_denied(&self, domain: &str) -> bool {
+    pub(crate) fn is_denied(&self, domain: &str) -> bool {
         self.deny.iter().any(|d| d == domain)
     }
 
-    fn is_allowed(&self, domain: &str) -> bool {
+    pub(crate) fn is_allowed(&self, domain: &str) -> bool {
         self.allow.iter().any(|d| d == domain)
     }
 }
 
 /// The Callbacks struct holds the configuration, storage, and sender channel.
 pub struct Callbacks {
-    cfg: Cfg,
-    auth_mapping: Mutex<HashMap<String, String>>,
+    runtime: Arc<RuntimeConfig>,
     storage: Arc<dyn Storage>,
     sender_channel: async_channel::Sender<worker::Job>,
-    from_domain_filters: DomainFilters,
-    to_domain_filters: DomainFilters,
     /// `Some` when the log-queue backend is active: DATA goes to the append
     /// log and the legacy storage/channel path is bypassed.
     log_queue: Option<LogQueueTap>,
@@ -254,6 +251,17 @@ impl Callbacks {
         receiver_channel: async_channel::Receiver<Job>,
         cfg: Cfg,
     ) -> miette::Result<(Self, Vec<JoinHandle<()>>, Arc<MtaStsResolver>)> {
+        let runtime = Arc::new(RuntimeConfig::new(cfg.clone())?);
+        Self::new_with_runtime(storage, sender_channel, receiver_channel, cfg, runtime).await
+    }
+
+    pub async fn new_with_runtime(
+        storage: Arc<dyn Storage>,
+        sender_channel: async_channel::Sender<Job>,
+        receiver_channel: async_channel::Receiver<Job>,
+        cfg: Cfg,
+        runtime: Arc<RuntimeConfig>,
+    ) -> miette::Result<(Self, Vec<JoinHandle<()>>, Arc<MtaStsResolver>)> {
         let (worker_resources, mta_sts_resolver) = build_worker_resources(&cfg)?;
 
         let worker_count = cfg.server.workers.unwrap_or(1).max(1);
@@ -261,7 +269,6 @@ impl Callbacks {
         for worker_index in 0..worker_count {
             let receiver_channel = receiver_channel.clone();
             let storage_cloned = storage.clone();
-            let dkim = cfg.server.dkim.clone();
             let worker_resources = worker_resources.clone();
             let worker_config = worker::WorkerConfig {
                 disable_outbound: cfg.server.disable_outbound.unwrap_or(false),
@@ -269,7 +276,7 @@ impl Callbacks {
             let mut worker = Worker::new(
                 receiver_channel,
                 storage_cloned,
-                &dkim,
+                Arc::clone(&runtime),
                 worker_config,
                 worker_resources,
             )
@@ -281,24 +288,10 @@ impl Callbacks {
             worker_handles.push(handle);
         }
 
-        // Create the auth mapping.
-        let mut auth_mapping = HashMap::new();
-
-        if let Some(auth) = &cfg.server.auth {
-            for auth in auth.iter() {
-                auth_mapping.insert(auth.username.clone(), auth.password.clone());
-            }
-        }
-
         let callbacks = Callbacks {
             storage,
             sender_channel,
-            from_domain_filters: DomainFilters::build(&cfg, |t| {
-                matches!(t, FilterType::FromDomain)
-            }),
-            to_domain_filters: DomainFilters::build(&cfg, |t| matches!(t, FilterType::ToDomain)),
-            cfg,
-            auth_mapping: Mutex::new(auth_mapping),
+            runtime,
             log_queue: None,
         };
 
@@ -313,27 +306,16 @@ impl Callbacks {
         storage: Arc<dyn Storage>,
         tap: LogQueueTap,
         cfg: Cfg,
+        runtime: Arc<RuntimeConfig>,
     ) -> miette::Result<(Self, worker::WorkerResources, Arc<MtaStsResolver>)> {
         let (worker_resources, mta_sts_resolver) = build_worker_resources(&cfg)?;
-
-        let mut auth_mapping = HashMap::new();
-        if let Some(auth) = &cfg.server.auth {
-            for auth in auth.iter() {
-                auth_mapping.insert(auth.username.clone(), auth.password.clone());
-            }
-        }
 
         // The legacy channel field is inert on this path.
         let (sender_channel, _) = async_channel::bounded(1);
         let callbacks = Callbacks {
             storage,
             sender_channel,
-            from_domain_filters: DomainFilters::build(&cfg, |t| {
-                matches!(t, FilterType::FromDomain)
-            }),
-            to_domain_filters: DomainFilters::build(&cfg, |t| matches!(t, FilterType::ToDomain)),
-            cfg,
-            auth_mapping: Mutex::new(auth_mapping),
+            runtime,
             log_queue: Some(tap),
         };
         Ok((callbacks, worker_resources, mta_sts_resolver))
@@ -524,12 +506,8 @@ impl SmtpCallbacks for Callbacks {
 
     // Handles the AUTH command.
     async fn on_auth(&self, username: &str, password: &str) -> Result<bool, SmtpError> {
-        if self.cfg.server.auth.is_none() {
-            return Ok(false);
-        }
-
-        let auth_mapping = self.auth_mapping.lock().await;
-        if let Some(expected_password) = auth_mapping.get(username) {
+        let runtime = self.runtime.load();
+        if let Some(expected_password) = runtime.auth.get(username) {
             let is_valid = constant_time_eq(password.as_bytes(), expected_password.as_bytes());
             return Ok(is_valid);
         }
@@ -548,12 +526,8 @@ impl SmtpCallbacks for Callbacks {
         challenge: &str,
         digest: &str,
     ) -> Result<bool, SmtpError> {
-        if self.cfg.server.auth.is_none() {
-            return Ok(false);
-        }
-
-        let auth_mapping = self.auth_mapping.lock().await;
-        if let Some(password) = auth_mapping.get(username) {
+        let runtime = self.runtime.load();
+        if let Some(password) = runtime.auth.get(username) {
             let expected = cram_md5_digest(password, challenge);
             // RFC 2195 mandates lowercase hex, but accept uppercase too.
             let is_valid =
@@ -570,7 +544,8 @@ impl SmtpCallbacks for Callbacks {
     ) -> Result<(), SmtpError> {
         let from_path = &from_command.address;
         let sender_domain_opt: Option<String> = extract_domain_from_path(from_path);
-        let filters = &self.from_domain_filters;
+        let runtime = self.runtime.load();
+        let filters = &runtime.from_domain_filters;
 
         // Deny wins over allow. A sender with no parsable domain cannot match a
         // deny rule, but it also cannot satisfy an allow list.
@@ -603,7 +578,8 @@ impl SmtpCallbacks for Callbacks {
     // Handles the RCPT TO command.
     async fn on_rcpt_to(&self, rcpt_path: &str) -> Result<(), SmtpError> {
         let recipient_domain_opt: Option<String> = extract_domain_from_path(rcpt_path);
-        let filters = &self.to_domain_filters;
+        let runtime = self.runtime.load();
+        let filters = &runtime.to_domain_filters;
 
         if let Some(ref recipient_domain) = recipient_domain_opt {
             if filters.is_denied(recipient_domain) {
@@ -1347,10 +1323,9 @@ mod tests {
             Callbacks::new(storage, sender, receiver, cfg)
                 .await
                 .expect("callbacks should initialize");
-        let auth_mapping = callbacks.auth_mapping.lock().await;
-        assert_eq!(auth_mapping.get("user1"), Some(&"pass1".to_string()));
-        assert_eq!(auth_mapping.get("user2"), Some(&"pass2".to_string()));
-        drop(auth_mapping);
+        let runtime = callbacks.runtime.load();
+        assert_eq!(runtime.auth.get("user1"), Some(&"pass1".to_string()));
+        assert_eq!(runtime.auth.get("user2"), Some(&"pass2".to_string()));
         for handle in worker_handles {
             // Abort so the worker pool we spawned for the test does not leak.
             handle.abort();
@@ -1537,6 +1512,54 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reload_updates_plain_login_cram_credentials_and_filters() {
+        let mut initial = create_test_config();
+        initial.server.auth = Some(vec![CfgAuth {
+            username: "old-user".into(),
+            password: "old-password".into(),
+        }]);
+        initial.filters = None;
+        let storage = Arc::new(MockStorage {});
+        let (sender, receiver) = async_channel::bounded(100);
+        let (callbacks, handles, _) = Callbacks::new(storage, sender, receiver, initial.clone())
+            .await
+            .unwrap();
+
+        let mut updated = initial;
+        updated.server.auth = Some(vec![CfgAuth {
+            username: "new-user".into(),
+            password: "new-password".into(),
+        }]);
+        updated.filters = Some(vec![CfgFilter {
+            typ: FilterType::FromDomain,
+            domain: vec!["blocked.test".into()],
+            action: FilterAction::Deny,
+        }]);
+        callbacks.runtime.reload(updated, |_| Ok(())).unwrap();
+
+        // PLAIN and LOGIN both use on_auth; CRAM-MD5 uses the same new
+        // snapshot through its challenge-specific callback.
+        assert!(!callbacks.on_auth("old-user", "old-password").await.unwrap());
+        assert!(callbacks.on_auth("new-user", "new-password").await.unwrap());
+        let challenge = "<reload@test>";
+        let digest = cram_md5_digest("new-password", challenge);
+        assert!(callbacks
+            .on_auth_cram_md5("new-user", challenge, &digest)
+            .await
+            .unwrap());
+        assert!(matches!(
+            callbacks
+                .on_mail_from(&create_mail_from_command("a@blocked.test"))
+                .await,
+            Err(SmtpError::MailFromDenied { .. })
+        ));
+
+        for handle in handles {
+            handle.abort();
+        }
     }
 
     #[tokio::test]

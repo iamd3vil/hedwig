@@ -1,12 +1,12 @@
 use config::{Config, File};
 use miette::{IntoDiagnostic, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 use tracing::Level;
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub enum FilterType {
     #[serde(rename = "from_domain_filter")]
     #[default]
@@ -15,7 +15,7 @@ pub enum FilterType {
     ToDomain,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum FilterAction {
     #[default]
@@ -23,7 +23,7 @@ pub enum FilterAction {
     Deny,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Cfg {
     #[serde(default)]
     pub log: CfgLog,
@@ -33,7 +33,7 @@ pub struct Cfg {
     pub queue: Option<CfgQueue>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgServer {
     pub listeners: Vec<CfgListener>,
     pub workers: Option<usize>,
@@ -61,7 +61,7 @@ pub struct CfgServer {
     pub data_timeout: Option<Duration>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgFilter {
     #[serde(rename = "type", default)]
     pub typ: FilterType,
@@ -70,7 +70,7 @@ pub struct CfgFilter {
     pub action: FilterAction,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgStorage {
     /// "log" (durable log queue, the default) or "fs" (legacy one file per
     /// message).
@@ -81,7 +81,7 @@ pub struct CfgStorage {
     pub cleanup: Option<CfgCleanup>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DkimKeyType {
     #[default]
@@ -89,7 +89,7 @@ pub enum DkimKeyType {
     Ed25519,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgLog {
     pub level: String,
     pub format: String,
@@ -104,7 +104,7 @@ impl Default for CfgLog {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgDKIM {
     pub domain: String,
     pub selector: String,
@@ -114,13 +114,14 @@ pub struct CfgDKIM {
     pub key_type: DkimKeyType,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgAuth {
     pub username: String,
+    #[serde(skip_serializing)]
     pub password: String,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct CfgSmtp {
     /// Number of destination MX transports to keep in the process-wide cache.
     pub cache_size: Option<u64>,
@@ -130,13 +131,13 @@ pub struct CfgSmtp {
     pub max_size: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgListener {
     pub addr: String,
     pub tls: Option<CfgTls>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgTls {
     pub cert_path: String,
     pub key_path: String,
@@ -147,7 +148,7 @@ pub struct CfgTls {
     pub mode: TlsMode,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TlsMode {
     #[default]
@@ -155,17 +156,17 @@ pub enum TlsMode {
     Starttls,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgMetrics {
     pub bind: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgHealth {
     pub bind: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgRateLimits {
     #[serde(default)]
     pub enabled: bool,
@@ -174,7 +175,7 @@ pub struct CfgRateLimits {
 }
 
 /// Configuration for on-disk spool cleanup.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CfgCleanup {
     #[serde(default, with = "humantime_serde::option")]
     pub deferred_retention: Option<Duration>,
@@ -186,7 +187,7 @@ pub struct CfgCleanup {
 
 /// Configuration for the durable append-log mail queue (see
 /// docs/plans/2026-07-20-durable-log-queue.md).
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct CfgQueue {
     /// Number of shards / concurrent append writers (default: 1).
     pub append_writers: Option<u16>,
@@ -351,6 +352,19 @@ mod tests {
             .build()
             .expect("build config");
         settings.try_deserialize().expect("deserialize config")
+    }
+
+    #[test]
+    fn auth_password_deserializes_but_is_never_serialized() {
+        let auth: CfgAuth =
+            serde_json::from_str(r#"{"username":"reload-user","password":"candidate-secret"}"#)
+                .unwrap();
+        assert_eq!(auth.password, "candidate-secret");
+
+        let serialized = serde_json::to_string(&auth).unwrap();
+        assert_eq!(serialized, r#"{"username":"reload-user"}"#);
+        assert!(!serialized.contains("candidate-secret"));
+        assert!(!serialized.contains("password"));
     }
 
     #[test]

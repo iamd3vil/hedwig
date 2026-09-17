@@ -71,6 +71,7 @@ prometheus = "0.13"
 crc32fast = "1.4"
 bytes = "1"
 libc = "0.2"
+arc-swap = "1.7"
 
 [dev-dependencies]
 stateright = "0.31.0"
