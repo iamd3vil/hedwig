@@ -178,6 +178,13 @@ pub struct Worker {
 }
 
 impl Worker {
+    fn retry_delay(&self, attempts: u32) -> Duration {
+        std::cmp::min(
+            self.initial_delay * 2_u32.pow(attempts.min(24)),
+            self.max_delay,
+        )
+    }
+
     pub async fn new(
         channel: Receiver<Job>,
         storage: Arc<dyn Storage>,
@@ -855,15 +862,12 @@ impl Worker {
                 if e.downcast_ref::<crate::dkim::UnconfiguredDomain>()
                     .is_some()
                 {
-                    let delay = std::cmp::min(
-                        self.initial_delay * 2_u32.pow(job.attempts.min(24)),
-                        self.max_delay,
-                    );
+                    let delay = self.retry_delay(job.attempts);
                     log_delivery(
                         "deferred",
                         &recipients.join(","),
                         &format!("{e:#}"),
-                        job.attempts,
+                        job.attempts + 1,
                     );
                     metrics::email_deferred();
                     return JobOutcome::Deferred {
@@ -972,10 +976,7 @@ impl Worker {
                     return JobOutcome::RateLimited { retry_after };
                 }
             }
-            let delay = std::cmp::min(
-                self.initial_delay * 2_u32.pow(job.attempts.min(24)),
-                self.max_delay,
-            );
+            let delay = self.retry_delay(job.attempts);
             metrics::email_deferred();
             return JobOutcome::Deferred {
                 next_attempt_ms: Utc::now().timestamp_millis() + delay.as_millis() as i64,

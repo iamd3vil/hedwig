@@ -14,6 +14,7 @@ import runpy
 import smtplib
 import subprocess
 import tempfile
+import time
 import uuid
 
 import dkim
@@ -46,6 +47,7 @@ level = "info"
 format = "json"
 [server]
 workers = 1
+max_retries = 1
 outbound_local = true
 [[server.listeners]]
 addr = "0.0.0.0:2525"
@@ -124,12 +126,21 @@ base_path = "/scratch/spool"
             reload(first)
             before = len(run("docker", "logs", server))
             (scratch / "hold").unlink()
-            wait_for(lambda: "Sending domain second.test is not configured" in run("docker", "logs", server)[before:], "queued domain removal defers")
+            wait_for(lambda: "Sending domain second.test is not configured" in run("docker", "logs", server)[before:], "queued domain removal defers and exhausts retries")
             logs = run("docker", "logs", server)[before:]
             assert '"status":"deferred"' in logs, logs
             assert '"status":"bounced"' not in logs, logs
+            # With one allowed attempt the deferred message must eventually
+            # move to the bounce archive, on both queue implementations.
+            deadline = time.monotonic() + 110
+            while time.monotonic() < deadline:
+                if any(b"pending" in path.read_bytes() for path in (scratch / "spool" / "bounced").rglob("*") if path.is_file()):
+                    break
+                time.sleep(0.5)
+            else:
+                raise AssertionError("removed-domain message did not bounce after retry exhaustion")
             client.quit()
-            print(f"PASS {backend}: RSA/Ed25519 signatures verified, From routing, rejection, rotation, atomic reload, legacy compatibility, queued domain removal defers")
+            print(f"PASS {backend}: RSA/Ed25519 signatures verified, From routing, rejection, rotation, atomic reload, legacy compatibility, queued domain removal defers and exhausts retries")
         except Exception:
             subprocess.run(["docker", "logs", server], check=False)
             raise

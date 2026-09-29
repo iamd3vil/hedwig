@@ -105,11 +105,39 @@ impl Default for CfgLog {
 }
 
 /// A table preserves global signing; an array opts into strict From-domain routing.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
 pub enum CfgDkim {
     Legacy(CfgDKIM),
     Domains(Vec<CfgDKIM>),
+}
+
+// Dispatch by shape so errors inside an entry retain their field diagnostics.
+impl<'de> Deserialize<'de> for CfgDkim {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = CfgDkim;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a DKIM table or an array of DKIM tables")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                CfgDKIM::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(CfgDkim::Legacy)
+            }
+            fn visit_seq<S: serde::de::SeqAccess<'de>>(
+                self,
+                seq: S,
+            ) -> Result<Self::Value, S::Error> {
+                Vec::<CfgDKIM>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(CfgDkim::Domains)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 impl From<CfgDKIM> for CfgDkim {
@@ -366,6 +394,50 @@ mod tests {
             .build()
             .expect("build config");
         settings.try_deserialize().expect("deserialize config")
+    }
+
+    #[test]
+    fn dkim_file_formats_preserve_field_errors() {
+        for extension in ["toml", "huml"] {
+            for array in [false, true] {
+                let source = if extension == "toml" {
+                    format!("{MINIMAL_CFG}\n{}\ndomain = \"example.com\"\nselector = \"default\"\nprivate_key = \"key.pem\"\nkey_type = \"ed25519\"\n",
+                        if array { "[[server.dkim]]" } else { "[server.dkim]" })
+                } else {
+                    let entry = if array {
+                        "    - ::\n      domain: \"example.com\"\n      selector: \"default\"\n      private_key: \"key.pem\"\n      key_type: \"ed25519\"\n"
+                    } else {
+                        "    domain: \"example.com\"\n    selector: \"default\"\n    private_key: \"key.pem\"\n    key_type: \"ed25519\"\n"
+                    };
+                    format!("server::\n  listeners::\n    - ::\n      addr: \"127.0.0.1:2525\"\n  dkim::\n{entry}storage::\n  base_path: \"/tmp/hedwig-test\"\n")
+                };
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join(format!("config.{extension}"));
+                std::fs::write(&path, &source).unwrap();
+                let cfg = Cfg::load(path.to_str().unwrap()).unwrap();
+                assert_eq!(matches!(cfg.server.dkim, Some(CfgDkim::Domains(_))), array);
+                let missing = source
+                    .lines()
+                    .filter(|line| !line.contains("selector"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n";
+                for (invalid, expected) in [
+                    (missing, "missing field `selector`"),
+                    (
+                        source.replace("ed25519", "not-a-key-type"),
+                        "not-a-key-type",
+                    ),
+                ] {
+                    std::fs::write(&path, invalid).unwrap();
+                    let error = format!("{:#}", Cfg::load(path.to_str().unwrap()).unwrap_err());
+                    assert!(
+                        error.contains(expected),
+                        "{extension} array={array}: {error}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -65,6 +65,12 @@ policy, eventually bouncing if the domain is not restored. Disabling DKIM
 entirely stops Hedwig from adding signatures, including to pending mail.
 Already-running signing operations may finish using the previous snapshot.
 
+When switching from a single signer or unsigned relaying to domain-based
+signing, queued messages also undergo the stricter `From:` validation. Messages
+with malformed or ambiguous `From:` headers bounce on their next attempt;
+messages with a valid but unconfigured domain retry. Drain the queue before
+switching if you need pending messages delivered under the previous rules.
+
 For a multi-domain configuration, select the entry when generating its key:
 
 ```bash
@@ -79,6 +85,12 @@ Key generation writes the configured private-key file; publish its DNS record
 before enabling a new identity or rotating the active signer.
 
 ## Generating keys
+
+When overriding a selector or key path, the configured key type remains the
+default. Use `--key-type` to change it explicitly. With a single signing domain,
+overriding `--domain` with a different domain also requires `--private-key` so
+the command does not overwrite the configured domain’s key by default.
+
 
 ```bash
 ./target/release/hedwig dkim-generate
@@ -98,7 +110,7 @@ Available flags:
 - `--domain`: Domain for DKIM signature
 - `--selector`: DKIM selector
 - `--private-key`: Path to save the private key
-- `--key-type`: Key type (rsa or ed25519, default: rsa)
+- `--key-type`: Key type (rsa or ed25519, default: configured key type, or rsa if none)
 
 Add the DNS TXT record output by the command:
 

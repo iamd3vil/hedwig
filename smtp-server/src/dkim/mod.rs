@@ -26,7 +26,17 @@ pub async fn generate_dkim_keys(config_path: &str, args: DkimGenerateArgs) -> Re
 /// Select config defaults without accidentally generating a key for another domain.
 fn key_generation_config(config: Option<&CfgDkim>, args: DkimGenerateArgs) -> Result<CfgDKIM> {
     let defaults = match config {
-        Some(CfgDkim::Legacy(entry)) => Some(entry),
+        Some(CfgDkim::Legacy(entry)) => {
+            if args
+                .domain
+                .as_ref()
+                .is_some_and(|domain| !entry.domain.eq_ignore_ascii_case(domain))
+                && args.private_key.is_none()
+            {
+                bail!("--private-key is required when overriding the configured DKIM domain");
+            }
+            Some(entry)
+        }
         Some(CfgDkim::Domains(entries)) => {
             let domain = args.domain.as_deref().ok_or_else(|| {
                 miette::miette!("--domain is required with multi-domain DKIM configuration")
@@ -37,8 +47,11 @@ fn key_generation_config(config: Option<&CfgDkim>, args: DkimGenerateArgs) -> Re
         }
         None => None,
     };
-    // Preserve the legacy no-flags behavior, including its configured key type.
-    if args.domain.is_none() && args.selector.is_none() && args.private_key.is_none() {
+    if args.domain.is_none()
+        && args.selector.is_none()
+        && args.private_key.is_none()
+        && args.key_type.is_none()
+    {
         return defaults.cloned().ok_or_else(|| {
             miette::miette!("DKIM configuration is missing in config file and no flags provided")
         });
@@ -59,10 +72,7 @@ fn key_generation_config(config: Option<&CfgDkim>, args: DkimGenerateArgs) -> Re
         Some("rsa") => DkimKeyType::Rsa,
         Some("ed25519") => DkimKeyType::Ed25519,
         Some(_) => bail!("Invalid key type. Use 'rsa' or 'ed25519'"),
-        None if matches!(config, Some(CfgDkim::Domains(_))) => {
-            defaults.map(|v| v.key_type.clone()).unwrap_or_default()
-        }
-        None => DkimKeyType::Rsa,
+        None => defaults.map(|v| v.key_type.clone()).unwrap_or_default(),
     };
     Ok(CfgDKIM {
         domain,
@@ -280,6 +290,56 @@ mod tests {
                 "accepted {header}"
             );
         }
+    }
+
+    #[test]
+    fn key_generation_preserves_algorithm_and_requires_new_domain_path() {
+        let config = CfgDkim::Legacy(CfgDKIM {
+            domain: "example.com".into(),
+            selector: "old".into(),
+            private_key: "live.pem".into(),
+            key_type: DkimKeyType::Ed25519,
+        });
+        let args = || DkimGenerateArgs {
+            domain: None,
+            selector: Some("new".into()),
+            private_key: None,
+            key_type: None,
+        };
+        assert!(matches!(
+            key_generation_config(Some(&config), args())
+                .unwrap()
+                .key_type,
+            DkimKeyType::Ed25519
+        ));
+        let mut explicit = args();
+        explicit.selector = None;
+        explicit.key_type = Some("rsa".into());
+        assert!(matches!(
+            key_generation_config(Some(&config), explicit)
+                .unwrap()
+                .key_type,
+            DkimKeyType::Rsa
+        ));
+        let mut other = args();
+        other.domain = Some("other.com".into());
+        assert!(key_generation_config(Some(&config), other)
+            .unwrap_err()
+            .to_string()
+            .contains("--private-key"));
+        let mut other = args();
+        other.domain = Some("other.com".into());
+        other.private_key = Some("other.pem".into());
+        let selected = key_generation_config(Some(&config), other).unwrap();
+        assert_eq!(selected.private_key, "other.pem");
+        let mut same = args();
+        same.domain = Some("EXAMPLE.COM".into());
+        assert_eq!(
+            key_generation_config(Some(&config), same)
+                .unwrap()
+                .private_key,
+            "live.pem"
+        );
     }
 
     #[test]

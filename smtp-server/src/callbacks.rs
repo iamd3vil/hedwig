@@ -1663,6 +1663,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_from_never_reaches_storage_or_worker_channel() {
+        use crate::config::{CfgDKIM, CfgDkim, DkimKeyType};
+        use futures::StreamExt;
+        let mut cfg = create_test_config();
+        cfg.server.dkim = Some(CfgDkim::Domains(vec![CfgDKIM {
+            domain: "example.com".into(),
+            selector: "default".into(),
+            private_key: format!(
+                "{}/../dev/certs/dkim-private.pem",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            key_type: DkimKeyType::Rsa,
+        }]));
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            crate::storage::fs_storage::FileSystemStorage::new(directory.path().to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let (sender_channel, receiver) = async_channel::unbounded();
+        let callbacks = Callbacks {
+            runtime: Arc::new(RuntimeConfig::new(cfg).unwrap()),
+            storage: storage.clone(),
+            sender_channel,
+            log_queue: None,
+        };
+        for headers in [
+            "From: a@unknown.com",
+            "From: a@example.com\r\nFrom: b@example.com",
+        ] {
+            let result = callbacks
+                .on_data(Email {
+                    from: "bounce@example.com".into(),
+                    to: vec!["r@example.com".into()],
+                    body: format!("{headers}\r\n\r\nbody").into(),
+                })
+                .await;
+            assert!(matches!(result, Err(SmtpError::DataRejected { .. })));
+            assert!(receiver.is_empty());
+            assert!(storage.list(Status::Queued).next().await.is_none());
+        }
+        callbacks
+            .on_data(Email {
+                from: "bounce@other.com".into(),
+                to: vec!["r@example.com".into()],
+                body: "From: a@example.com\r\n\r\nbody".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(receiver.len(), 1);
+        assert!(storage.list(Status::Queued).next().await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
     async fn test_on_data() {
         // Test on_data method (lines 339-341)
         let callbacks = create_test_callbacks(None).await;

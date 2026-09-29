@@ -47,6 +47,7 @@ pub struct PreparationError {
     pub component: &'static str,
     pub stage: &'static str,
     pub listener_index: Option<usize>,
+    pub dkim_index: Option<usize>,
 }
 
 impl PreparationError {
@@ -55,6 +56,7 @@ impl PreparationError {
             component,
             stage,
             listener_index: None,
+            dkim_index: None,
         }
     }
 
@@ -63,12 +65,20 @@ impl PreparationError {
             component,
             stage,
             listener_index: Some(index),
+            dkim_index: None,
         }
     }
 }
 
 impl std::fmt::Display for PreparationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(index) = self.dkim_index {
+            return write!(
+                formatter,
+                "{} {} for DKIM entry {index}",
+                self.component, self.stage
+            );
+        }
         match self.listener_index {
             Some(index) => write!(
                 formatter,
@@ -151,7 +161,7 @@ impl RuntimeSnapshot {
                 if entries.is_empty() {
                     return Err(PreparationError::new("server.dkim", "empty domain list"));
                 }
-                for entry in entries {
+                for (index, entry) in entries.iter().enumerate() {
                     let domain = crate::dkim::normalize_domain(&entry.domain).ok_or_else(|| {
                         PreparationError::new("server.dkim.domain", "invalid domain")
                     })?;
@@ -163,7 +173,13 @@ impl RuntimeSnapshot {
                     }
                     let mut entry = entry.clone();
                     entry.domain = domain.clone();
-                    domains.insert(domain, load_signer(&entry)?);
+                    domains.insert(
+                        domain,
+                        load_signer(&entry).map_err(|mut error| {
+                            error.dkim_index = Some(index);
+                            error
+                        })?,
+                    );
                 }
                 (None, Some(domains))
             }
@@ -506,6 +522,7 @@ mod tests {
                 component: "log.level",
                 stage: "parse",
                 listener_index: None,
+                dkim_index: None,
             }))
         ));
         assert_snapshot_retained(&runtime, &before);
@@ -531,6 +548,7 @@ mod tests {
                 component: "server.dkim.private_key",
                 stage: "read",
                 listener_index: None,
+                dkim_index: None,
             }))
         ));
         assert_snapshot_retained(&runtime, &before);
@@ -559,6 +577,7 @@ mod tests {
                 component: "server.dkim.private_key",
                 stage: "parse",
                 listener_index: None,
+                dkim_index: None,
             })
         ));
         assert!(!format!("{error:?}").contains("candidate-secret"));
@@ -641,7 +660,12 @@ mod tests {
         let mut broken = entry("third.com");
         broken.private_key = "/missing/key".into();
         bad.server.dkim = Some(CfgDkim::Domains(vec![entry("example.com"), broken]));
-        assert!(runtime.reload(bad, |_| Ok(())).is_err());
+        let Err(ReloadError::Preparation(error)) = runtime.reload(bad, |_| Ok(())) else {
+            panic!("expected key failure")
+        };
+        assert_eq!(error.dkim_index, Some(1));
+        assert!(error.to_string().contains("DKIM entry 1"));
+        assert!(!error.to_string().contains("/missing/key"));
         assert_snapshot_retained(&runtime, &before);
         let mut changed = initial.clone();
         let mut rotated = entry("example.com");
@@ -686,6 +710,7 @@ mod tests {
                 component: "server.listeners.tls.certificate",
                 stage: "read",
                 listener_index: Some(0),
+                dkim_index: None,
             }))
         ));
         assert_snapshot_retained(&runtime, &before);
@@ -713,6 +738,7 @@ mod tests {
                 component: "server.listeners.tls.certificate",
                 stage: "parse",
                 listener_index: Some(0),
+                dkim_index: None,
             })
         ));
         assert!(!format!("{error:?}").contains("candidate-secret"));
