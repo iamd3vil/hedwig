@@ -70,6 +70,17 @@ username = "user2"
 password = "password2"
 
 # Optional DKIM configuration
+# Sign every outgoing message using this domain and key.
+# For strict From-domain selection, replace this table with one or more
+# [[server.dkim]] entries (see docs/src/pages/dkim.md). Example:
+# [[server.dkim]]
+# domain = "example.com"
+# selector = "default"
+# private_key = "/etc/hedwig/dkim/example.com.key"
+# [[server.dkim]]
+# domain = "another.com"
+# selector = "default"
+# private_key = "/etc/hedwig/dkim/another.com.key"
 [server.dkim]
 domain = "example.com"
 selector = "default"

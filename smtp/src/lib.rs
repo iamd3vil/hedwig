@@ -162,6 +162,10 @@ pub enum SmtpError {
     #[error("Mail rejected: {message}")]
     RcptToDenied { message: String },
 
+    /// A permanent message policy failure after DATA.
+    #[error("Message rejected: {message}")]
+    DataRejected { message: String },
+
     #[error("Authentication error")]
     #[diagnostic(code(smtp::auth_error))]
     AuthError,
@@ -690,10 +694,19 @@ impl SmtpServer {
                 }
                 data_buffer.clear();
                 *data_scanned = 0;
-                self.callbacks
+                match self
+                    .callbacks
                     .on_data(std::mem::take(&mut session.email))
-                    .await?;
-                stream.write_line(b"250 OK\r\n").await?;
+                    .await
+                {
+                    Ok(()) => stream.write_line(b"250 OK\r\n").await?,
+                    Err(SmtpError::DataRejected { message }) => {
+                        stream
+                            .write_line(format!("550 {message}\r\n").as_bytes())
+                            .await?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
                 session.state = SessionState::Authenticated;
             }
             None => {

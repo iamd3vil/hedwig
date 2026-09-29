@@ -39,7 +39,7 @@ pub struct CfgServer {
     pub workers: Option<usize>,
     pub max_retries: Option<u32>,
     pub auth: Option<Vec<CfgAuth>>,
-    pub dkim: Option<CfgDKIM>,
+    pub dkim: Option<CfgDkim>,
     pub disable_outbound: Option<bool>,
     pub outbound_local: Option<bool>,
     pub helo_hostname: Option<String>,
@@ -101,6 +101,20 @@ impl Default for CfgLog {
             level: Level::INFO.to_string(),
             format: "fmt".to_string(),
         }
+    }
+}
+
+/// A table preserves global signing; an array opts into strict From-domain routing.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+pub enum CfgDkim {
+    Legacy(CfgDKIM),
+    Domains(Vec<CfgDKIM>),
+}
+
+impl From<CfgDKIM> for CfgDkim {
+    fn from(value: CfgDKIM) -> Self {
+        Self::Legacy(value)
     }
 }
 

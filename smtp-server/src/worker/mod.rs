@@ -384,6 +384,12 @@ impl Worker {
                 // generic display — same as before for non-SMTP failures.
                 let (outcome, smtp_response) = match e.downcast_ref::<ClassifiedSendError>() {
                     Some(c) => (c.outcome, c.smtp_response.clone()),
+                    None if e
+                        .downcast_ref::<crate::dkim::UnconfiguredDomain>()
+                        .is_some() =>
+                    {
+                        (SendOutcome::Defer, format!("{e:#}"))
+                    }
                     None => (SendOutcome::Bounce, format!("{:#}", e)),
                 };
 
@@ -552,7 +558,7 @@ impl Worker {
     /// final outbound bytes with a single copy of the message.
     fn sign_outbound(&self, body: &[u8]) -> Result<Vec<u8>> {
         let runtime = self.runtime.load();
-        let Some(signer) = &runtime.dkim_signer else {
+        let Some(signer) = runtime.signer_for(body)? else {
             let (out, _) = Self::strip_outbound_headers(body, false, 0)
                 .wrap_err("Failed to remove Bcc header")?;
             return Ok(out);
@@ -846,6 +852,26 @@ impl Worker {
         let raw_email = match self.sign_outbound(body) {
             Ok(raw) => raw,
             Err(e) => {
+                if e.downcast_ref::<crate::dkim::UnconfiguredDomain>()
+                    .is_some()
+                {
+                    let delay = std::cmp::min(
+                        self.initial_delay * 2_u32.pow(job.attempts.min(24)),
+                        self.max_delay,
+                    );
+                    log_delivery(
+                        "deferred",
+                        &recipients.join(","),
+                        &format!("{e:#}"),
+                        job.attempts,
+                    );
+                    metrics::email_deferred();
+                    return JobOutcome::Deferred {
+                        next_attempt_ms: Utc::now().timestamp_millis() + delay.as_millis() as i64,
+                        remaining_recipients: recipients.to_vec(),
+                        error: format!("preparing outbound message: {e:#}"),
+                    };
+                }
                 return self
                     .bounce_claim(job, body, format!("preparing outbound message: {e:#}"))
                     .await;

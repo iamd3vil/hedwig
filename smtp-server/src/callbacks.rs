@@ -609,6 +609,12 @@ impl SmtpCallbacks for Callbacks {
 
     // Handles the DATA command.
     async fn on_data(&self, email: Email) -> Result<(), SmtpError> {
+        self.runtime
+            .load()
+            .signer_for(&email.body)
+            .map_err(|error| SmtpError::DataRejected {
+                message: format!("5.7.1 {error}"),
+            })?;
         self.process_email(email).await?;
         Ok(())
     }
