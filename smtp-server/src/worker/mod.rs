@@ -177,6 +177,15 @@ pub struct Worker {
     mta_sts: Arc<MtaStsResolver>,
 }
 
+/// Bound the exponent before computing it, including for configurations that
+/// allow more than 32 retries. Both queue backends use the same ceiling.
+fn retry_delay(initial_delay: Duration, max_delay: Duration, attempts: u32) -> Duration {
+    std::cmp::min(
+        initial_delay.saturating_mul(2_u32.pow(attempts.min(24))),
+        max_delay,
+    )
+}
+
 impl Worker {
     pub async fn new(
         channel: Receiver<Job>,
@@ -384,6 +393,12 @@ impl Worker {
                 // generic display — same as before for non-SMTP failures.
                 let (outcome, smtp_response) = match e.downcast_ref::<ClassifiedSendError>() {
                     Some(c) => (c.outcome, c.smtp_response.clone()),
+                    None if e
+                        .downcast_ref::<crate::dkim::UnconfiguredDomain>()
+                        .is_some() =>
+                    {
+                        (SendOutcome::Defer, format!("{e:#}"))
+                    }
                     None => (SendOutcome::Bounce, format!("{:#}", e)),
                 };
 
@@ -442,8 +457,7 @@ impl Worker {
     }
 
     async fn defer_email(&self, job: &Job, smtp_response: &str) -> Result<()> {
-        let delay = self.initial_delay * (2_u32.pow(job.attempts));
-        let delay = std::cmp::min(delay, self.max_delay);
+        let delay = retry_delay(self.initial_delay, self.max_delay, job.attempts);
 
         info!(
             msg_id = ?job.job_id,
@@ -552,7 +566,7 @@ impl Worker {
     /// final outbound bytes with a single copy of the message.
     fn sign_outbound(&self, body: &[u8]) -> Result<Vec<u8>> {
         let runtime = self.runtime.load();
-        let Some(signer) = &runtime.dkim_signer else {
+        let Some(signer) = runtime.signer_for(body)? else {
             let (out, _) = Self::strip_outbound_headers(body, false, 0)
                 .wrap_err("Failed to remove Bcc header")?;
             return Ok(out);
@@ -846,6 +860,23 @@ impl Worker {
         let raw_email = match self.sign_outbound(body) {
             Ok(raw) => raw,
             Err(e) => {
+                if e.downcast_ref::<crate::dkim::UnconfiguredDomain>()
+                    .is_some()
+                {
+                    let delay = retry_delay(self.initial_delay, self.max_delay, job.attempts);
+                    log_delivery(
+                        "deferred",
+                        &recipients.join(","),
+                        &format!("{e:#}"),
+                        job.attempts + 1,
+                    );
+                    metrics::email_deferred();
+                    return JobOutcome::Deferred {
+                        next_attempt_ms: Utc::now().timestamp_millis() + delay.as_millis() as i64,
+                        remaining_recipients: recipients.to_vec(),
+                        error: format!("preparing outbound message: {e:#}"),
+                    };
+                }
                 return self
                     .bounce_claim(job, body, format!("preparing outbound message: {e:#}"))
                     .await;
@@ -946,10 +977,7 @@ impl Worker {
                     return JobOutcome::RateLimited { retry_after };
                 }
             }
-            let delay = std::cmp::min(
-                self.initial_delay * 2_u32.pow(job.attempts.min(24)),
-                self.max_delay,
-            );
+            let delay = retry_delay(self.initial_delay, self.max_delay, job.attempts);
             metrics::email_deferred();
             return JobOutcome::Deferred {
                 next_attempt_ms: Utc::now().timestamp_millis() + delay.as_millis() as i64,
@@ -1266,6 +1294,17 @@ mod tests {
     use super::*;
     use crate::config::{CfgDKIM, DkimKeyType};
     use std::str;
+
+    #[test]
+    fn retry_backoff_caps_large_attempt_counts_without_overflow() {
+        let initial = Duration::from_secs(60);
+        let maximum = Duration::from_secs(86400);
+        assert_eq!(retry_delay(initial, maximum, 0), initial);
+        assert_eq!(retry_delay(initial, maximum, 1), Duration::from_secs(120));
+        for attempts in [11, 24, 31, 32, 64, u32::MAX] {
+            assert_eq!(retry_delay(initial, maximum, attempts), maximum);
+        }
+    }
 
     #[test]
     fn test_create_dkim_signer_accepts_pkcs1_rsa_pem() {

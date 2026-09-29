@@ -15,7 +15,7 @@ use tracing::Level;
 
 use crate::{
     callbacks::DomainFilters,
-    config::{Cfg, FilterType},
+    config::{Cfg, CfgDkim, FilterType},
     worker::{DkimSignerType, Worker},
 };
 
@@ -25,6 +25,7 @@ pub(crate) struct RuntimeSnapshot {
     pub(crate) to_domain_filters: DomainFilters,
     pub(crate) auth: HashMap<String, String>,
     pub(crate) dkim_signer: Option<DkimSignerType>,
+    pub(crate) dkim_domains: Option<HashMap<String, DkimSignerType>>,
     tls_acceptors: Vec<Option<TlsAcceptor>>,
     log_level: Level,
 }
@@ -46,6 +47,7 @@ pub struct PreparationError {
     pub component: &'static str,
     pub stage: &'static str,
     pub listener_index: Option<usize>,
+    pub dkim_index: Option<usize>,
 }
 
 impl PreparationError {
@@ -54,7 +56,13 @@ impl PreparationError {
             component,
             stage,
             listener_index: None,
+            dkim_index: None,
         }
+    }
+
+    fn at_dkim_entry(mut self, index: usize) -> Self {
+        self.dkim_index = Some(index);
+        self
     }
 
     fn listener(component: &'static str, stage: &'static str, index: usize) -> Self {
@@ -62,12 +70,20 @@ impl PreparationError {
             component,
             stage,
             listener_index: Some(index),
+            dkim_index: None,
         }
     }
 }
 
 impl std::fmt::Display for PreparationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(index) = self.dkim_index {
+            return write!(
+                formatter,
+                "{} {} for DKIM entry {index}",
+                self.component, self.stage
+            );
+        }
         match self.listener_index {
             Some(index) => write!(
                 formatter,
@@ -137,16 +153,41 @@ impl RuntimeSnapshot {
             .flatten()
             .map(|a| (a.username.clone(), a.password.clone()))
             .collect();
-        let dkim_signer = match &cfg.server.dkim {
-            Some(dkim) => {
-                let key = std::fs::read_to_string(&dkim.private_key)
-                    .map_err(|_| PreparationError::new("server.dkim.private_key", "read"))?;
-                Some(
-                    Worker::create_dkim_signer(dkim, &key)
-                        .map_err(|_| PreparationError::new("server.dkim.private_key", "parse"))?,
-                )
+        let load_signer = |dkim: &crate::config::CfgDKIM| {
+            let key = std::fs::read_to_string(&dkim.private_key)
+                .map_err(|_| PreparationError::new("server.dkim.private_key", "read"))?;
+            Worker::create_dkim_signer(dkim, &key)
+                .map_err(|_| PreparationError::new("server.dkim.private_key", "parse"))
+        };
+        let (dkim_signer, dkim_domains) = match &cfg.server.dkim {
+            Some(CfgDkim::Legacy(dkim)) => (Some(load_signer(dkim)?), None),
+            Some(CfgDkim::Domains(entries)) => {
+                let mut domains = HashMap::new();
+                if entries.is_empty() {
+                    return Err(PreparationError::new("server.dkim", "empty domain list"));
+                }
+                for (index, entry) in entries.iter().enumerate() {
+                    let domain = crate::dkim::normalize_domain(&entry.domain).ok_or_else(|| {
+                        PreparationError::new("server.dkim.domain", "invalid domain")
+                            .at_dkim_entry(index)
+                    })?;
+                    if domains.contains_key(&domain) {
+                        return Err(PreparationError::new(
+                            "server.dkim.domain",
+                            "duplicate domain",
+                        )
+                        .at_dkim_entry(index));
+                    }
+                    let mut entry = entry.clone();
+                    entry.domain = domain.clone();
+                    domains.insert(
+                        domain,
+                        load_signer(&entry).map_err(|error| error.at_dkim_entry(index))?,
+                    );
+                }
+                (None, Some(domains))
             }
-            None => None,
+            None => (None, None),
         };
         let tls_acceptors = cfg
             .server
@@ -168,6 +209,7 @@ impl RuntimeSnapshot {
             to_domain_filters: DomainFilters::build(&cfg, |t| matches!(t, FilterType::ToDomain)),
             auth,
             dkim_signer,
+            dkim_domains,
             tls_acceptors,
             log_level,
             cfg,
@@ -227,7 +269,10 @@ fn unsupported_changes(old: &Cfg, new: &Cfg) -> Result<Vec<String>> {
         if path == "log.level" || path == "filters" || path.starts_with("filters[") {
             return false;
         }
-        if path == "server.dkim" || path.starts_with("server.dkim.") {
+        if path == "server.dkim"
+            || path.starts_with("server.dkim.")
+            || path.starts_with("server.dkim[")
+        {
             return false;
         }
         if auth_reloadable && (path == "server.auth" || path.starts_with("server.auth[")) {
@@ -441,12 +486,15 @@ mod tests {
         let before = runtime.current.load_full();
         let mut new = cfg();
         new.server.workers = Some(99);
-        new.server.dkim = Some(CfgDKIM {
-            domain: "example.test".into(),
-            selector: "new".into(),
-            private_key: "/definitely/missing/dkim.pem".into(),
-            key_type: DkimKeyType::Rsa,
-        });
+        new.server.dkim = Some(
+            CfgDKIM {
+                domain: "example.test".into(),
+                selector: "new".into(),
+                private_key: "/definitely/missing/dkim.pem".into(),
+                key_type: DkimKeyType::Rsa,
+            }
+            .into(),
+        );
         let error = runtime.reload(new, |_| Ok(())).unwrap_err();
         assert!(matches!(
             error,
@@ -478,6 +526,7 @@ mod tests {
                 component: "log.level",
                 stage: "parse",
                 listener_index: None,
+                dkim_index: None,
             }))
         ));
         assert_snapshot_retained(&runtime, &before);
@@ -488,18 +537,22 @@ mod tests {
         let runtime = RuntimeConfig::new(cfg()).unwrap();
         let before = runtime.current.load_full();
         let mut new = cfg();
-        new.server.dkim = Some(CfgDKIM {
-            domain: "example.test".into(),
-            selector: "new".into(),
-            private_key: "/definitely/missing/dkim.pem".into(),
-            key_type: DkimKeyType::Rsa,
-        });
+        new.server.dkim = Some(
+            CfgDKIM {
+                domain: "example.test".into(),
+                selector: "new".into(),
+                private_key: "/definitely/missing/dkim.pem".into(),
+                key_type: DkimKeyType::Rsa,
+            }
+            .into(),
+        );
         assert!(matches!(
             runtime.reload(new, |_| Ok(())),
             Err(ReloadError::Preparation(PreparationError {
                 component: "server.dkim.private_key",
                 stage: "read",
                 listener_index: None,
+                dkim_index: None,
             }))
         ));
         assert_snapshot_retained(&runtime, &before);
@@ -512,12 +565,15 @@ mod tests {
         let runtime = RuntimeConfig::new(cfg()).unwrap();
         let before = runtime.current.load_full();
         let mut new = cfg();
-        new.server.dkim = Some(CfgDKIM {
-            domain: "example.test".into(),
-            selector: "new".into(),
-            private_key: key.path().to_string_lossy().into_owned(),
-            key_type: DkimKeyType::Rsa,
-        });
+        new.server.dkim = Some(
+            CfgDKIM {
+                domain: "example.test".into(),
+                selector: "new".into(),
+                private_key: key.path().to_string_lossy().into_owned(),
+                key_type: DkimKeyType::Rsa,
+            }
+            .into(),
+        );
         let error = runtime.reload(new, |_| Ok(())).unwrap_err();
         assert!(matches!(
             error,
@@ -525,6 +581,7 @@ mod tests {
                 component: "server.dkim.private_key",
                 stage: "parse",
                 listener_index: None,
+                dkim_index: None,
             })
         ));
         assert!(!format!("{error:?}").contains("candidate-secret"));
@@ -534,18 +591,27 @@ mod tests {
     #[test]
     fn dkim_rotation_disable_and_reenable_publish_atomically() {
         let mut initial = cfg();
-        initial.server.dkim = Some(CfgDKIM {
-            domain: "example.test".into(),
-            selector: "one".into(),
-            private_key: fixture("dkim-private.pem"),
-            key_type: DkimKeyType::Rsa,
-        });
+        initial.server.dkim = Some(
+            CfgDKIM {
+                domain: "example.test".into(),
+                selector: "one".into(),
+                private_key: fixture("dkim-private.pem"),
+                key_type: DkimKeyType::Rsa,
+            }
+            .into(),
+        );
         let runtime = RuntimeConfig::new(initial.clone()).unwrap();
         let mut rotated = initial.clone();
-        rotated.server.dkim.as_mut().unwrap().selector = "two".into();
+        let Some(CfgDkim::Legacy(entry)) = &mut rotated.server.dkim else {
+            panic!("legacy config")
+        };
+        entry.selector = "two".into();
         runtime.reload(rotated, |_| Ok(())).unwrap();
         assert_eq!(
-            runtime.load().cfg.server.dkim.as_ref().unwrap().selector,
+            match runtime.load().cfg.server.dkim.as_ref().unwrap() {
+                CfgDkim::Legacy(entry) => entry.selector.clone(),
+                _ => panic!("legacy config"),
+            },
             "two"
         );
         let mut disabled = initial.clone();
@@ -554,6 +620,81 @@ mod tests {
         assert!(runtime.load().dkim_signer.is_none());
         runtime.reload(initial, |_| Ok(())).unwrap();
         assert!(runtime.load().dkim_signer.is_some());
+    }
+
+    #[test]
+    fn multi_domain_selection_reload_and_validation() {
+        let entry = |domain: &str| CfgDKIM {
+            domain: domain.into(),
+            selector: "one".into(),
+            private_key: fixture("dkim-private.pem"),
+            key_type: DkimKeyType::Rsa,
+        };
+        let mut initial = cfg();
+        initial.server.dkim = Some(CfgDkim::Domains(vec![
+            entry("EXAMPLE.com"),
+            entry("another.com"),
+        ]));
+        let runtime = RuntimeConfig::new(initial.clone()).unwrap();
+        let body = |domain| format!("From: Sender <user@{domain}>\r\n\r\nhello").into_bytes();
+        for domain in ["example.com", "EXAMPLE.COM", "another.com"] {
+            assert!(runtime.load().signer_for(&body(domain)).unwrap().is_some());
+        }
+        for domain in ["unknown.com", "news.example.com"] {
+            assert!(runtime
+                .load()
+                .signer_for(&body(domain))
+                .err()
+                .unwrap()
+                .downcast_ref::<crate::dkim::UnconfiguredDomain>()
+                .is_some());
+        }
+        let before = runtime.current.load_full();
+        for (entries, expected_index) in [
+            (vec![], None),
+            (vec![entry("example.com"), entry("EXAMPLE.COM")], Some(1)),
+            (vec![entry("example.com"), entry("*.example.com")], Some(1)),
+        ] {
+            let mut bad = initial.clone();
+            bad.server.dkim = Some(CfgDkim::Domains(entries));
+            let Err(ReloadError::Preparation(error)) = runtime.reload(bad, |_| Ok(())) else {
+                panic!("expected domain validation failure")
+            };
+            assert_eq!(error.dkim_index, expected_index);
+            assert_snapshot_retained(&runtime, &before);
+        }
+        let mut bad = initial.clone();
+        let mut broken = entry("third.com");
+        broken.private_key = "/missing/key".into();
+        bad.server.dkim = Some(CfgDkim::Domains(vec![entry("example.com"), broken]));
+        let Err(ReloadError::Preparation(error)) = runtime.reload(bad, |_| Ok(())) else {
+            panic!("expected key failure")
+        };
+        assert_eq!(error.dkim_index, Some(1));
+        assert!(error.to_string().contains("DKIM entry 1"));
+        assert!(!error.to_string().contains("/missing/key"));
+        assert_snapshot_retained(&runtime, &before);
+        let mut changed = initial.clone();
+        let mut rotated = entry("example.com");
+        rotated.selector = "two".into();
+        changed.server.dkim = Some(CfgDkim::Domains(vec![rotated]));
+        runtime.reload(changed, |_| Ok(())).unwrap();
+        assert!(runtime.load().signer_for(&body("another.com")).is_err());
+        // Existing readers keep their complete snapshot through replacement.
+        assert!(before.signer_for(&body("another.com")).unwrap().is_some());
+        let mut legacy = initial;
+        legacy.server.dkim = Some(entry("example.com").into());
+        runtime.reload(legacy, |_| Ok(())).unwrap();
+        assert!(runtime
+            .load()
+            .signer_for(&body("unknown.com"))
+            .unwrap()
+            .is_some());
+        assert!(runtime
+            .load()
+            .signer_for(b"no From header")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -576,6 +717,7 @@ mod tests {
                 component: "server.listeners.tls.certificate",
                 stage: "read",
                 listener_index: Some(0),
+                dkim_index: None,
             }))
         ));
         assert_snapshot_retained(&runtime, &before);
@@ -603,6 +745,7 @@ mod tests {
                 component: "server.listeners.tls.certificate",
                 stage: "parse",
                 listener_index: Some(0),
+                dkim_index: None,
             })
         ));
         assert!(!format!("{error:?}").contains("candidate-secret"));

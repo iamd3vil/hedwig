@@ -162,6 +162,10 @@ pub enum SmtpError {
     #[error("Mail rejected: {message}")]
     RcptToDenied { message: String },
 
+    /// A permanent message policy failure after DATA.
+    #[error("Message rejected: {message}")]
+    DataRejected { message: String },
+
     #[error("Authentication error")]
     #[diagnostic(code(smtp::auth_error))]
     AuthError,
@@ -690,10 +694,19 @@ impl SmtpServer {
                 }
                 data_buffer.clear();
                 *data_scanned = 0;
-                self.callbacks
+                match self
+                    .callbacks
                     .on_data(std::mem::take(&mut session.email))
-                    .await?;
-                stream.write_line(b"250 OK\r\n").await?;
+                    .await
+                {
+                    Ok(()) => stream.write_line(b"250 OK\r\n").await?,
+                    Err(SmtpError::DataRejected { message }) => {
+                        stream
+                            .write_line(format!("550 {message}\r\n").as_bytes())
+                            .await?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
                 session.state = SessionState::Authenticated;
             }
             None => {
@@ -1177,6 +1190,7 @@ mod tests {
 
     struct RecordingCallbacks {
         emails: StdMutex<Vec<Email>>,
+        reject_first: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -1197,6 +1211,14 @@ mod tests {
             Ok(())
         }
         async fn on_data(&self, email: Email) -> Result<(), SmtpError> {
+            if self
+                .reject_first
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SmtpError::DataRejected {
+                    message: "5.7.1 Sending domain is not configured".into(),
+                });
+            }
             self.emails.lock().unwrap().push(email);
             Ok(())
         }
@@ -1210,6 +1232,7 @@ mod tests {
     async fn run_chunked_data_session(body: &str, chunk_size: usize) -> String {
         let callbacks = Arc::new(RecordingCallbacks {
             emails: StdMutex::new(Vec::new()),
+            reject_first: std::sync::atomic::AtomicBool::new(false),
         });
         let server = SmtpServer {
             callbacks: callbacks.clone(),
@@ -1283,6 +1306,7 @@ mod tests {
     async fn recipient_count_is_capped_per_message() {
         let callbacks = Arc::new(RecordingCallbacks {
             emails: StdMutex::new(Vec::new()),
+            reject_first: std::sync::atomic::AtomicBool::new(false),
         });
         let server = SmtpServer {
             callbacks: callbacks.clone(),
@@ -1355,6 +1379,18 @@ mod tests {
         assert!(!emails[0].to.iter().any(|r| r.contains("one-too-many")));
     }
 
+    #[tokio::test]
+    async fn data_rejection_preserves_pipelined_next_transaction() {
+        let (reply, emails) = run_session_with_rejection(DEFAULT_MAX_MESSAGE_SIZE, &[
+            b"EHLO client.test\r\nMAIL FROM:<first@example.com>\r\nRCPT TO:<r@example.com>\r\nDATA\r\nFrom: first@example.com\r\n\r\nrejected\r\n.\r\nMAIL FROM:<second@example.com>\r\nRCPT TO:<r@example.com>\r\nDATA\r\nFrom: second@example.com\r\n\r\naccepted\r\n.\r\nQUIT\r\n"
+        ], true).await;
+        assert_eq!(reply.matches("550 5.7.1").count(), 1, "{reply}");
+        assert!(reply.contains("221"), "{reply}");
+        assert_eq!(emails.len(), 1, "{reply}");
+        assert!(emails[0].from.contains("second@example.com"));
+        assert!(emails[0].body.ends_with(b"accepted"));
+    }
+
     /// Drives a session over a duplex stream and returns every byte the
     /// server wrote, given a list of client writes performed after DATA is
     /// acknowledged. Each write goes out as one segment.
@@ -1363,8 +1399,17 @@ mod tests {
     }
 
     async fn run_session_with(max_message_size: usize, writes: &[&[u8]]) -> (String, Vec<Email>) {
+        run_session_with_rejection(max_message_size, writes, false).await
+    }
+
+    async fn run_session_with_rejection(
+        max_message_size: usize,
+        writes: &[&[u8]],
+        reject_first: bool,
+    ) -> (String, Vec<Email>) {
         let callbacks = Arc::new(RecordingCallbacks {
             emails: StdMutex::new(Vec::new()),
+            reject_first: std::sync::atomic::AtomicBool::new(reject_first),
         });
         let server = SmtpServer {
             callbacks: callbacks.clone(),
@@ -1791,6 +1836,7 @@ mod tests {
         // RecordingCallbacks keeps the default supports_cram_md5() == false.
         let callbacks = Arc::new(RecordingCallbacks {
             emails: StdMutex::new(Vec::new()),
+            reject_first: std::sync::atomic::AtomicBool::new(false),
         });
         let server = SmtpServer {
             callbacks,

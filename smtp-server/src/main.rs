@@ -687,6 +687,7 @@ async fn wait_for_shutdown_signal(
                                 );
                             } else {
                                 error!(
+                                    dkim_index = failure.dkim_index,
                                     component = failure.component,
                                     stage = failure.stage,
                                     "configuration reload failed; previous configuration retained"

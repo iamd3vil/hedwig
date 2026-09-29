@@ -1,4 +1,4 @@
-use crate::config::{Cfg, CfgDKIM, DkimKeyType};
+use crate::config::{Cfg, CfgDKIM, CfgDkim, DkimKeyType};
 use base64::Engine;
 use clap::Parser;
 use miette::{bail, Context, IntoDiagnostic, Result};
@@ -15,54 +15,156 @@ pub const DEFAULT_DKIM_KEY_BITS: usize = 2048;
 pub async fn generate_dkim_keys(config_path: &str, args: DkimGenerateArgs) -> Result<()> {
     let cfg = Cfg::load(config_path).wrap_err("error loading configuration")?;
 
-    let dkim_config =
-        if args.domain.is_some() || args.selector.is_some() || args.private_key.is_some() {
-            let domain = match args.domain {
-                Some(d) => d,
-                None => match &cfg.server.dkim {
-                    Some(config) => config.domain.clone(),
-                    None => bail!("Domain is required when not in config file"),
-                },
-            };
-
-            let selector = match args.selector {
-                Some(s) => s,
-                None => match &cfg.server.dkim {
-                    Some(config) => config.selector.clone(),
-                    None => bail!("Selector is required when not in config file"),
-                },
-            };
-
-            let private_key = match args.private_key {
-                Some(p) => p,
-                None => match &cfg.server.dkim {
-                    Some(config) => config.private_key.clone(),
-                    None => bail!("Private key path is required when not in config file"),
-                },
-            };
-
-            let key_type = match args.key_type.as_str() {
-                "rsa" => DkimKeyType::Rsa,
-                "ed25519" => DkimKeyType::Ed25519,
-                _ => bail!("Invalid key type. Use 'rsa' or 'ed25519'"),
-            };
-
-            CfgDKIM {
-                domain,
-                selector,
-                private_key,
-                key_type,
-            }
-        } else {
-            match &cfg.server.dkim {
-                Some(config) => config.clone(),
-                None => bail!("DKIM configuration is missing in config file and no flags provided"),
-            }
-        };
+    let dkim_config = key_generation_config(cfg.server.dkim.as_ref(), args)?;
 
     match dkim_config.key_type {
         DkimKeyType::Rsa => generate_rsa_keys(&dkim_config).await,
         DkimKeyType::Ed25519 => generate_ed25519_keys(&dkim_config).await,
+    }
+}
+
+/// Select config defaults without accidentally generating a key for another domain.
+fn key_generation_config(config: Option<&CfgDkim>, args: DkimGenerateArgs) -> Result<CfgDKIM> {
+    let defaults = match config {
+        Some(CfgDkim::Legacy(entry)) => {
+            if args
+                .domain
+                .as_ref()
+                .is_some_and(|domain| !entry.domain.eq_ignore_ascii_case(domain))
+                && args.private_key.is_none()
+            {
+                bail!("--private-key is required when overriding the configured DKIM domain");
+            }
+            Some(entry)
+        }
+        Some(CfgDkim::Domains(entries)) => {
+            let domain = args.domain.as_deref().ok_or_else(|| {
+                miette::miette!("--domain is required with multi-domain DKIM configuration")
+            })?;
+            entries
+                .iter()
+                .find(|entry| entry.domain.eq_ignore_ascii_case(domain))
+        }
+        None => None,
+    };
+    if args.domain.is_none()
+        && args.selector.is_none()
+        && args.private_key.is_none()
+        && args.key_type.is_none()
+    {
+        return defaults.cloned().ok_or_else(|| {
+            miette::miette!("DKIM configuration is missing in config file and no flags provided")
+        });
+    }
+    let domain = args
+        .domain
+        .or_else(|| defaults.map(|v| v.domain.clone()))
+        .ok_or_else(|| miette::miette!("Domain is required when not in config file"))?;
+    let selector = args
+        .selector
+        .or_else(|| defaults.map(|v| v.selector.clone()))
+        .ok_or_else(|| miette::miette!("Selector is required when not in config file"))?;
+    let key_type = match args.key_type.as_deref() {
+        Some("rsa") => DkimKeyType::Rsa,
+        Some("ed25519") => DkimKeyType::Ed25519,
+        Some(_) => bail!("Invalid key type. Use 'rsa' or 'ed25519'"),
+        None => defaults.map(|v| v.key_type.clone()).unwrap_or_default(),
+    };
+    if defaults.is_some_and(|entry| entry.key_type != key_type) && args.private_key.is_none() {
+        bail!("--private-key is required when changing the configured DKIM key type; update key_type and the DNS record before enabling the new key");
+    }
+    let private_key = args
+        .private_key
+        .or_else(|| defaults.map(|v| v.private_key.clone()))
+        .ok_or_else(|| miette::miette!("Private key path is required when not in config file"))?;
+    Ok(CfgDKIM {
+        domain,
+        selector,
+        private_key,
+        key_type,
+    })
+}
+
+/// Domains are DNS names in ASCII (use A-label/punycode for IDNs).
+/// Exact matching deliberately excludes wildcard and parent-domain fallback.
+pub(crate) fn normalize_domain(domain: &str) -> Option<String> {
+    (domain.len() <= 253
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        }))
+    .then(|| domain.to_ascii_lowercase())
+}
+
+pub(crate) fn from_domain(body: &[u8]) -> Result<String> {
+    let message = mail_parser::MessageParser::default()
+        .parse_headers(body)
+        .ok_or_else(|| miette::miette!("Invalid message headers"))?;
+    if message
+        .headers()
+        .iter()
+        .filter(|h| h.name == mail_parser::HeaderName::From)
+        .count()
+        != 1
+    {
+        bail!("Exactly one From header is required");
+    }
+    let Some(mail_parser::Address::List(addresses)) = message.from() else {
+        bail!("From must contain one mailbox");
+    };
+    if addresses.len() != 1 {
+        bail!("From must contain one mailbox");
+    }
+    let address = addresses[0]
+        .address()
+        .ok_or_else(|| miette::miette!("Invalid From mailbox"))?;
+    let parsed = email_address_parser::EmailAddress::parse(address, None)
+        .ok_or_else(|| miette::miette!("Invalid From mailbox"))?;
+    let domain =
+        normalize_domain(&parsed.domain()).ok_or_else(|| miette::miette!("Invalid From domain"))?;
+    // mail-parser deliberately recovers malformed addresses (for example an
+    // unclosed angle bracket). Require the raw field to parse as one mailbox
+    // too, so recovery cannot turn malformed input into an authorized sender.
+    let raw = message
+        .headers_raw()
+        .find(|(name, _)| name.eq_ignore_ascii_case("From"))
+        .map(|(_, value)| value)
+        .ok_or_else(|| miette::miette!("Invalid From header"))?;
+    let raw_addresses = mailparse::addrparse(raw)
+        .into_diagnostic()
+        .wrap_err("Invalid From header")?;
+    let [mailparse::MailAddr::Single(mailbox)] = raw_addresses.as_slice() else {
+        bail!("From must contain one mailbox");
+    };
+    let raw_address = email_address_parser::EmailAddress::parse(&mailbox.addr, None)
+        .ok_or_else(|| miette::miette!("Invalid From mailbox"))?;
+    if normalize_domain(&raw_address.domain()).as_ref() != Some(&domain) {
+        bail!("Ambiguous From domain");
+    }
+    Ok(domain)
+}
+
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("Sending domain {0} is not configured")]
+pub(crate) struct UnconfiguredDomain(pub String);
+
+impl crate::reload::RuntimeSnapshot {
+    pub(crate) fn signer_for(&self, body: &[u8]) -> Result<Option<&crate::worker::DkimSignerType>> {
+        match &self.dkim_domains {
+            Some(domains) => {
+                let domain = from_domain(body)?;
+                domains
+                    .get(&domain)
+                    .map(Some)
+                    .ok_or_else(|| UnconfiguredDomain(domain).into())
+            }
+            None => Ok(self.dkim_signer.as_ref()),
+        }
     }
 }
 
@@ -154,6 +256,162 @@ pub struct DkimGenerateArgs {
     pub private_key: Option<String>,
 
     /// Key type (rsa or ed25519)
-    #[arg(long, default_value = "rsa")]
-    pub key_type: String,
+    #[arg(long)]
+    pub key_type: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_domain_requires_one_unambiguous_mailbox() {
+        for header in [
+            "From: Alice <alice@EXAMPLE.com>",
+            "From: Alice\r\n <alice@example.com>",
+            "From: \"a@b\" <alice@example.com>",
+        ] {
+            assert_eq!(
+                from_domain(format!("{header}\r\nSubject: test\r\n\r\nbody").as_bytes()).unwrap(),
+                "example.com"
+            );
+        }
+        for header in [
+            "Subject: no from",
+            "From: a@example.com\r\nFrom: b@example.com",
+            "From: a@example.com, b@example.com",
+            "From: friends: a@example.com;",
+            "From: invalid",
+            "From: <a@example.com",
+            "From: a@example.com>",
+            "From: a@bad_domain.com",
+            "From: a@[127.0.0.1]",
+            "From:",
+        ] {
+            assert!(
+                from_domain(format!("{header}\r\n\r\nbody").as_bytes()).is_err(),
+                "accepted {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_generation_preserves_algorithm_and_requires_new_domain_path() {
+        let config = CfgDkim::Legacy(CfgDKIM {
+            domain: "example.com".into(),
+            selector: "old".into(),
+            private_key: "live.pem".into(),
+            key_type: DkimKeyType::Ed25519,
+        });
+        let args = || DkimGenerateArgs {
+            domain: None,
+            selector: Some("new".into()),
+            private_key: None,
+            key_type: None,
+        };
+        assert!(matches!(
+            key_generation_config(Some(&config), args())
+                .unwrap()
+                .key_type,
+            DkimKeyType::Ed25519
+        ));
+        let mut explicit = args();
+        explicit.selector = None;
+        explicit.key_type = Some("rsa".into());
+        explicit.private_key = Some("rsa.pem".into());
+        assert!(matches!(
+            key_generation_config(Some(&config), explicit)
+                .unwrap()
+                .key_type,
+            DkimKeyType::Rsa
+        ));
+        let mut other = args();
+        other.domain = Some("other.com".into());
+        assert!(key_generation_config(Some(&config), other)
+            .unwrap_err()
+            .to_string()
+            .contains("--private-key"));
+        let mut other = args();
+        other.domain = Some("other.com".into());
+        other.private_key = Some("other.pem".into());
+        let selected = key_generation_config(Some(&config), other).unwrap();
+        assert_eq!(selected.private_key, "other.pem");
+        let mut same = args();
+        same.domain = Some("EXAMPLE.COM".into());
+        assert_eq!(
+            key_generation_config(Some(&config), same)
+                .unwrap()
+                .private_key,
+            "live.pem"
+        );
+    }
+
+    #[test]
+    fn changing_algorithm_requires_explicit_path_in_both_modes() {
+        for current in [DkimKeyType::Rsa, DkimKeyType::Ed25519] {
+            let entry = CfgDKIM {
+                domain: "example.com".into(),
+                selector: "default".into(),
+                private_key: "live.pem".into(),
+                key_type: current.clone(),
+            };
+            for config in [
+                CfgDkim::Legacy(entry.clone()),
+                CfgDkim::Domains(vec![entry.clone()]),
+            ] {
+                for requested in ["rsa", "ed25519"] {
+                    let args = |path| DkimGenerateArgs {
+                        domain: matches!(config, CfgDkim::Domains(_)).then(|| "example.com".into()),
+                        selector: None,
+                        private_key: path,
+                        key_type: Some(requested.into()),
+                    };
+                    let changed = (current == DkimKeyType::Rsa) != (requested == "rsa");
+                    let result = key_generation_config(Some(&config), args(None));
+                    if changed {
+                        assert!(result.unwrap_err().to_string().contains("--private-key"));
+                    } else {
+                        assert_eq!(result.unwrap().private_key, "live.pem");
+                    }
+                    let selected =
+                        key_generation_config(Some(&config), args(Some("new.pem".into()))).unwrap();
+                    assert_eq!(selected.private_key, "new.pem");
+                    assert_eq!(selected.key_type == DkimKeyType::Rsa, requested == "rsa");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_formats_and_key_generation_defaults() {
+        let entry = CfgDKIM {
+            domain: "example.com".into(),
+            selector: "one".into(),
+            private_key: "one.pem".into(),
+            key_type: DkimKeyType::Ed25519,
+        };
+        let args = |domain| DkimGenerateArgs {
+            domain,
+            selector: None,
+            private_key: None,
+            key_type: None,
+        };
+        let legacy: CfgDkim =
+            serde_json::from_value(serde_json::to_value(&entry).unwrap()).unwrap();
+        assert!(matches!(legacy, CfgDkim::Legacy(_)));
+        assert!(matches!(
+            key_generation_config(Some(&legacy), args(None))
+                .unwrap()
+                .key_type,
+            DkimKeyType::Ed25519
+        ));
+        let multi: CfgDkim = serde_json::from_value(serde_json::json!([entry])).unwrap();
+        assert!(matches!(multi, CfgDkim::Domains(_)));
+        assert!(key_generation_config(Some(&multi), args(None)).is_err());
+        let selected =
+            key_generation_config(Some(&multi), args(Some("EXAMPLE.COM".into()))).unwrap();
+        assert_eq!(selected.private_key, "one.pem");
+        assert!(matches!(selected.key_type, DkimKeyType::Ed25519));
+        assert!(key_generation_config(Some(&multi), args(Some("unknown.com".into()))).is_err());
+    }
 }
