@@ -64,16 +64,19 @@ fn key_generation_config(config: Option<&CfgDkim>, args: DkimGenerateArgs) -> Re
         .selector
         .or_else(|| defaults.map(|v| v.selector.clone()))
         .ok_or_else(|| miette::miette!("Selector is required when not in config file"))?;
-    let private_key = args
-        .private_key
-        .or_else(|| defaults.map(|v| v.private_key.clone()))
-        .ok_or_else(|| miette::miette!("Private key path is required when not in config file"))?;
     let key_type = match args.key_type.as_deref() {
         Some("rsa") => DkimKeyType::Rsa,
         Some("ed25519") => DkimKeyType::Ed25519,
         Some(_) => bail!("Invalid key type. Use 'rsa' or 'ed25519'"),
         None => defaults.map(|v| v.key_type.clone()).unwrap_or_default(),
     };
+    if defaults.is_some_and(|entry| entry.key_type != key_type) && args.private_key.is_none() {
+        bail!("--private-key is required when changing the configured DKIM key type; update key_type and the DNS record before enabling the new key");
+    }
+    let private_key = args
+        .private_key
+        .or_else(|| defaults.map(|v| v.private_key.clone()))
+        .ok_or_else(|| miette::miette!("Private key path is required when not in config file"))?;
     Ok(CfgDKIM {
         domain,
         selector,
@@ -315,6 +318,7 @@ mod tests {
         let mut explicit = args();
         explicit.selector = None;
         explicit.key_type = Some("rsa".into());
+        explicit.private_key = Some("rsa.pem".into());
         assert!(matches!(
             key_generation_config(Some(&config), explicit)
                 .unwrap()
@@ -340,6 +344,42 @@ mod tests {
                 .private_key,
             "live.pem"
         );
+    }
+
+    #[test]
+    fn changing_algorithm_requires_explicit_path_in_both_modes() {
+        for current in [DkimKeyType::Rsa, DkimKeyType::Ed25519] {
+            let entry = CfgDKIM {
+                domain: "example.com".into(),
+                selector: "default".into(),
+                private_key: "live.pem".into(),
+                key_type: current.clone(),
+            };
+            for config in [
+                CfgDkim::Legacy(entry.clone()),
+                CfgDkim::Domains(vec![entry.clone()]),
+            ] {
+                for requested in ["rsa", "ed25519"] {
+                    let args = |path| DkimGenerateArgs {
+                        domain: matches!(config, CfgDkim::Domains(_)).then(|| "example.com".into()),
+                        selector: None,
+                        private_key: path,
+                        key_type: Some(requested.into()),
+                    };
+                    let changed = (current == DkimKeyType::Rsa) != (requested == "rsa");
+                    let result = key_generation_config(Some(&config), args(None));
+                    if changed {
+                        assert!(result.unwrap_err().to_string().contains("--private-key"));
+                    } else {
+                        assert_eq!(result.unwrap().private_key, "live.pem");
+                    }
+                    let selected =
+                        key_generation_config(Some(&config), args(Some("new.pem".into()))).unwrap();
+                    assert_eq!(selected.private_key, "new.pem");
+                    assert_eq!(selected.key_type == DkimKeyType::Rsa, requested == "rsa");
+                }
+            }
+        }
     }
 
     #[test]

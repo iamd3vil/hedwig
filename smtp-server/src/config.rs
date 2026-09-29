@@ -81,7 +81,7 @@ pub struct CfgStorage {
     pub cleanup: Option<CfgCleanup>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DkimKeyType {
     #[default]

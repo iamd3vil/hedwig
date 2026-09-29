@@ -87,10 +87,11 @@ before enabling a new identity or rotating the active signer.
 ## Generating keys
 
 When overriding a selector or key path, the configured key type remains the
-default. Use `--key-type` to change it explicitly. With a single signing domain,
+default. Changing it with `--key-type` requires an explicit `--private-key` path.
+Update the configured key type, key path, and DNS record before enabling the new
+key. With a single signing domain,
 overriding `--domain` with a different domain also requires `--private-key` so
 the command does not overwrite the configured domain’s key by default.
-
 
 ```bash
 ./target/release/hedwig dkim-generate

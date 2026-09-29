@@ -60,6 +60,11 @@ impl PreparationError {
         }
     }
 
+    fn at_dkim_entry(mut self, index: usize) -> Self {
+        self.dkim_index = Some(index);
+        self
+    }
+
     fn listener(component: &'static str, stage: &'static str, index: usize) -> Self {
         Self {
             component,
@@ -164,21 +169,20 @@ impl RuntimeSnapshot {
                 for (index, entry) in entries.iter().enumerate() {
                     let domain = crate::dkim::normalize_domain(&entry.domain).ok_or_else(|| {
                         PreparationError::new("server.dkim.domain", "invalid domain")
+                            .at_dkim_entry(index)
                     })?;
                     if domains.contains_key(&domain) {
                         return Err(PreparationError::new(
                             "server.dkim.domain",
                             "duplicate domain",
-                        ));
+                        )
+                        .at_dkim_entry(index));
                     }
                     let mut entry = entry.clone();
                     entry.domain = domain.clone();
                     domains.insert(
                         domain,
-                        load_signer(&entry).map_err(|mut error| {
-                            error.dkim_index = Some(index);
-                            error
-                        })?,
+                        load_signer(&entry).map_err(|error| error.at_dkim_entry(index))?,
                     );
                 }
                 (None, Some(domains))
@@ -646,14 +650,17 @@ mod tests {
                 .is_some());
         }
         let before = runtime.current.load_full();
-        for entries in [
-            vec![],
-            vec![entry("example.com"), entry("EXAMPLE.COM")],
-            vec![entry("*.example.com")],
+        for (entries, expected_index) in [
+            (vec![], None),
+            (vec![entry("example.com"), entry("EXAMPLE.COM")], Some(1)),
+            (vec![entry("example.com"), entry("*.example.com")], Some(1)),
         ] {
             let mut bad = initial.clone();
             bad.server.dkim = Some(CfgDkim::Domains(entries));
-            assert!(runtime.reload(bad, |_| Ok(())).is_err());
+            let Err(ReloadError::Preparation(error)) = runtime.reload(bad, |_| Ok(())) else {
+                panic!("expected domain validation failure")
+            };
+            assert_eq!(error.dkim_index, expected_index);
             assert_snapshot_retained(&runtime, &before);
         }
         let mut bad = initial.clone();
