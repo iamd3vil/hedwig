@@ -46,7 +46,7 @@ docker run -d --name hedwig --restart unless-stopped \
   --mount type=bind,src="$(pwd)/config.toml",dst=/etc/hedwig/config.toml,readonly \
   --mount type=volume,src=hedwig-data,dst=/var/lib/hedwig \
   -e HEDWIG_LOG_LEVEL=info \
-  ghcr.io/iamd3vil/hedwig:0.12.3 -c /etc/hedwig/config.toml
+  ghcr.io/iamd3vil/hedwig:0.13.0 -c /etc/hedwig/config.toml
 
 docker logs -f hedwig
 ```

@@ -17,10 +17,41 @@ Pushing a `v*` Git tag triggers two independent workflows:
   build cache. A merge job publishes the multi-platform tags only after both
   builds succeed.
 
-For `v0.12.3`, Docker publishes `0.12.3`, `0.12`, and `latest`. The Docker
+For `v0.13.0`, Docker publishes `0.13.0`, `0.13`, and `latest`. The Docker
 workflow checks out the release tag, so the image contains the tagged source.
 A successful binary release does not imply that Docker publishing has finished;
 check both workflows.
+
+## Prepare and publish a release
+
+Update both crate versions (`smtp-server/Cargo.toml` and `smtp/Cargo.toml`),
+refresh `Cargo.lock`, and update the installation examples before committing
+the release preparation. Run the workspace tests, formatting, and Clippy
+checks, then use `verbump` to create the tag on that commit.
+
+For the minor version bump from `v0.12.3` to `v0.13.0`:
+
+```bash
+verbump --show
+verbump --minor
+verbump --show
+```
+
+Confirm that the tag matches the crate versions. To build release archives and
+checksums locally without publishing, run:
+
+```bash
+rlsr --skip-publish
+```
+
+When ready to publish the prepared commit and tag:
+
+```bash
+git push origin main
+verbump --push-latest
+```
+
+Pushing the tag starts both publication workflows described above.
 
 ## Rebuild Docker images for an existing release
 
@@ -28,7 +59,7 @@ The Docker workflow also accepts a manual `tag` input. Run the workflow from
 `main` to use the current workflow while building the existing tagged source:
 
 ```bash
-gh workflow run docker.yml --ref main -f tag=v0.12.3
+gh workflow run docker.yml --ref main -f tag=v0.13.0
 gh run list --workflow docker.yml
 ```
 
@@ -46,8 +77,8 @@ are serialized by the workflow's concurrency group.
 ## Verify publication
 
 ```bash
-docker buildx imagetools inspect ghcr.io/iamd3vil/hedwig:0.12.3
-docker run --rm ghcr.io/iamd3vil/hedwig:0.12.3 --version
+docker buildx imagetools inspect ghcr.io/iamd3vil/hedwig:0.13.0
+docker run --rm ghcr.io/iamd3vil/hedwig:0.13.0 --version
 ```
 
 The image index should contain `linux/amd64` and `linux/arm64`. Additional
