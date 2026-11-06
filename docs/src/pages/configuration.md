@@ -45,7 +45,13 @@ min_idle = 2      # Minimum idle connections per MX pool, shared by all workers 
 max_size = 10     # Maximum connections per MX pool, shared by all workers (default: 10)
 ```
 
-All workers share this cache and its per-MX connection pools, so these limits are process-wide rather than multiplied by the worker count.
+All workers share this cache and its connection pools, so these limits are process-wide rather than multiplied by the worker count. Each MX has separate pools for opportunistic and MTA-STS-enforced TLS, each subject to `min_idle` and `max_size`; both count toward `cache_size`.
+
+Outbound delivery uses STARTTLS when available without requiring a verified
+certificate, and allows plaintext if STARTTLS is unavailable. A valid,
+unexpired MTA-STS `enforce` policy instead requires STARTTLS and certificate
+verification. `outbound_local = true` skips TLS only for destinations without
+an enforced policy. See [MTA-STS](/mta-sts) for details.
 
 For new or low-volume senders, keep `min_idle` and `max_size` small so strict receivers do not see unnecessary parallel connections. The legacy `server.pool_size` setting is still accepted as a fallback for `server.smtp.cache_size`.
 

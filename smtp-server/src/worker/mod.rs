@@ -20,6 +20,7 @@ use rustls_pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
 // use pool::SmtpClientPool;
 use memchr::memmem;
 use moka::future::Cache;
+use pool::OutboundTlsMode;
 pub(crate) use pool::PoolManager;
 pub use pool::{
     SmtpPoolConfig, DEFAULT_SMTP_CACHE_SIZE, DEFAULT_SMTP_POOL_MAX_SIZE, DEFAULT_SMTP_POOL_MIN_IDLE,
@@ -685,6 +686,8 @@ impl Worker {
 
         // Look up MTA-STS policy for the recipient domain.
         let mta_sts_policy = self.mta_sts.get_policy(domain).await;
+        let tls_mode =
+            OutboundTlsMode::from_policy(mta_sts_policy.as_ref().map(|policy| policy.mode));
         if let Some(ref policy) = mta_sts_policy {
             debug!(domain = ?domain, mode = %policy.mode, "MTA-STS policy found");
         }
@@ -740,7 +743,8 @@ impl Worker {
                     PolicyMode::None => {}
                 }
             }
-            let transport: AsyncSmtpTransport<Tokio1Executor> = self.pool.get(&exchange).await?;
+            let transport: AsyncSmtpTransport<Tokio1Executor> =
+                self.pool.get(&exchange, tls_mode).await?;
 
             let send_start = Instant::now();
             match transport.send_raw(&envelope, raw_email).await {

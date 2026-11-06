@@ -165,11 +165,11 @@ pub struct CfgAuth {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct CfgSmtp {
-    /// Number of destination MX transports to keep in the process-wide cache.
+    /// Number of MX/TLS-mode transports to keep in the process-wide cache.
     pub cache_size: Option<u64>,
-    /// Minimum number of idle connections in each process-wide destination MX pool.
+    /// Minimum idle connections in each process-wide MX/TLS-mode pool.
     pub min_idle: Option<u32>,
-    /// Maximum number of connections in each process-wide destination MX pool.
+    /// Maximum connections in each process-wide MX/TLS-mode pool.
     pub max_size: Option<u32>,
 }
 
