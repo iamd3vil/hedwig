@@ -3,15 +3,10 @@ members = ["smtp-server", "smtp"]
 exclude = ["smtp-server/fuzz"]
 resolver = "2"
 
-[patch.crates-io]
-# Fix future incompatibility warning in num-bigint-dig 0.8.4
-# See: https://github.com/rust-lang/rust/issues/120192
-num-bigint-dig = { git = "https://github.com/dignifiedquire/num-bigint", tag = "v0.8.6" }
-
 [workspace.dependencies]
-miette = { version = "7.2.0", features = ["fancy"] }
-thiserror = "1.0.64"
-tokio = { version = "1.40.0", features = [
+miette = { version = "7.6.0", features = ["fancy"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = [
     "net",
     "io-util",
     "rt-multi-thread",
@@ -21,4 +16,4 @@ tokio = { version = "1.40.0", features = [
     "sync",
     "signal",
 ] }
-async-trait = "0.1"
+async-trait = "0.1.92"

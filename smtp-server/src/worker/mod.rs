@@ -2,18 +2,13 @@ use crate::config::DkimKeyType;
 use async_channel::Receiver;
 use chrono::{DateTime, SecondsFormat, Utc};
 use email_address_parser::EmailAddress;
-use hickory_resolver::{
-    lookup::MxLookup,
-    name_server::{GenericConnector, TokioRuntimeProvider},
-    proto::rr::rdata::MX,
-    AsyncResolver,
-};
+use hickory_resolver::{lookup::Lookup, proto::rr::RData, TokioResolver};
 use lettre::{address::Envelope, Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use mail_auth::{
-    common::crypto::{Ed25519Key, RsaKey, Sha256},
+    crypto::{Ed25519Key, RsaKey, Sha256},
     dkim::DkimSigner,
 };
-use mail_auth::{common::headers::HeaderWriter, dkim::Done};
+use mail_auth::{headers::HeaderWriter, signer::Ready};
 use mail_parser::{Message, MessageParser};
 use miette::{bail, Context, IntoDiagnostic, Result};
 use rustls_pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
@@ -110,8 +105,8 @@ pub struct EmailMetadata {
 }
 
 pub enum DkimSignerType {
-    Rsa(DkimSigner<RsaKey<Sha256>, Done>),
-    Ed25519(DkimSigner<Ed25519Key, Done>),
+    Rsa(DkimSigner<RsaKey<Sha256>, Ready>),
+    Ed25519(DkimSigner<Ed25519Key, Ready>),
 }
 
 pub struct WorkerConfig {
@@ -120,9 +115,9 @@ pub struct WorkerConfig {
 
 #[derive(Clone)]
 pub struct WorkerResources {
-    mx_cache: Cache<String, MxLookup>,
+    mx_cache: Cache<String, Lookup>,
     pool: Arc<PoolManager>,
-    resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
+    resolver: TokioResolver,
     mta_sts: Arc<MtaStsResolver>,
     rate_limiter: RateLimiter,
 }
@@ -135,9 +130,9 @@ impl WorkerResources {
     }
 
     pub(crate) fn new(
-        mx_cache: Cache<String, MxLookup>,
+        mx_cache: Cache<String, Lookup>,
         pool: Arc<PoolManager>,
-        resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
+        resolver: TokioResolver,
         mta_sts: Arc<MtaStsResolver>,
         rate_limit_config: RateLimitConfig,
     ) -> Self {
@@ -154,13 +149,13 @@ impl WorkerResources {
 pub struct Worker {
     channel: Receiver<Job>,
     storage: Arc<dyn Storage>,
-    resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
+    resolver: TokioResolver,
 
     pool: Arc<PoolManager>,
     runtime: Arc<RuntimeConfig>,
 
     // MX Cache
-    mx_cache: Cache<String, MxLookup>,
+    mx_cache: Cache<String, Lookup>,
 
     /// disable_outbound when set true, all outbound emails will be discarded.
     disable_outbound: bool,
@@ -237,12 +232,12 @@ impl Worker {
                     ))
                     .into_diagnostic()
                     .wrap_err("error reading PKCS#1 RSA private key")?,
-                    "ENCRYPTED PRIVATE KEY" => bail!(
-                        "encrypted RSA private keys are not supported; use an unencrypted PKCS#8 or PKCS#1 PEM key"
-                    ),
-                    tag => bail!(
-                        "unsupported RSA private key PEM tag {tag:?}; expected \"PRIVATE KEY\" or \"RSA PRIVATE KEY\""
-                    ),
+                    "ENCRYPTED PRIVATE KEY" => {
+                        bail!("encrypted RSA private keys are not supported; use an unencrypted PKCS#8 or PKCS#1 PEM key");
+                    }
+                    tag => {
+                        bail!("unsupported RSA private key PEM tag {tag:?}; expected \"PRIVATE KEY\" or \"RSA PRIVATE KEY\"");
+                    }
                 };
 
                 Ok(DkimSignerType::Rsa(
@@ -250,7 +245,7 @@ impl Worker {
                         .domain(&dkim.domain)
                         .selector(&dkim.selector)
                         .headers(DKIM_HEADERS)
-                        .expiration(60 * 60 * 7)
+                        .expiration(Duration::from_hours(7))
                         .body_canonicalization(mail_auth::dkim::Canonicalization::Simple)
                         .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed),
                 ))
@@ -261,17 +256,16 @@ impl Worker {
                     .into_diagnostic()
                     .wrap_err("parsing Ed25519 PEM")?;
 
-                let pk_ed25519 =
-                    mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(pem.contents())
-                        .into_diagnostic()
-                        .wrap_err("error reading Ed25519 priv key")?;
+                let pk_ed25519 = mail_auth::crypto::Ed25519Key::from_pkcs8_der(pem.contents())
+                    .into_diagnostic()
+                    .wrap_err("error reading Ed25519 priv key")?;
 
                 Ok(DkimSignerType::Ed25519(
                     DkimSigner::from_key(pk_ed25519)
                         .domain(&dkim.domain)
                         .selector(&dkim.selector)
                         .headers(DKIM_HEADERS)
-                        .expiration(60 * 60 * 7)
+                        .expiration(Duration::from_hours(7))
                         .body_canonicalization(mail_auth::dkim::Canonicalization::Simple)
                         .header_canonicalization(mail_auth::dkim::Canonicalization::Relaxed),
                 ))
@@ -314,7 +308,7 @@ impl Worker {
             Some(msg) => msg,
             None => {
                 error!(msg_id = ?job.job_id, "Failed to parse email body");
-                bail!("failed to parse email body")
+                bail!("failed to parse email body");
             }
         };
 
@@ -610,30 +604,22 @@ impl Worker {
     /// The union of envelope recipients and any Cc/Bcc addresses parsed out
     /// of the message, deduplicated (historical behavior of `send_email`).
     fn merge_recipients(to: &[String], email: &Message<'_>) -> Vec<String> {
-        let to_iter = to.iter().map(|s| s.to_owned());
-
-        let cc_iter = email
-            .cc()
-            .into_iter()
-            .flat_map(|list| list.as_list())
-            .flatten()
-            .filter_map(|cc| cc.address())
-            .map(|addr_str| addr_str.to_owned());
-
-        let bcc_iter = email
-            .bcc()
-            .into_iter()
-            .flat_map(|list| list.as_list())
-            .flatten()
-            .filter_map(|bcc| bcc.address())
-            .map(|addr_str| addr_str.to_owned());
-
-        let all_recipients: Vec<String> = to_iter.chain(cc_iter).chain(bcc_iter).collect();
-        all_recipients
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect()
+        let mut recipients: std::collections::HashSet<_> = to.iter().cloned().collect();
+        for list in [email.cc(), email.bcc()].into_iter().flatten() {
+            // The previous parser classified any list containing a group as a group.
+            if list
+                .iter()
+                .any(|addr| matches!(addr, mail_parser::Address::Group(_)))
+            {
+                continue;
+            }
+            recipients.extend(
+                list.mailboxes()
+                    .filter_map(|mailbox| mailbox.address())
+                    .map(str::to_owned),
+            );
+        }
+        recipients.into_iter().collect()
     }
 
     /// Block until this domain has a token, consuming it. Used only by the
@@ -672,17 +658,24 @@ impl Worker {
             .lookup_mx(domain)
             .await
             .wrap_err("looking up mx record")?;
-        if mx_lookup.iter().count() == 0 {
+        let mut mx: Vec<_> = mx_lookup
+            .answers()
+            .iter()
+            .filter_map(|answer| match &answer.data {
+                RData::MX(mx) => Some(mx),
+                _ => None,
+            })
+            .collect();
+        if mx.is_empty() {
             warn!(domain = ?domain, "No MX records found");
             metrics::record_send_failure(domain);
             return Ok(RecipientDelivery::Skipped("no MX records"));
         }
 
         // Sort mx according to preference in ascending order.
-        let mut mx = mx_lookup.iter().collect::<Vec<&MX>>();
         // Shuffle first so the stable sort randomizes equal-preference MXes.
-        mx.shuffle(&mut rand::thread_rng());
-        mx.sort_by_key(|a| a.preference());
+        mx.shuffle(&mut rand::rng());
+        mx.sort_by_key(|a| a.preference);
 
         // Look up MTA-STS policy for the recipient domain.
         let mta_sts_policy = self.mta_sts.get_policy(domain).await;
@@ -707,9 +700,9 @@ impl Worker {
         // `into_diagnostic_makes_original_error_unreachable`).
         let mut last_error: Option<ClassifiedSendError> = None;
         for mx_record in mx.iter() {
-            debug!(mx = ?mx_record.exchange(), "Attempting delivery via MX server");
+            debug!(mx = ?mx_record.exchange, "Attempting delivery via MX server");
 
-            let exchange = mx_record.exchange().to_string();
+            let exchange = mx_record.exchange.to_string();
 
             // MTA-STS: validate MX hostname against policy.
             if let Some(ref policy) = mta_sts_policy {
@@ -1123,7 +1116,7 @@ impl Worker {
         Ok(())
     }
 
-    async fn lookup_mx(&self, domain: &str) -> Result<MxLookup> {
+    async fn lookup_mx(&self, domain: &str) -> Result<Lookup> {
         if let Some(mx) = self.mx_cache.get(domain).await {
             return Ok(mx);
         }
@@ -1314,8 +1307,8 @@ mod tests {
     fn test_create_dkim_signer_accepts_pkcs1_rsa_pem() {
         use rsa::pkcs1::EncodeRsaPrivateKey;
 
-        let mut rng = rand::thread_rng();
-        let key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
+        let mut rng = rand::rng();
+        let key = rsa::PrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
         let pem = key
             .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
             .expect("encode test RSA key as PKCS#1 PEM");
@@ -1552,6 +1545,16 @@ mod tests {
     }
 
     #[test]
+    fn merging_recipients_keeps_grouped_address_headers_out_of_the_envelope() {
+        let message = MessageParser::default()
+            .parse_headers(b"Cc: Team: grouped@example.com;, other@example.com\r\nBcc: blind@example.com\r\n\r\n")
+            .unwrap();
+        let mut recipients = Worker::merge_recipients(&["to@example.com".into()], &message);
+        recipients.sort();
+        assert_eq!(recipients, ["blind@example.com", "to@example.com"]);
+    }
+
+    #[test]
     fn test_header_only_parse_matches_full_parse() {
         // The delivery paths read nothing but header fields, so they parse
         // headers only. Anything that changes across that boundary would be
@@ -1575,10 +1578,9 @@ mod tests {
 
         assert_eq!(headers.subject(), full.subject());
         assert_eq!(headers.subject(), Some("Re: café — résumé"));
-        fn addresses(list: Option<&mail_parser::Address<'_>>) -> Vec<String> {
+        fn addresses(list: Option<mail_parser::AddressList<'_>>) -> Vec<String> {
             list.into_iter()
-                .flat_map(|list| list.as_list())
-                .flatten()
+                .flat_map(|list| list.mailboxes())
                 .filter_map(|addr| addr.address().map(str::to_owned))
                 .collect()
         }

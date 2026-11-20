@@ -369,7 +369,7 @@ fn system_time_to_ms(t: SystemTime) -> i64 {
 /// dedup identity, not security). Re-running migration maps the same legacy
 /// id to the same new id.
 fn derived_message_id(legacy_id: &str) -> MessageId {
-    use hmac::Mac;
+    use hmac::{KeyInit, Mac};
     // md-5 is already in the tree (CRAM-MD5); collision resistance is not a
     // requirement here, only stability across runs.
     let mut mac = hmac::Hmac::<md5::Md5>::new_from_slice(b"hedwig-migrate-id")
@@ -518,7 +518,7 @@ mod tests {
     }
 
     fn new_ulid() -> String {
-        ulid::Ulid::new().to_string()
+        ulid::Ulid::generate().to_string()
     }
 
     /// Every message id found by scanning a shard's payload segments,

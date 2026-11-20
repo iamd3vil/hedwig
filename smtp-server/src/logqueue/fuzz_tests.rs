@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::record::{self, DecodeError, RecordParams, FIXED_HEADER_LEN, MAX_RECORD_LEN};
 use super::segment::{scan_headers, validate_active_tail, ActiveSegment, SegmentReader};
@@ -25,22 +25,22 @@ fn rng(seed: u64) -> StdRng {
 }
 
 fn random_string(rng: &mut StdRng, max_len: usize) -> String {
-    let len = rng.gen_range(0..=max_len);
+    let len = rng.random_range(0..=max_len);
     (0..len)
         .map(|_| {
             // Mostly ASCII with some multi-byte characters mixed in.
-            match rng.gen_range(0..10) {
+            match rng.random_range(0..10) {
                 0 => 'é',
                 1 => '日',
                 2 => '🦉',
-                _ => rng.gen_range(b'!'..=b'~') as char,
+                _ => rng.random_range(b'!'..=b'~') as char,
             }
         })
         .collect()
 }
 
 fn random_id(rng: &mut StdRng) -> MessageId {
-    MessageId::from_ulid(ulid::Ulid::from_parts(rng.gen(), rng.gen()))
+    MessageId::from_ulid(ulid::Ulid::from_parts(rng.random(), rng.random()))
 }
 
 fn random_params<'a>(
@@ -51,9 +51,9 @@ fn random_params<'a>(
 ) -> RecordParams<'a> {
     RecordParams {
         message_id: random_id(rng),
-        enqueue_ms: rng.gen(),
-        generation: rng.gen(),
-        ordinal: rng.gen(),
+        enqueue_ms: rng.random(),
+        generation: rng.random(),
+        ordinal: rng.random(),
         sender,
         recipients,
         body,
@@ -70,9 +70,11 @@ fn fuzz_record_round_trip() {
     let mut rng = rng(1);
     for _ in 0..2_000 {
         let sender = random_string(&mut rng, 200);
-        let n_rcpt = rng.gen_range(1..=40);
+        let n_rcpt = rng.random_range(1..=40);
         let recipients: Vec<String> = (0..n_rcpt).map(|_| random_string(&mut rng, 120)).collect();
-        let body: Vec<u8> = (0..rng.gen_range(0..4096)).map(|_| rng.gen()).collect();
+        let body: Vec<u8> = (0..rng.random_range(0..4096))
+            .map(|_| rng.random())
+            .collect();
         let p = random_params(&mut rng, &sender, &recipients, &body);
 
         let buf = record::encode(&p).unwrap();
@@ -94,8 +96,8 @@ fn fuzz_record_round_trip() {
 fn fuzz_decode_header_arbitrary_bytes() {
     let mut rng = rng(2);
     for i in 0..50_000 {
-        let len = rng.gen_range(0..600);
-        let mut buf: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
+        let len = rng.random_range(0..600);
+        let mut buf: Vec<u8> = (0..len).map(|_| rng.random()).collect();
         // Half the time, plant plausible magic/version so the decoder gets
         // past the first checks and exercises deeper paths.
         if i % 2 == 0 && buf.len() >= 8 {
@@ -118,20 +120,22 @@ fn fuzz_decode_header_mutations() {
     let mut rng = rng(3);
     for _ in 0..5_000 {
         let sender = random_string(&mut rng, 60);
-        let recipients: Vec<String> = (0..rng.gen_range(1..=5))
+        let recipients: Vec<String> = (0..rng.random_range(1..=5))
             .map(|_| random_string(&mut rng, 60))
             .collect();
-        let body: Vec<u8> = (0..rng.gen_range(0..512)).map(|_| rng.gen()).collect();
+        let body: Vec<u8> = (0..rng.random_range(0..512))
+            .map(|_| rng.random())
+            .collect();
         let p = random_params(&mut rng, &sender, &recipients, &body);
         let clean = record::encode(&p).unwrap();
         let original = record::decode_header(&clean, MAX_RECORD_LEN).unwrap();
 
         let mut buf = clean.clone();
-        let flips = rng.gen_range(1..=4);
+        let flips = rng.random_range(1..=4);
         let mut touched_header = false;
         for _ in 0..flips {
-            let at = rng.gen_range(0..buf.len());
-            let bit = 1u8 << rng.gen_range(0..8);
+            let at = rng.random_range(0..buf.len());
+            let bit = 1u8 << rng.random_range(0..8);
             buf[at] ^= bit;
             if at < original.header_len as usize {
                 touched_header = true;
@@ -149,8 +153,13 @@ fn fuzz_decode_header_mutations() {
                 );
             }
             Err(DecodeError::Corrupt(_) | DecodeError::UnsupportedVersion(_)) => {}
-            Err(DecodeError::Incomplete { .. }) => {
-                panic!("full-length record decoded as incomplete after mutation")
+            Err(DecodeError::Incomplete { needed }) => {
+                // A mutation can increase both declared lengths beyond the buffer.
+                assert_eq!(
+                    needed,
+                    u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize
+                );
+                assert!(needed > buf.len());
             }
         }
     }
@@ -160,12 +169,12 @@ fn fuzz_decode_header_mutations() {
 // Active-segment tail recovery.
 
 fn encode_record(rng: &mut StdRng, ordinal: u32, body_len: usize) -> Vec<u8> {
-    let recipients: Vec<String> = (0..rng.gen_range(1..=3))
+    let recipients: Vec<String> = (0..rng.random_range(1..=3))
         .map(|_| format!("{}@example.com", random_string(rng, 20).replace('@', "_")))
         .collect();
-    let body: Vec<u8> = (0..body_len).map(|_| rng.gen()).collect();
+    let body: Vec<u8> = (0..body_len).map(|_| rng.random()).collect();
     record::encode(&RecordParams {
-        message_id: MessageId::from_ulid(ulid::Ulid::from_parts(rng.gen(), rng.gen())),
+        message_id: MessageId::from_ulid(ulid::Ulid::from_parts(rng.random(), rng.random())),
         enqueue_ms: 1_752_000_000_000 + ordinal as i64,
         generation: 0,
         ordinal,
@@ -189,10 +198,10 @@ fn fuzz_active_tail_corruption_recovery() {
     for iter in 0..250 {
         let dir = tempfile::tempdir().unwrap();
         let mut seg = ActiveSegment::create(dir.path(), 1).unwrap();
-        let n = rng.gen_range(1..=12);
+        let n = rng.random_range(1..=12);
         let mut boundaries = vec![0u64];
         for ordinal in 0..n {
-            let body_len = rng.gen_range(0..2048);
+            let body_len = rng.random_range(0..2048);
             let encoded = encode_record(&mut rng, ordinal, body_len);
             seg.append(&encoded).unwrap();
             boundaries.push(seg.len());
@@ -202,7 +211,7 @@ fn fuzz_active_tail_corruption_recovery() {
         let full_len = std::fs::metadata(&path).unwrap().len();
 
         // Random corruption.
-        let mode = rng.gen_range(0..4);
+        let mode = rng.random_range(0..4);
         {
             use std::os::unix::fs::FileExt;
             let f = std::fs::OpenOptions::new()
@@ -211,21 +220,23 @@ fn fuzz_active_tail_corruption_recovery() {
                 .open(&path)
                 .unwrap();
             if mode == 0 || mode == 3 {
-                let cut = rng.gen_range(0..=full_len);
+                let cut = rng.random_range(0..=full_len);
                 f.set_len(cut).unwrap();
             }
             let len_now = f.metadata().unwrap().len();
             if (mode == 1 || mode == 3) && len_now > 0 {
-                for _ in 0..rng.gen_range(1..=8) {
-                    let at = rng.gen_range(0..len_now);
+                for _ in 0..rng.random_range(1..=8) {
+                    let at = rng.random_range(0..len_now);
                     let mut b = [0u8; 1];
                     f.read_exact_at(&mut b, at).unwrap();
-                    f.write_all_at(&[b[0] ^ (1 << rng.gen_range(0..8))], at)
+                    f.write_all_at(&[b[0] ^ (1 << rng.random_range(0..8))], at)
                         .unwrap();
                 }
             }
             if mode == 2 {
-                let garbage: Vec<u8> = (0..rng.gen_range(1..300)).map(|_| rng.gen()).collect();
+                let garbage: Vec<u8> = (0..rng.random_range(1..300))
+                    .map(|_| rng.random())
+                    .collect();
                 f.write_all_at(&garbage, len_now).unwrap();
             }
         }
@@ -271,23 +282,23 @@ fn fuzz_active_tail_corruption_recovery() {
 fn random_location(rng: &mut StdRng) -> JobLocation {
     JobLocation {
         shard: 0,
-        segment: rng.gen_range(1..6),
-        offset: rng.gen_range(0..1 << 20),
-        length: rng.gen_range(64..4096),
-        ordinal: rng.gen(),
-        generation: rng.gen_range(0..3),
+        segment: rng.random_range(1..6),
+        offset: rng.random_range(0..1 << 20),
+        length: rng.random_range(64..4096),
+        ordinal: rng.random(),
+        generation: rng.random_range(0..3),
     }
 }
 
 fn random_entry(rng: &mut StdRng, ids: &[MessageId]) -> StateEntry {
-    let id = ids[rng.gen_range(0..ids.len())];
-    match rng.gen_range(0..4) {
+    let id = ids[rng.random_range(0..ids.len())];
+    match rng.random_range(0..4) {
         0 => StateEntry::Deferred {
             id,
             location: random_location(rng),
-            attempts: rng.gen_range(0..10),
-            next_attempt_ms: rng.gen(),
-            remaining_recipients: (0..rng.gen_range(0..5))
+            attempts: rng.random_range(0..10),
+            next_attempt_ms: rng.random(),
+            remaining_recipients: (0..rng.random_range(0..5))
                 .map(|_| random_string(rng, 40))
                 .collect(),
             last_error: random_string(rng, 80),
@@ -295,12 +306,12 @@ fn random_entry(rng: &mut StdRng, ids: &[MessageId]) -> StateEntry {
         1 => StateEntry::Delivered {
             id,
             location: random_location(rng),
-            timestamp_ms: rng.gen(),
+            timestamp_ms: rng.random(),
         },
         2 => StateEntry::Bounced {
             id,
             location: random_location(rng),
-            timestamp_ms: rng.gen(),
+            timestamp_ms: rng.random(),
             reason: random_string(rng, 80),
         },
         _ => {
@@ -339,7 +350,7 @@ fn fuzz_journal_corruption_recovers_a_prefix() {
     for iter in 0..250 {
         let dir = tempfile::tempdir().unwrap();
         let ids: Vec<MessageId> = (0..5).map(|_| random_id(&mut rng)).collect();
-        let n = rng.gen_range(1..=25);
+        let n = rng.random_range(1..=25);
         let mut entries = Vec::with_capacity(n);
         {
             let (mut store, _) = ShardStateStore::recover(dir.path(), 0).unwrap();
@@ -353,7 +364,7 @@ fn fuzz_journal_corruption_recovers_a_prefix() {
         // Random corruption of the (only) journal file.
         let path = dir.path().join(JOURNAL_1);
         let full_len = std::fs::metadata(&path).unwrap().len();
-        let mode = rng.gen_range(0..4);
+        let mode = rng.random_range(0..4);
         {
             use std::os::unix::fs::FileExt;
             let f = std::fs::OpenOptions::new()
@@ -362,18 +373,20 @@ fn fuzz_journal_corruption_recovers_a_prefix() {
                 .open(&path)
                 .unwrap();
             match mode {
-                0 => f.set_len(rng.gen_range(0..=full_len)).unwrap(),
+                0 => f.set_len(rng.random_range(0..=full_len)).unwrap(),
                 1 => {
-                    for _ in 0..rng.gen_range(1..=4) {
-                        let at = rng.gen_range(0..full_len);
+                    for _ in 0..rng.random_range(1..=4) {
+                        let at = rng.random_range(0..full_len);
                         let mut b = [0u8; 1];
                         f.read_exact_at(&mut b, at).unwrap();
-                        f.write_all_at(&[b[0] ^ (1 << rng.gen_range(0..8))], at)
+                        f.write_all_at(&[b[0] ^ (1 << rng.random_range(0..8))], at)
                             .unwrap();
                     }
                 }
                 2 => {
-                    let garbage: Vec<u8> = (0..rng.gen_range(1..200)).map(|_| rng.gen()).collect();
+                    let garbage: Vec<u8> = (0..rng.random_range(1..200))
+                        .map(|_| rng.random())
+                        .collect();
                     f.write_all_at(&garbage, full_len).unwrap();
                 }
                 _ => {} // no corruption: the full state must survive
@@ -417,7 +430,7 @@ fn fuzz_checkpoint_corruption_is_rejected() {
         let ids: Vec<MessageId> = (0..4).map(|_| random_id(&mut rng)).collect();
         {
             let (mut store, _) = ShardStateStore::recover(dir.path(), 0).unwrap();
-            for _ in 0..rng.gen_range(1..=8) {
+            for _ in 0..rng.random_range(1..=8) {
                 store.append(&random_entry(&mut rng, &ids)).unwrap();
             }
             store.write_checkpoint(&Checkpoint::default()).unwrap();
@@ -425,14 +438,14 @@ fn fuzz_checkpoint_corruption_is_rejected() {
 
         let path = dir.path().join("checkpoint");
         let clean = std::fs::read(&path).unwrap();
-        let mode = rng.gen_range(0..3);
+        let mode = rng.random_range(0..3);
         match mode {
             0 => {
                 // Bit flips.
                 let mut buf = clean.clone();
-                for _ in 0..rng.gen_range(1..=4) {
-                    let at = rng.gen_range(0..buf.len());
-                    buf[at] ^= 1 << rng.gen_range(0..8);
+                for _ in 0..rng.random_range(1..=4) {
+                    let at = rng.random_range(0..buf.len());
+                    buf[at] ^= 1 << rng.random_range(0..8);
                 }
                 std::fs::write(&path, &buf).unwrap();
                 match ShardStateStore::recover(dir.path(), 0) {
@@ -450,7 +463,7 @@ fn fuzz_checkpoint_corruption_is_rejected() {
             }
             1 => {
                 // Truncation.
-                let cut = rng.gen_range(0..clean.len());
+                let cut = rng.random_range(0..clean.len());
                 std::fs::write(&path, &clean[..cut]).unwrap();
                 assert!(
                     ShardStateStore::recover(dir.path(), 0).is_err(),
@@ -459,7 +472,9 @@ fn fuzz_checkpoint_corruption_is_rejected() {
             }
             _ => {
                 // Pure garbage.
-                let garbage: Vec<u8> = (0..rng.gen_range(0..400)).map(|_| rng.gen()).collect();
+                let garbage: Vec<u8> = (0..rng.random_range(0..400))
+                    .map(|_| rng.random())
+                    .collect();
                 std::fs::write(&path, &garbage).unwrap();
                 assert!(
                     ShardStateStore::recover(dir.path(), 0).is_err(),
@@ -486,16 +501,16 @@ fn fuzz_repeated_crash_cycles() {
         for _cycle in 0..4 {
             {
                 let (mut store, _) = ShardStateStore::recover(dir.path(), 0).unwrap();
-                for _ in 0..rng.gen_range(0..8) {
+                for _ in 0..rng.random_range(0..8) {
                     store.append(&random_entry(&mut rng, &ids)).unwrap();
                 }
-                if rng.gen_bool(0.3) {
+                if rng.random_bool(0.3) {
                     // Snapshot whatever state we currently believe in.
                     store.write_checkpoint(&Checkpoint::default()).unwrap();
                 }
             }
             // Crash: tear the tail off the newest journal.
-            if rng.gen_bool(0.5) {
+            if rng.random_bool(0.5) {
                 let newest = std::fs::read_dir(dir.path())
                     .unwrap()
                     .filter_map(|e| e.ok())
@@ -504,7 +519,7 @@ fn fuzz_repeated_crash_cycles() {
                 if let Some(entry) = newest {
                     let len = entry.metadata().unwrap().len();
                     if len > 0 {
-                        let cut = rng.gen_range(0..len);
+                        let cut = rng.random_range(0..len);
                         let f = std::fs::OpenOptions::new()
                             .write(true)
                             .open(entry.path())

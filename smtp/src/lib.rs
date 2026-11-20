@@ -33,7 +33,7 @@ pub trait SmtpStream: AsyncRead + AsyncWrite + Unpin + Send {
     /// Upgrades the stream to TLS in place. Only valid when
     /// `supports_starttls()` returns true.
     async fn upgrade_to_tls(&mut self) -> Result<()> {
-        bail!("STARTTLS not supported on this stream")
+        bail!("STARTTLS not supported on this stream");
     }
 }
 
@@ -130,7 +130,7 @@ impl SmtpStream for MaybeTlsStream {
             }
             other => {
                 *self = other;
-                bail!("STARTTLS not supported on this stream")
+                bail!("STARTTLS not supported on this stream");
             }
         }
     }

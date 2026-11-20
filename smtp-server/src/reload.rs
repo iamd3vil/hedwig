@@ -2,13 +2,12 @@
 
 use std::{
     collections::HashMap,
-    io::BufReader,
     sync::{Arc, Mutex},
 };
 
 use arc_swap::{ArcSwap, Guard};
 use miette::{IntoDiagnostic, Result};
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use serde_json::Value;
 use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 use tracing::Level;
@@ -227,8 +226,8 @@ fn build_tls_acceptor(
     let key = std::fs::File::open(&tls.key_path).map_err(|_| {
         PreparationError::listener("server.listeners.tls.private_key", "read", listener_index)
     })?;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert))
-        .collect::<std::io::Result<_>>()
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cert)
+        .collect::<Result<_, _>>()
         .map_err(|_| {
             PreparationError::listener("server.listeners.tls.certificate", "parse", listener_index)
         })?;
@@ -239,13 +238,9 @@ fn build_tls_acceptor(
             listener_index,
         ));
     }
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key))
-        .map_err(|_| {
-            PreparationError::listener("server.listeners.tls.private_key", "parse", listener_index)
-        })?
-        .ok_or_else(|| {
-            PreparationError::listener("server.listeners.tls.private_key", "parse", listener_index)
-        })?;
+    let key = PrivateKeyDer::from_pem_reader(key).map_err(|_| {
+        PreparationError::listener("server.listeners.tls.private_key", "parse", listener_index)
+    })?;
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
