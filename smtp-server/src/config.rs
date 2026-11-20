@@ -316,9 +316,11 @@ impl Cfg {
         if path.extension().and_then(|s| s.to_str()) == Some("huml") {
             println!("Loading HUML configuration from {}", cfg_path);
             let huml_content = std::fs::read_to_string(cfg_path).into_diagnostic()?;
-            let cfg: Cfg = huml_rs::serde::from_str(&huml_content)
-                .map_err(|e| miette::miette!("Failed to parse HUML: {}", e))?;
-            return Ok(cfg);
+            // Parse the document first so syntax errors report a location without echoing the configuration.
+            let (_, document) = huml_rs::parse_huml(huml_content.trim())
+                .map_err(|e| miette::miette!("Invalid HUML at {e}"))?;
+            return Cfg::deserialize(huml_rs::serde::Deserializer::new(document.root))
+                .map_err(|e| miette::miette!("Invalid HUML configuration: {e}"));
         }
 
         // For other formats (TOML, JSON), use the config crate
@@ -397,6 +399,16 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_huml_version_reports_the_version_without_the_config_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.huml");
+        std::fs::write(&path, "%HUML v0.1.0\npassword: \"secret-fixture\"\n").unwrap();
+        let error = Cfg::load(path.to_str().unwrap()).unwrap_err().to_string();
+        assert!(error.contains("unsupported version"));
+        assert!(!error.contains("secret-fixture"));
+    }
+
+    #[test]
     fn dkim_file_formats_preserve_field_errors() {
         for extension in ["toml", "huml"] {
             for array in [false, true] {
@@ -423,7 +435,7 @@ mod tests {
                     .join("\n")
                     + "\n";
                 for (invalid, expected) in [
-                    (missing, "missing field `selector`"),
+                    (missing, "selector"),
                     (
                         source.replace("ed25519", "not-a-key-type"),
                         "not-a-key-type",

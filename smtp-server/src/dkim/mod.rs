@@ -3,10 +3,10 @@ use base64::Engine;
 use clap::Parser;
 use miette::{bail, Context, IntoDiagnostic, Result};
 use pkcs8::EncodePrivateKey;
-use rand::rngs::OsRng;
+use rand::rngs::SysRng;
 use rsa::{
     pkcs8::{EncodePublicKey, LineEnding},
-    RsaPrivateKey,
+    PrivateKey,
 };
 
 pub const DEFAULT_DKIM_KEY_BITS: usize = 2048;
@@ -67,7 +67,9 @@ fn key_generation_config(config: Option<&CfgDkim>, args: DkimGenerateArgs) -> Re
     let key_type = match args.key_type.as_deref() {
         Some("rsa") => DkimKeyType::Rsa,
         Some("ed25519") => DkimKeyType::Ed25519,
-        Some(_) => bail!("Invalid key type. Use 'rsa' or 'ed25519'"),
+        Some(_) => {
+            bail!("Invalid key type. Use 'rsa' or 'ed25519'");
+        }
         None => defaults.map(|v| v.key_type.clone()).unwrap_or_default(),
     };
     if defaults.is_some_and(|entry| entry.key_type != key_type) && args.private_key.is_none() {
@@ -105,22 +107,22 @@ pub(crate) fn from_domain(body: &[u8]) -> Result<String> {
     let message = mail_parser::MessageParser::default()
         .parse_headers(body)
         .ok_or_else(|| miette::miette!("Invalid message headers"))?;
-    if message
+    let mut from_headers = message
         .headers()
         .iter()
-        .filter(|h| h.name == mail_parser::HeaderName::From)
-        .count()
-        != 1
-    {
+        .filter(|header| header.name() == mail_parser::HeaderName::From);
+    let Some(from_header) = from_headers.next() else {
+        bail!("Exactly one From header is required");
+    };
+    if from_headers.next().is_some() {
         bail!("Exactly one From header is required");
     }
-    let Some(mail_parser::Address::List(addresses)) = message.from() else {
+    let mut addresses = message.from().into_iter().flat_map(|list| list.iter());
+    let (Some(mail_parser::Address::Mailbox(mailbox)), None) = (addresses.next(), addresses.next())
+    else {
         bail!("From must contain one mailbox");
     };
-    if addresses.len() != 1 {
-        bail!("From must contain one mailbox");
-    }
-    let address = addresses[0]
+    let address = mailbox
         .address()
         .ok_or_else(|| miette::miette!("Invalid From mailbox"))?;
     let parsed = email_address_parser::EmailAddress::parse(address, None)
@@ -130,11 +132,9 @@ pub(crate) fn from_domain(body: &[u8]) -> Result<String> {
     // mail-parser deliberately recovers malformed addresses (for example an
     // unclosed angle bracket). Require the raw field to parse as one mailbox
     // too, so recovery cannot turn malformed input into an authorized sender.
-    let raw = message
-        .headers_raw()
-        .find(|(name, _)| name.eq_ignore_ascii_case("From"))
-        .map(|(_, value)| value)
-        .ok_or_else(|| miette::miette!("Invalid From header"))?;
+    let raw = std::str::from_utf8(from_header.raw_value())
+        .into_diagnostic()
+        .wrap_err("Invalid From header")?;
     let raw_addresses = mailparse::addrparse(raw)
         .into_diagnostic()
         .wrap_err("Invalid From header")?;
@@ -170,8 +170,8 @@ impl crate::reload::RuntimeSnapshot {
 
 /// Generate RSA DKIM keys
 async fn generate_rsa_keys(dkim_config: &CfgDKIM) -> Result<()> {
-    let mut rng = OsRng;
-    let private_key = RsaPrivateKey::new(&mut rng, DEFAULT_DKIM_KEY_BITS)
+    let mut rng = SysRng;
+    let private_key = PrivateKey::new(&mut rng, DEFAULT_DKIM_KEY_BITS)
         .into_diagnostic()
         .wrap_err("Failed to generate RSA key pair")?;
 
@@ -198,13 +198,13 @@ async fn generate_rsa_keys(dkim_config: &CfgDKIM) -> Result<()> {
 async fn generate_ed25519_keys(dkim_config: &CfgDKIM) -> Result<()> {
     use ed25519_dalek::SigningKey;
     use pkcs8::{EncodePrivateKey, LineEnding};
-    use rand::RngCore;
+    use rand::TryRng;
 
-    let mut rng = OsRng;
+    let mut rng = SysRng;
 
     // Generate random bytes for the secret key
     let mut secret_bytes = [0u8; 32];
-    rng.fill_bytes(&mut secret_bytes);
+    rng.try_fill_bytes(&mut secret_bytes).into_diagnostic()?;
 
     // Create signing key from random bytes
     let signing_key = SigningKey::from_bytes(&secret_bytes);

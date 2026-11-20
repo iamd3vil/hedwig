@@ -236,15 +236,15 @@ mod tests {
                         .unwrap();
                     return session;
                 }
-                let certs = rustls_pemfile::certs(
-                    &mut include_bytes!("../../../dev/certs/mailpit.pem").as_slice(),
-                )
-                .collect::<std::io::Result<Vec<_>>>()
+                use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+                let certs = CertificateDer::pem_slice_iter(include_bytes!(
+                    "../../../dev/certs/mailpit.pem"
+                ))
+                .collect::<Result<Vec<_>, _>>()
                 .unwrap();
-                let key = rustls_pemfile::private_key(
-                    &mut include_bytes!("../../../dev/certs/mailpit-key.pem").as_slice(),
-                )
-                .unwrap()
+                let key = PrivateKeyDer::from_pem_slice(include_bytes!(
+                    "../../../dev/certs/mailpit-key.pem"
+                ))
                 .unwrap();
                 let config = rustls::ServerConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),

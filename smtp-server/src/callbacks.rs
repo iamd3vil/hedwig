@@ -8,7 +8,7 @@ use mailparse::MailAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use hickory_resolver::{lookup::MxLookup, TokioAsyncResolver};
+use hickory_resolver::{lookup::Lookup, TokioResolver};
 use miette::{Context, IntoDiagnostic};
 use moka::{future::Cache, Expiry};
 use smtp::{Email, SmtpCallbacks, SmtpError};
@@ -28,7 +28,7 @@ use crate::{
 /// Computes the lowercase hex HMAC-MD5 digest a client must send for the
 /// given password and challenge (RFC 2195).
 fn cram_md5_digest(password: &str, challenge: &str) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     // HMAC accepts keys of any length, so new_from_slice cannot fail.
     let mut mac =
         Hmac::<md5::Md5>::new_from_slice(password.as_bytes()).expect("HMAC accepts any key length");
@@ -219,11 +219,11 @@ fn extract_domain_full(path: &str) -> Option<String> {
 
 pub struct MXExpiry;
 
-impl Expiry<String, MxLookup> for MXExpiry {
+impl Expiry<String, Lookup> for MXExpiry {
     fn expire_after_create(
         &self,
         _key: &String,
-        value: &MxLookup,
+        value: &Lookup,
         _created_at: std::time::Instant,
     ) -> Option<std::time::Duration> {
         let valid_until = value.valid_until();
@@ -339,7 +339,7 @@ impl Callbacks {
             }
         }
 
-        let message_id = crate::logqueue::MessageId::from_ulid(Ulid::new());
+        let message_id = crate::logqueue::MessageId::from_ulid(Ulid::generate());
         let msg = crate::logqueue::writer::AppendMessage {
             message_id,
             enqueue_ms: Utc::now().timestamp_millis(),
@@ -363,7 +363,7 @@ impl Callbacks {
         if let Some(tap) = &self.log_queue {
             return self.process_email_log(tap, email).await;
         }
-        let ulid = Ulid::new().to_string();
+        let ulid = Ulid::generate().to_string();
         // We are using ulid as the message id instead of message_id from the email.
         // The issue is we can't depend on the email client to provide a unique message id.
         let body_len = email.body.len();
@@ -417,7 +417,8 @@ fn build_worker_resources(
         .build();
 
     // Create a shared DNS resolver for workers and MTA-STS.
-    let resolver = TokioAsyncResolver::tokio_from_system_conf()
+    let resolver = TokioResolver::builder_tokio()
+        .and_then(|builder| builder.build())
         .into_diagnostic()
         .wrap_err("failed to create DNS resolver")?;
 

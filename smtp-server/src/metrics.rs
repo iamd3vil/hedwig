@@ -6,14 +6,18 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use axum::{
+    body::Body,
+    http::{Method, Request, Response, StatusCode},
+    Router,
+};
 use once_cell::sync::Lazy;
 use prometheus::{
     register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
     register_int_gauge, register_int_gauge_vec, Encoder, Histogram, HistogramVec, IntCounter,
     IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
+use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 /// Holds references to all registered metrics so we can update them safely.
@@ -731,11 +735,15 @@ pub fn spawn_metrics_server(addr: SocketAddr) {
     info!(%addr, "starting metrics endpoint");
 
     tokio::spawn(async move {
-        let make_svc = make_service_fn(|_conn| async {
-            Ok::<_, Infallible>(service_fn(handle_metrics_request))
-        });
-
-        if let Err(err) = Server::bind(&addr).serve(make_svc).await {
+        let listener = match TcpListener::bind(addr).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                error!(%addr, error = %err, "failed to bind metrics endpoint");
+                return;
+            }
+        };
+        let app = Router::new().fallback(handle_metrics_request);
+        if let Err(err) = axum::serve(listener, app).await {
             error!(%addr, error = %err, "metrics server exited unexpectedly");
         } else {
             info!(%addr, "metrics server stopped");
@@ -761,7 +769,7 @@ async fn handle_metrics_request(req: Request<Body>) -> Result<Response<Body>, In
 
             let response = Response::builder()
                 .status(StatusCode::OK)
-                .header(hyper::header::CONTENT_TYPE, encoder.format_type())
+                .header(axum::http::header::CONTENT_TYPE, encoder.format_type())
                 .body(Body::from(buffer))
                 .expect("failed to build metrics response");
             Ok(response)
@@ -846,9 +854,9 @@ mod tests {
                 let matches_status = metric
                     .get_label()
                     .iter()
-                    .any(|label| label.get_name() == "status" && label.get_value() == status);
+                    .any(|label| label.name() == "status" && label.value() == status);
                 if matches_status {
-                    total += metric.get_counter().get_value() as u64;
+                    total += metric.get_counter().value() as u64;
                 }
             }
         }
@@ -862,8 +870,8 @@ mod tests {
         for family in METRICS.send_outcomes.collect() {
             for metric in family.get_metric() {
                 for label in metric.get_label() {
-                    if label.get_name() == "domain" {
-                        labels.insert(label.get_value().to_string());
+                    if label.name() == "domain" {
+                        labels.insert(label.value().to_string());
                     }
                 }
             }

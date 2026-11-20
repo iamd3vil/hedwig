@@ -1,10 +1,6 @@
 use std::{str, time::Duration};
 
-use hickory_resolver::{
-    error::ResolveErrorKind,
-    name_server::{GenericConnector, TokioRuntimeProvider},
-    AsyncResolver,
-};
+use hickory_resolver::{proto::rr::RData, TokioResolver};
 use miette::{Context, IntoDiagnostic, Result};
 use tracing::{debug, warn};
 
@@ -14,13 +10,24 @@ const POLICY_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_POLICY_SIZE_BYTES: usize = 64 * 1024;
 
 pub struct MtaStsFetcher {
-    resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>,
+    resolver: TokioResolver,
     http_client: reqwest::Client,
 }
 
 impl MtaStsFetcher {
-    pub fn new(resolver: AsyncResolver<GenericConnector<TokioRuntimeProvider>>) -> Self {
+    pub fn new(resolver: TokioResolver) -> Self {
+        // Keep the bundled WebPKI roots used for policy HTTPS requests.
+        let tls = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS versions")
+        .with_root_certificates(rustls::RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+        ))
+        .with_no_client_auth();
         let http_client = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(POLICY_FETCH_TIMEOUT)
             .build()
@@ -39,7 +46,7 @@ impl MtaStsFetcher {
         let lookup = match self.resolver.txt_lookup(query_name.as_str()).await {
             Ok(lookup) => lookup,
             Err(error) => {
-                if matches!(error.kind(), ResolveErrorKind::NoRecordsFound { .. }) {
+                if error.is_no_records_found() {
                     debug!(domain = %domain, "MTA-STS TXT record not found");
                     return Ok(None);
                 }
@@ -51,9 +58,12 @@ impl MtaStsFetcher {
         };
 
         let mut valid_records = Vec::new();
-        for record in lookup.iter() {
+        for answer in lookup.answers() {
+            let RData::TXT(record) = &answer.data else {
+                continue;
+            };
             let mut record_value = String::new();
-            for part in record.txt_data() {
+            for part in &record.txt_data {
                 record_value.push_str(&String::from_utf8_lossy(part.as_ref()));
             }
 

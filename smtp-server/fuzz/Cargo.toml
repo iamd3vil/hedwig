@@ -8,10 +8,10 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
-arbitrary = { version = "1", features = ["derive"] }
-tempfile = "3"
-ulid = "1"
+libfuzzer-sys = "0.4.13"
+arbitrary = { version = "1.5.0", features = ["derive"] }
+tempfile = "3.27.0"
+ulid = "3.0.0"
 hedwig = { path = ".." }
 
 # The fuzz crate is excluded from the parent workspace (see the root

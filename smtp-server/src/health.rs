@@ -1,8 +1,12 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use axum::{
+    body::Body,
+    http::{Method, Request, Response, StatusCode},
+    Router,
+};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
@@ -11,22 +15,19 @@ pub fn spawn_health_server(addr: SocketAddr, shutdown: CancellationToken) {
     info!(%addr, "starting health endpoint");
 
     tokio::spawn(async move {
-        let shutdown_for_service = shutdown.clone();
-        let make_svc = make_service_fn(move |_conn| {
-            let shutdown = shutdown_for_service.clone();
-            async move {
-                Ok::<_, Infallible>(service_fn(move |req| {
-                    handle_health_request(req, shutdown.clone())
-                }))
+        let listener = match TcpListener::bind(addr).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                error!(%addr, error = %err, "failed to bind health endpoint");
+                return;
             }
-        });
-
-        let server = Server::bind(&addr).serve(make_svc);
-        let server = server.with_graceful_shutdown(async move {
-            shutdown.cancelled().await;
-        });
-
-        if let Err(err) = server.await {
+        };
+        let token = shutdown.clone();
+        let app = Router::new().fallback(move |req| handle_health_request(req, token.clone()));
+        if let Err(err) = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+        {
             error!(%addr, error = %err, "health server exited unexpectedly");
         } else {
             info!(%addr, "health server stopped");

@@ -5,7 +5,7 @@ use hedwig::mta_sts::refresher;
 use hedwig::storage::{fs_storage::FileSystemStorage, Status, Storage};
 use hedwig::worker::{deferred_worker::DeferredWorker, Job};
 use hedwig::{callbacks, config, dkim, health, logqueue, metrics, queue_cli, worker};
-use miette::{bail, Context, IntoDiagnostic, Result};
+use miette::{miette, Context, IntoDiagnostic, Result};
 use smtp::{MaybeTlsStream, SmtpServer, SmtpStream};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -744,6 +744,6 @@ async fn get_storage_type(cfg: &CfgStorage) -> Result<Arc<dyn Storage>> {
             let st = FileSystemStorage::new(cfg.base_path.clone()).await?;
             Ok(Arc::new(st))
         }
-        _ => bail!("Unknown storage type: {}", cfg.storage_type),
+        _ => Err(miette!("Unknown storage type: {}", cfg.storage_type)),
     }
 }

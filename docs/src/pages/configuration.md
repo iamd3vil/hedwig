@@ -12,6 +12,8 @@ Hedwig supports TOML (default) and HUML configuration formats. The default confi
 hedwig -c /path/to/custom-config.toml
 ```
 
+The HUML parser reads v0.2.0. When upgrading a file with a `%HUML v0.1.0` directive, convert it to v0.2.0 syntax before restarting. For multiline strings, replace triple backticks with triple double quotes. The shipped HUML example works without a version directive.
+
 ## Log configuration (`[log]`)
 
 ```toml
