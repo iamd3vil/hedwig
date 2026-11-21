@@ -485,11 +485,11 @@ impl Worker {
         Ok(())
     }
 
-    /// Copies `raw_email` minus the headers that must not be transmitted,
-    /// returning the copy and the offset at which a `DKIM-Signature` header
-    /// belongs (the end of the header block). Keeping the copy and the
-    /// signature insertion separate is what lets the signed path build the
-    /// outbound message once instead of once per header rewrite.
+    /// Returns `raw_email` minus the headers that must not be transmitted,
+    /// along with the offset at which a `DKIM-Signature` header belongs (the
+    /// end of the header block). When no headers need to be dropped and
+    /// `reserve == 0` (the unsigned path), borrows `raw_email` directly with
+    /// zero allocation or body copy.
     ///
     /// Bcc is always dropped. A `DKIM-Signature` already on the message is
     /// dropped only when we are about to add our own: otherwise it belongs
@@ -498,11 +498,11 @@ impl Worker {
     ///
     /// Line endings are preserved verbatim, so the bytes handed to the
     /// signer are the bytes that go on the wire.
-    fn strip_outbound_headers(
-        raw_email: &[u8],
+    fn strip_outbound_headers<'a>(
+        raw_email: &'a [u8],
         drop_dkim_signature: bool,
         reserve: usize,
-    ) -> Result<(Vec<u8>, usize)> {
+    ) -> Result<(Cow<'a, [u8]>, usize)> {
         let boundary = memmem::find(raw_email, HEADER_BODY_SEPARATOR).ok_or_else(|| {
             miette::miette!("Invalid email format: header body boundary not found")
         })?;
@@ -512,8 +512,24 @@ impl Worker {
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
         };
 
+        let header_block = &raw_email[..boundary];
+        let has_dropped = header_block.split(|&b| b == b'\n').any(|line| {
+            let trimmed = line.strip_suffix(b"\r").unwrap_or(line);
+            is_header(trimmed, BCC_HEADER_PREFIX)
+                || (drop_dkim_signature && is_header(trimmed, DKIM_HEADER_PREFIX))
+        });
+
+        if !has_dropped {
+            if reserve == 0 {
+                return Ok((Cow::Borrowed(raw_email), boundary + 2));
+            }
+            let mut out = Vec::with_capacity(raw_email.len() + reserve);
+            out.extend_from_slice(raw_email);
+            return Ok((Cow::Owned(out), boundary + 2));
+        }
+
         let mut out = Vec::with_capacity(raw_email.len() + reserve);
-        for line in raw_email[..boundary].split(|&b| b == b'\n') {
+        for line in header_block.split(|&b| b == b'\n') {
             let trimmed = line.strip_suffix(b"\r").unwrap_or(line);
             // A folded continuation line is not recognized as part of the
             // header it continues, so a folded Bcc keeps its continuation
@@ -543,7 +559,7 @@ impl Worker {
         out.extend_from_slice(HEADER_BODY_SEPARATOR);
         out.extend_from_slice(&raw_email[boundary + HEADER_BODY_SEPARATOR.len()..]);
 
-        Ok((out, signature_at))
+        Ok((Cow::Owned(out), signature_at))
     }
 
     /// Inserts a signature header at the offset reported by
@@ -557,9 +573,9 @@ impl Worker {
         out.splice(signature_at..signature_at, header);
     }
 
-    /// Strip Bcc headers and DKIM-sign (when configured), producing the
-    /// final outbound bytes with a single copy of the message.
-    fn sign_outbound(&self, body: &[u8]) -> Result<Vec<u8>> {
+    /// Strip Bcc headers and DKIM-sign (when configured), borrowing the
+    /// original slice on the unsigned fast path when no headers are dropped.
+    fn sign_outbound<'a>(&self, body: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         let runtime = self.runtime.load();
         let Some(signer) = runtime.signer_for(body)? else {
             let (out, _) = Self::strip_outbound_headers(body, false, 0)
@@ -570,9 +586,10 @@ impl Worker {
         debug!("Signing email with DKIM");
         // Reserve the signature's room up front so splicing it in below
         // cannot reallocate and copy the whole message again.
-        let (mut out, signature_at) =
+        let (out_cow, signature_at) =
             Self::strip_outbound_headers(body, true, DKIM_SIGNATURE_RESERVE)
                 .wrap_err("Failed to remove Bcc header")?;
+        let mut out = out_cow.into_owned();
         // Signing `out` signs the message exactly as it will be
         // transmitted: the signature header itself is never covered.
         let signature = match signer {
@@ -598,7 +615,7 @@ impl Worker {
             }
         };
         Self::splice_dkim_signature(&mut out, signature_at, &signature);
-        Ok(out)
+        Ok(Cow::Owned(out))
     }
 
     /// The union of envelope recipients and any Cc/Bcc addresses parsed out
@@ -1356,14 +1373,15 @@ mod tests {
 
     /// The unsigned path: drop Bcc, leave any upstream signature alone.
     fn strip_bcc(raw_email: &[u8]) -> Result<Vec<u8>> {
-        Worker::strip_outbound_headers(raw_email, false, 0).map(|(out, _)| out)
+        Worker::strip_outbound_headers(raw_email, false, 0).map(|(out, _)| out.into_owned())
     }
 
     /// The signed path: drop Bcc and any stale signature, then splice ours
     /// in where the signer's output would go.
     fn strip_and_sign(raw_email: &[u8], signature: &str) -> Result<Vec<u8>> {
-        let (mut out, signature_at) =
+        let (out, signature_at) =
             Worker::strip_outbound_headers(raw_email, true, signature.len() + 2)?;
+        let mut out = out.into_owned();
         Worker::splice_dkim_signature(&mut out, signature_at, signature);
         Ok(out)
     }
@@ -1407,9 +1425,13 @@ mod tests {
     fn test_strip_outbound_headers_bcc_absent() {
         let raw_email = b"From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n\r\nBody";
         let expected = b"From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n\r\nBody";
-        let result = strip_bcc(raw_email).unwrap();
+        let (cow, _) = Worker::strip_outbound_headers(raw_email, false, 0).unwrap();
+        assert!(
+            matches!(cow, Cow::Borrowed(_)),
+            "unsigned path without Bcc should borrow without copying"
+        );
         assert_eq!(
-            str::from_utf8(&result).unwrap(),
+            str::from_utf8(&cow).unwrap(),
             str::from_utf8(expected).unwrap()
         );
     }
