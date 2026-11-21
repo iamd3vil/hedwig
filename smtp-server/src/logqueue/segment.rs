@@ -335,13 +335,16 @@ impl SegmentReader {
         }
     }
 
-    /// Read and checksum-verify the body of a record whose header was read
-    /// at `offset`.
+    /// Read, checksum-verify, and decode the body of a record whose header was
+    /// read at `offset`.
     pub fn read_body(&self, header: &RecordHeader, offset: u64) -> Result<Vec<u8>, QueueError> {
         let mut body = vec![0u8; header.body_len() as usize];
         self.read_exact_at(&mut body, offset + header.header_len as u64)?;
         record::verify_body(header, &body)?;
-        Ok(body)
+        if (header.flags & record::FLAG_LZ4) == 0 {
+            return Ok(body);
+        }
+        record::decode_body(header, bytes::Bytes::from(body)).map(Vec::from)
     }
 
     /// Read a complete record (header + verified body) at `offset`.

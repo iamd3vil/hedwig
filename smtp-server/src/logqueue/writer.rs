@@ -141,6 +141,8 @@ pub struct AppendMessage {
 
 struct AppendRequest {
     msg: AppendMessage,
+    /// Record header flags (e.g. `FLAG_LZ4` when `msg.body` is LZ4-compressed).
+    flags: u16,
     /// Computed by the concurrent admission task so the single shard writer
     /// does not serially checksum every large body before writing it.
     payload_crc: u32,
@@ -205,9 +207,9 @@ impl AppendHandle {
     pub async fn append_to_shard(
         &self,
         shard: u16,
-        msg: AppendMessage,
+        mut msg: AppendMessage,
     ) -> Result<JobLocation, QueueError> {
-        let params = RecordParams {
+        let raw_params = RecordParams {
             message_id: msg.message_id,
             enqueue_ms: msg.enqueue_ms,
             generation: msg.generation,
@@ -216,10 +218,10 @@ impl AppendHandle {
             recipients: &msg.recipients,
             body: &msg.body,
         };
-        let sizes = record::encoded_sizes(&params)?;
-        if sizes.record_len > self.max_record_len {
+        let raw_sizes = record::encoded_sizes(&raw_params)?;
+        if raw_sizes.record_len > self.max_record_len {
             return Err(QueueError::RecordTooLarge {
-                len: sizes.record_len as u64,
+                len: raw_sizes.record_len as u64,
                 limit: self.max_record_len as u64,
             });
         }
@@ -229,7 +231,7 @@ impl AppendHandle {
         // stay below the journal replay limit. The SMTP recipient cap keeps
         // real mail far under this; the check makes the queue safe on its
         // own.
-        let envelope_len = sizes.header_len as u64 - record::FIXED_HEADER_LEN as u64;
+        let envelope_len = raw_sizes.header_len as u64 - record::FIXED_HEADER_LEN as u64;
         if envelope_len > super::spool::ENVELOPE_ALLOWANCE {
             return Err(QueueError::InvalidRecord(format!(
                 "envelope is {envelope_len} bytes, exceeds the {} byte allowance",
@@ -237,8 +239,19 @@ impl AppendHandle {
             )));
         }
 
-        // Acquire admission permits for the encoded size, clamped so one
-        // huge record cannot exceed the whole semaphore (it then simply
+        // Do body-sized CPU work (LZ4 compression + CRC32) on the concurrent
+        // admission tasks rather than serializing it on the shard's single
+        // writer. `prepare_payload` compresses payloads that shrink on disk and
+        // probes large bodies first so incompressible attachments bail out fast.
+        let (stored_body, flags) = record::prepare_payload(msg.body);
+        msg.body = stored_body;
+        let sizes = record::RecordSizes {
+            header_len: raw_sizes.header_len,
+            record_len: raw_sizes.header_len + msg.body.len() as u32,
+        };
+
+        // Acquire admission permits for the encoded on-disk size, clamped so
+        // one huge record cannot exceed the whole semaphore (it then simply
         // occupies all admission capacity while queued).
         let permits = (sizes.record_len as u64).min(self.pending_limit) as u32;
         let permit = Arc::clone(&self.pending_bytes)
@@ -249,9 +262,6 @@ impl AppendHandle {
             self.pending_limit - self.pending_bytes.available_permits() as u64,
         );
 
-        // Do the body-sized CPU work on the concurrent admission tasks,
-        // rather than serializing it on the shard's single writer. The body
-        // is immutable Bytes, so the checksum remains valid after queueing.
         let payload_crc = crc32fast::hash(&msg.body);
 
         let (tx, rx) = oneshot::channel();
@@ -259,6 +269,7 @@ impl AppendHandle {
             .tx
             .send(WriterMsg::Append(AppendRequest {
                 msg,
+                flags,
                 payload_crc,
                 sizes,
                 completion: tx,
@@ -562,7 +573,12 @@ impl ShardWriter {
             // Header only: the kernel gathers it with the body, so a
             // multi-megabyte message is never copied to make the record
             // contiguous.
-            match record::encode_header_with_payload_crc(&params, req.sizes, req.payload_crc) {
+            match record::encode_header_with_payload_crc(
+                &params,
+                req.sizes,
+                req.flags,
+                req.payload_crc,
+            ) {
                 Ok(header) => headers.push(header),
                 // Admission measured these sizes, so this is unreachable.
                 // Were it not, the offending record must not take the rest
@@ -757,6 +773,18 @@ mod tests {
         writers.shutdown().await;
     }
 
+    fn incompressible_body(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x & 0xff) as u8
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn rotation_at_target_size() {
         let dir = tempfile::tempdir().unwrap();
@@ -767,7 +795,10 @@ mod tests {
         let handle = writers.handle();
 
         for i in 0..20u64 {
-            handle.append(message(i, &vec![b'y'; 1024])).await.unwrap();
+            handle
+                .append(message(i, &incompressible_body(i, 1024)))
+                .await
+                .unwrap();
         }
 
         let chain = handle.shard_shared(0).chain();
@@ -974,6 +1005,7 @@ mod tests {
         (
             AppendRequest {
                 msg,
+                flags: 0,
                 payload_crc,
                 sizes,
                 completion: tx,
@@ -1074,7 +1106,12 @@ mod tests {
                 .read_record_exact(loc.offset, loc.length, MAX_RECORD_LEN)
                 .unwrap();
             assert_eq!(header.message_id, *id);
-            assert_eq!(&record[header.header_len as usize..], &body[..]);
+            let decoded = record::decode_body(
+                &header,
+                Bytes::from(record).slice(header.header_len as usize..),
+            )
+            .unwrap();
+            assert_eq!(&decoded[..], &body[..]);
         }
         assert_eq!(head.committed, expected_offset);
 
