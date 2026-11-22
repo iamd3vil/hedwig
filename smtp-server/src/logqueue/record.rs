@@ -6,7 +6,7 @@
 //! offset  size  field
 //!      0     4  magic ("HWLQ")
 //!      4     2  format version
-//!      6     2  flags (reserved, must be zero)
+//!      6     2  flags (bit 0 = FLAG_LZ4; higher bits reserved, must be zero)
 //!      8     4  record_len   — total record size: header_len + body_len
 //!     12     4  header_len   — body starts at this offset within the record
 //!     16     4  header_crc   — crc32 over [0..16) ++ [20..header_len)
@@ -27,6 +27,16 @@
 use super::{MessageId, QueueError, FORMAT_VERSION};
 
 pub const MAGIC: [u8; 4] = *b"HWLQ";
+/// Payload is LZ4-block compressed with a 4-byte little-endian uncompressed
+/// length prefix (`lz4_flex::block::compress_prepend_size`). `payload_crc`
+/// covers the stored (compressed) bytes on disk.
+pub const FLAG_LZ4: u16 = 0x0001;
+const KNOWN_FLAGS_MASK: u16 = FLAG_LZ4;
+/// Body size at or above which we probe a 4 KiB middle slice before committing
+/// to full-body LZ4 compression, so large incompressible attachments (PDFs,
+/// images, ZIPs) bail out in a few µs without a multi-MB allocation.
+const COMPRESS_PROBE_THRESHOLD: usize = 32 * 1024;
+const COMPRESS_PROBE_BYTES: usize = 4 * 1024;
 /// Size of the fixed portion of the header, before the envelope.
 pub const FIXED_HEADER_LEN: usize = 56;
 /// Byte range covered by `header_crc`, part 1 (everything before the crc
@@ -42,6 +52,7 @@ pub const MAX_RECORD_LEN: u32 = u32::MAX - 4096;
 /// header without touching the body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordHeader {
+    pub flags: u16,
     pub message_id: MessageId,
     pub enqueue_ms: i64,
     pub generation: u32,
@@ -169,13 +180,63 @@ fn header_len(params: &RecordParams<'_>) -> Result<u32, QueueError> {
     Ok(len as u32)
 }
 
+/// Compress a payload with LZ4 when it shrinks the on-disk size.
+///
+/// Payloads at or above [`COMPRESS_PROBE_THRESHOLD`] probe a 4 KiB window in
+/// the middle of the body first so incompressible attachments skip full-body
+/// compression without allocating and scanning a multi-MB buffer.
+pub fn prepare_payload(body: bytes::Bytes) -> (bytes::Bytes, u16) {
+    if body.len() >= COMPRESS_PROBE_THRESHOLD {
+        let mid = body.len() / 2;
+        let half = COMPRESS_PROBE_BYTES / 2;
+        let probe = &body[mid - half..mid + half];
+        if lz4_flex::block::compress(probe).len()
+            >= COMPRESS_PROBE_BYTES - (COMPRESS_PROBE_BYTES / 8)
+        {
+            return (body, 0);
+        }
+    }
+
+    let compressed = lz4_flex::block::compress_prepend_size(&body);
+    if compressed.len() < body.len() {
+        (bytes::Bytes::from(compressed), FLAG_LZ4)
+    } else {
+        (body, 0)
+    }
+}
+
+/// Decode a verified on-disk payload back into raw message bytes.
+/// Uncompressed records are returned zero-copy.
+pub fn decode_body(
+    header: &RecordHeader,
+    stored: bytes::Bytes,
+) -> Result<bytes::Bytes, QueueError> {
+    if (header.flags & FLAG_LZ4) == 0 {
+        return Ok(stored);
+    }
+    if stored.len() < 4 {
+        return Err(QueueError::InvalidRecord(
+            "compressed payload shorter than 4-byte length prefix".into(),
+        ));
+    }
+    let uncompressed_len = u32::from_le_bytes(stored[..4].try_into().unwrap());
+    if uncompressed_len > MAX_RECORD_LEN {
+        return Err(QueueError::InvalidRecord(format!(
+            "compressed payload declares {uncompressed_len} bytes, exceeds MAX_RECORD_LEN"
+        )));
+    }
+    let decompressed = lz4_flex::block::decompress_size_prepended(&stored)
+        .map_err(|e| QueueError::InvalidRecord(format!("lz4 decompression failed: {e}")))?;
+    Ok(bytes::Bytes::from(decompressed))
+}
+
 /// Encode just the header of a record whose sizes have already been
 /// measured. The body is left where it is: the append path hands header and
 /// body to the kernel as adjacent iovecs, so nothing copies the message
 /// (up to the configured maximum, tens of megabytes) merely to make the
 /// record contiguous in userspace.
 pub fn encode_header(params: &RecordParams<'_>, sizes: RecordSizes) -> Result<Vec<u8>, QueueError> {
-    encode_header_with_payload_crc(params, sizes, crc32fast::hash(params.body))
+    encode_header_with_payload_crc(params, sizes, 0, crc32fast::hash(params.body))
 }
 
 /// Encode a header with a payload checksum computed by the caller.
@@ -186,10 +247,11 @@ pub fn encode_header(params: &RecordParams<'_>, sizes: RecordSizes) -> Result<Ve
 pub(super) fn encode_header_with_payload_crc(
     params: &RecordParams<'_>,
     sizes: RecordSizes,
+    flags: u16,
     payload_crc: u32,
 ) -> Result<Vec<u8>, QueueError> {
     let mut buf = Vec::with_capacity(sizes.header_len as usize);
-    write_header(&mut buf, params, sizes, payload_crc)?;
+    write_header(&mut buf, params, sizes, flags, payload_crc)?;
     Ok(buf)
 }
 
@@ -199,7 +261,7 @@ pub(super) fn encode_header_with_payload_crc(
 pub fn encode(params: &RecordParams<'_>) -> Result<Vec<u8>, QueueError> {
     let sizes = encoded_sizes(params)?;
     let mut buf = Vec::with_capacity(sizes.record_len as usize);
-    write_header(&mut buf, params, sizes, crc32fast::hash(params.body))?;
+    write_header(&mut buf, params, sizes, 0, crc32fast::hash(params.body))?;
     buf.extend_from_slice(params.body);
     debug_assert_eq!(buf.len(), sizes.record_len as usize);
     Ok(buf)
@@ -211,6 +273,7 @@ fn write_header(
     buf: &mut Vec<u8>,
     params: &RecordParams<'_>,
     sizes: RecordSizes,
+    flags: u16,
     payload_crc: u32,
 ) -> Result<(), QueueError> {
     debug_assert!(buf.is_empty());
@@ -221,7 +284,7 @@ fn write_header(
 
     buf.extend_from_slice(&MAGIC);
     buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes()); // flags
+    buf.extend_from_slice(&flags.to_le_bytes());
     buf.extend_from_slice(&record_len.to_le_bytes());
     buf.extend_from_slice(&header_len.to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes()); // header_crc placeholder
@@ -291,7 +354,7 @@ pub fn decode_header(buf: &[u8], max_record_len: u32) -> Result<RecordHeader, De
         return Err(DecodeError::UnsupportedVersion(version));
     }
     let flags = read_u16(buf, 6);
-    if flags != 0 {
+    if (flags & !KNOWN_FLAGS_MASK) != 0 {
         return Err(DecodeError::Corrupt(format!("unknown flags {flags:#06x}")));
     }
     let record_len = read_u32(buf, 8);
@@ -348,6 +411,7 @@ pub fn decode_header(buf: &[u8], max_record_len: u32) -> Result<RecordHeader, De
     }
 
     Ok(RecordHeader {
+        flags,
         message_id: MessageId(id),
         enqueue_ms,
         generation,
@@ -436,7 +500,8 @@ mod tests {
         let sizes = encoded_sizes(&p).unwrap();
         let whole = encode(&p).unwrap();
         let header = encode_header(&p, sizes).unwrap();
-        let precomputed = encode_header_with_payload_crc(&p, sizes, crc32fast::hash(body)).unwrap();
+        let precomputed =
+            encode_header_with_payload_crc(&p, sizes, 0, crc32fast::hash(body)).unwrap();
 
         assert_eq!(precomputed, header);
         assert_eq!(header.len(), sizes.header_len as usize);
@@ -455,7 +520,7 @@ mod tests {
         let body = b"body";
         let p = params(body, &rcpts);
         let sizes = encoded_sizes(&p).unwrap();
-        let header = encode_header_with_payload_crc(&p, sizes, 0).unwrap();
+        let header = encode_header_with_payload_crc(&p, sizes, 0, 0).unwrap();
         let decoded = decode_header(&header, MAX_RECORD_LEN).unwrap();
 
         assert!(verify_body(&decoded, body).is_err());
@@ -623,5 +688,81 @@ mod tests {
         let h = decode_header(&buf, MAX_RECORD_LEN).unwrap();
         assert_eq!(h.enqueue_ms, p.enqueue_ms);
         assert_eq!(h.generation, 42);
+    }
+
+    #[test]
+    fn lz4_compresses_small_and_large_text_and_round_trips() {
+        let rcpts = vec!["a@example.com".to_string()];
+        for repeats in [20, 4000] {
+            let original = bytes::Bytes::from(
+                "From: a@b.com\r\nTo: c@d.com\r\n\r\n".to_string()
+                    + &"hello world email body\r\n".repeat(repeats),
+            );
+            let (stored, flags) = prepare_payload(original.clone());
+            assert_eq!(flags, FLAG_LZ4);
+            assert!(stored.len() < original.len());
+
+            let p = params(&stored, &rcpts);
+            let sizes = encoded_sizes(&p).unwrap();
+            let hdr =
+                encode_header_with_payload_crc(&p, sizes, flags, crc32fast::hash(&stored)).unwrap();
+            let h = decode_header(&hdr, MAX_RECORD_LEN).unwrap();
+            assert_eq!(h.flags, FLAG_LZ4);
+            verify_body(&h, &stored).unwrap();
+            let decoded = decode_body(&h, stored).unwrap();
+            assert_eq!(decoded, original);
+        }
+    }
+
+    #[test]
+    fn lz4_skips_incompressible_payloads() {
+        // Pseudo-random incompressible bytes simulating a PDF/base64 attachment
+        // both below and above the probe threshold.
+        let mut x: u64 = 0x1234_5678_9abc_def0;
+        let gen = |len: usize, state: &mut u64| -> bytes::Bytes {
+            let v: Vec<u8> = (0..len)
+                .map(|_| {
+                    *state ^= *state << 13;
+                    *state ^= *state >> 7;
+                    *state ^= *state << 17;
+                    (*state & 0xff) as u8
+                })
+                .collect();
+            bytes::Bytes::from(v)
+        };
+        for len in [64, 4 * 1024, 128 * 1024] {
+            let incomp = gen(len, &mut x);
+            let (stored, flags) = prepare_payload(incomp.clone());
+            assert_eq!(flags, 0);
+            assert_eq!(stored.len(), incomp.len());
+        }
+    }
+
+    #[test]
+    fn lz4_decode_rejects_truncated_oversized_and_corrupt_frames() {
+        let rcpts = vec!["a@example.com".to_string()];
+        let make_header = |stored: &[u8]| {
+            let p = params(stored, &rcpts);
+            let sizes = encoded_sizes(&p).unwrap();
+            let hdr = encode_header_with_payload_crc(&p, sizes, FLAG_LZ4, crc32fast::hash(stored))
+                .unwrap();
+            decode_header(&hdr, MAX_RECORD_LEN).unwrap()
+        };
+
+        // Shorter than 4-byte uncompressed length prefix.
+        let short = bytes::Bytes::from_static(&[1, 2]);
+        assert!(decode_body(&make_header(&short), short).is_err());
+
+        // Declared uncompressed length exceeds MAX_RECORD_LEN.
+        let mut huge = Vec::from((MAX_RECORD_LEN + 1).to_le_bytes());
+        huge.extend_from_slice(&[0u8; 8]);
+        let huge = bytes::Bytes::from(huge);
+        assert!(decode_body(&make_header(&huge), huge).is_err());
+
+        // Valid length prefix but invalid LZ4 block stream.
+        let mut corrupt = Vec::from(128u32.to_le_bytes());
+        corrupt.extend_from_slice(&[0xffu8; 16]);
+        let corrupt = bytes::Bytes::from(corrupt);
+        assert!(decode_body(&make_header(&corrupt), corrupt).is_err());
     }
 }

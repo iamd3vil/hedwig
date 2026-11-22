@@ -214,7 +214,10 @@ impl DispatcherHandle {
                     ),
                 });
             }
-            Ok(bytes::Bytes::from(buf).slice(header.header_len as usize..))
+            super::record::decode_body(
+                &header,
+                bytes::Bytes::from(buf).slice(header.header_len as usize..),
+            )
         })
         .await
         .expect("read_body task panicked")
@@ -1301,7 +1304,19 @@ impl Dispatcher {
                     return;
                 }
             };
-            let body = bytes::Bytes::from(buf).slice(header.header_len as usize..);
+            let body = match super::record::decode_body(
+                &header,
+                bytes::Bytes::from(buf).slice(header.header_len as usize..),
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(message_id = %id, error = %e,
+                        "compaction decode failed; aborting pass");
+                    crate::metrics::logqueue_compaction_failed();
+                    self.compaction = None;
+                    return;
+                }
+            };
 
             let append = self.append.clone();
             let new = match append
@@ -2131,6 +2146,20 @@ mod tests {
         v
     }
 
+    fn incompressible_body(seed: u64, len: usize) -> Bytes {
+        let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        Bytes::from(
+            (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x & 0xff) as u8
+                })
+                .collect::<Vec<u8>>(),
+        )
+    }
+
     #[tokio::test]
     async fn fully_delivered_sealed_segments_are_deleted_event_driven() {
         let dir = tempfile::tempdir().unwrap();
@@ -2159,7 +2188,7 @@ mod tests {
         let append = writers.handle();
         for i in 0..12u64 {
             let mut m = message(i, "r@example.com");
-            m.body = Bytes::from(vec![b'x'; 400]);
+            m.body = incompressible_body(i, 400);
             append.append(m).await.unwrap();
         }
         let shard_dir = spool.shard(0).path().to_path_buf();
@@ -2215,9 +2244,10 @@ mod tests {
         .unwrap();
         let append = writers.handle();
         // m0..m3 fill segment 1; m4 forces rotation into segment 2.
+        let filler = incompressible_body(1, 400);
         for i in 0..5u64 {
             let mut m = message(i, "r@example.com");
-            m.body = Bytes::from(vec![b'x'; 400]);
+            m.body = filler.clone();
             append.append(m).await.unwrap();
         }
         let shard_dir = spool.shard(0).path().to_path_buf();
@@ -2282,7 +2312,7 @@ mod tests {
             .unwrap();
         assert_eq!(header.message_id, survivor);
         assert_eq!(header.generation, 1);
-        assert_eq!(body, vec![b'x'; 400]);
+        assert_eq!(body, &filler[..]);
     }
 
     #[tokio::test]
