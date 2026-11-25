@@ -66,6 +66,16 @@ fn strip_brackets(s: &str) -> &str {
     s.trim_matches(|c| c == '<' || c == '>')
 }
 
+/// Normalizes bare `\n` and bare `\r` line endings to `\r\n`, borrowing
+/// `raw_email` with zero allocation when line endings are already valid CRLF.
+pub(crate) fn normalize_line_endings(raw_email: &[u8]) -> Cow<'_, [u8]> {
+    if has_bare_line_ending(raw_email) {
+        Cow::Owned(normalize_crlf(raw_email, 0))
+    } else {
+        Cow::Borrowed(raw_email)
+    }
+}
+
 /// Returns true if `raw_email` contains any bare `\n` (not preceded by `\r`)
 /// or bare `\r` (not followed by `\n`). Valid CRLF messages pass in a single
 /// SIMD scan without allocating.
@@ -338,9 +348,15 @@ impl Worker {
             Err(e) => return Err(e).wrap_err("failed to get email from storage"),
         };
 
+        // Normalize bare line endings before the first header parse so
+        // Subject/From/Cc/Bcc extraction, DKIM authorization, and outbound
+        // signing all see identical CRLF headers (including already-queued
+        // messages). Valid CRLF messages borrow without copying.
+        let body = normalize_line_endings(email.body.as_bytes());
+
         // Only header fields are ever read out of `msg`, so parsing the
         // whole MIME tree per attempt is wasted work.
-        let msg = match MessageParser::default().parse_headers(&email.body) {
+        let msg = match MessageParser::default().parse_headers(&body) {
             Some(msg) => msg,
             None => {
                 error!(msg_id = ?job.job_id, "Failed to parse email body");
@@ -383,7 +399,7 @@ impl Worker {
             attempt: job.attempts,
         };
 
-        match self.send_email(&email.to, &msg, &email.body, &ctx).await {
+        match self.send_email(&email.to, &msg, &body, &ctx).await {
             Ok(_) => {
                 self.storage.delete(&job.job_id, Status::Queued).await?;
                 metrics::queue_depth_dec();
@@ -575,18 +591,22 @@ impl Worker {
         }
 
         let mut out = Vec::with_capacity(normalized.len() + reserve);
+        let mut dropping = false;
         for line in header_block.split(|&b| b == b'\n') {
             let trimmed = line.strip_suffix(b"\r").unwrap_or(line);
-            // A folded continuation line is not recognized as part of the
-            // header it continues, so a folded Bcc keeps its continuation
-            // lines. Fixing that needs real header parsing; the behavior is
-            // pinned by `test_strip_outbound_headers_folded_bcc`.
-            let drop = is_header(trimmed, BCC_HEADER_PREFIX)
-                || (drop_dkim_signature && is_header(trimmed, DKIM_HEADER_PREFIX));
-            if !drop {
-                out.extend_from_slice(line);
-                out.push(b'\n');
+            if matches!(trimmed.first(), Some(b' ' | b'\t')) {
+                if dropping {
+                    continue;
+                }
+            } else {
+                dropping = is_header(trimmed, BCC_HEADER_PREFIX)
+                    || (drop_dkim_signature && is_header(trimmed, DKIM_HEADER_PREFIX));
+                if dropping {
+                    continue;
+                }
             }
+            out.extend_from_slice(line);
+            out.push(b'\n');
         }
 
         // The loop left a terminator on the last kept header; the separator
@@ -622,18 +642,33 @@ impl Worker {
     /// Strip Bcc headers and DKIM-sign (when configured), borrowing the
     /// original slice on the unsigned fast path when no headers are dropped.
     fn sign_outbound<'a>(&self, body: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        let normalized = normalize_line_endings(body);
         let runtime = self.runtime.load();
-        let Some(signer) = runtime.signer_for(body)? else {
-            let (out, _) = Self::strip_outbound_headers(body, false, 0)
-                .wrap_err("Failed to remove Bcc header")?;
-            return Ok(out);
+        let Some(signer) = runtime.signer_for(&normalized)? else {
+            return match normalized {
+                Cow::Borrowed(raw) => {
+                    let (out, _) = Self::strip_outbound_headers(raw, false, 0)
+                        .wrap_err("Failed to remove Bcc header")?;
+                    Ok(out)
+                }
+                Cow::Owned(buf) => {
+                    let stripped = match Self::strip_outbound_headers(&buf, false, 0)
+                        .wrap_err("Failed to remove Bcc header")?
+                        .0
+                    {
+                        Cow::Owned(stripped) => Some(stripped),
+                        Cow::Borrowed(_) => None,
+                    };
+                    Ok(Cow::Owned(stripped.unwrap_or(buf)))
+                }
+            };
         };
 
         debug!("Signing email with DKIM");
         // Reserve the signature's room up front so splicing it in below
         // cannot reallocate and copy the whole message again.
         let (out_cow, signature_at) =
-            Self::strip_outbound_headers(body, true, DKIM_SIGNATURE_RESERVE)
+            Self::strip_outbound_headers(&normalized, true, DKIM_SIGNATURE_RESERVE)
                 .wrap_err("Failed to remove Bcc header")?;
         let mut out = out_cow.into_owned();
         // Signing `out` signs the message exactly as it will be
@@ -886,12 +921,17 @@ impl Worker {
             );
         };
 
+        // Normalize bare line endings before the first header parse so
+        // From/Cc/Bcc extraction, DKIM authorization, and outbound signing all
+        // see identical CRLF headers (including already-queued messages).
+        let body = normalize_line_endings(body);
+
         // Headers only: this path reads the From address and (on the first
         // attempt) Cc/Bcc, never the body parts.
-        let Some(msg) = MessageParser::default().parse_headers(body) else {
+        let Some(msg) = MessageParser::default().parse_headers(&body) else {
             error!(msg_id = %job.message_id, "Failed to parse email body");
             return self
-                .bounce_claim(job, body, "unparseable message body".into())
+                .bounce_claim(job, &body, "unparseable message body".into())
                 .await;
         };
 
@@ -917,7 +957,7 @@ impl Worker {
             Cow::Borrowed(&job.recipients)
         };
 
-        let raw_email = match self.sign_outbound(body) {
+        let raw_email = match self.sign_outbound(&body) {
             Ok(raw) => raw,
             Err(e) => {
                 if e.downcast_ref::<crate::dkim::UnconfiguredDomain>()
@@ -938,13 +978,13 @@ impl Worker {
                     };
                 }
                 return self
-                    .bounce_claim(job, body, format!("preparing outbound message: {e:#}"))
+                    .bounce_claim(job, &body, format!("preparing outbound message: {e:#}"))
                     .await;
             }
         };
         let Some(from) = msg.from().and_then(|f| f.first()).and_then(|f| f.address()) else {
             return self
-                .bounce_claim(job, body, "invalid from address".into())
+                .bounce_claim(job, &body, "invalid from address".into())
                 .await;
         };
 
@@ -1047,7 +1087,7 @@ impl Worker {
         }
 
         match bounce_reason {
-            Some(reason) if !delivered_any => self.bounce_claim(job, body, reason).await,
+            Some(reason) if !delivered_any => self.bounce_claim(job, &body, reason).await,
             _ => {
                 metrics::email_sent();
                 JobOutcome::Delivered {
@@ -1095,10 +1135,10 @@ impl Worker {
         &self,
         to: &[String],
         email: &'b Message<'b>,
-        body: &str,
+        body: &[u8],
         ctx: &DeliveryContext<'b>,
     ) -> Result<()> {
-        let raw_email = self.sign_outbound(body.as_bytes())?;
+        let raw_email = self.sign_outbound(body)?;
         let from = email
             .from()
             .and_then(|f| f.first())
@@ -1495,19 +1535,73 @@ mod tests {
 
     #[test]
     fn test_strip_outbound_headers_folded_bcc() {
-        // Folded headers are tricky. This line-oriented implementation
-        // won't handle a folded Bcc; a robust solution would need proper
-        // header parsing.
-        let raw_email = b"From: a@b.com\r\nTo: c@d.com\r\nBcc: e@f.com,\r\n g@h.com\r\nSubject: Test\r\n\r\nBody";
-        // Only the first line "Bcc: e@f.com," is removed.
-        let expected_current =
-            b"From: a@b.com\r\nTo: c@d.com\r\n g@h.com\r\nSubject: Test\r\n\r\nBody";
-        let result = strip_bcc(raw_email).unwrap();
+        // Space- and tab-indented continuation lines of Bcc must be dropped
+        // completely so blind recipients never leak on CRLF or bare-LF mail.
+        let raw_crlf = b"From: a@b.com\r\nTo: c@d.com\r\nBcc: e@f.com,\r\n g@h.com,\r\n\ti@j.com\r\nSubject: Test\r\n folded\r\n\r\nBody";
+        let expected = b"From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n folded\r\n\r\nBody";
         assert_eq!(
-            str::from_utf8(&result).unwrap(),
-            str::from_utf8(expected_current).unwrap(),
-            "Note: Folded Bcc headers are not fully handled by this simple removal logic."
+            str::from_utf8(&strip_bcc(raw_crlf).unwrap()).unwrap(),
+            str::from_utf8(expected).unwrap()
         );
+
+        // LF-only folded Bcc in trailing position on both unsigned and signed paths.
+        let raw_lf_trailing =
+            b"From: a@b.com\nTo: c@d.com\nSubject: Test\nBcc: e@f.com,\n g@h.com\n\nBody\n";
+        assert_eq!(
+            str::from_utf8(&strip_bcc(raw_lf_trailing).unwrap()).unwrap(),
+            "From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n\r\nBody\r\n"
+        );
+        let signed = strip_and_sign(raw_lf_trailing, "DKIM-Signature: fresh").unwrap();
+        assert_eq!(
+            str::from_utf8(&signed).unwrap(),
+            "From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\nDKIM-Signature: fresh\r\n\r\nBody\r\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_outbound_headers_folded_dkim_signature() {
+        let raw_email = b"From: a@b.com\nDKIM-Signature: v=1; a=rsa-sha256; d=old.com;\n s=sel; bh=abc;\n\tb=xyz\nSubject: Test\n\nBody\n";
+        // Unsigned relay preserves the entire folded upstream DKIM-Signature.
+        let unsigned = strip_bcc(raw_email).unwrap();
+        assert_eq!(
+            str::from_utf8(&unsigned).unwrap(),
+            "From: a@b.com\r\nDKIM-Signature: v=1; a=rsa-sha256; d=old.com;\r\n s=sel; bh=abc;\r\n\tb=xyz\r\nSubject: Test\r\n\r\nBody\r\n"
+        );
+        // Signed path drops the entire folded stale signature without leaving fragments.
+        let signed = strip_and_sign(raw_email, "DKIM-Signature: fresh").unwrap();
+        assert_eq!(
+            str::from_utf8(&signed).unwrap(),
+            "From: a@b.com\r\nSubject: Test\r\nDKIM-Signature: fresh\r\n\r\nBody\r\n"
+        );
+    }
+
+    #[test]
+    fn test_bare_cr_headers_parsed_consistently_after_normalization() {
+        // With bare CR between Subject, From, and Cc, normalizing before the
+        // first header parse ensures recipient selection and per-domain DKIM
+        // authorization see the same headers that signing will transmit.
+        let raw = b"Subject: OTP\rFrom: sender@example.com\rCc: copy@example.org\r\n\r\nBody\r\n";
+        let normalized = normalize_line_endings(raw);
+
+        let msg = MessageParser::default()
+            .parse_headers(&normalized)
+            .expect("parse normalized headers");
+        assert_eq!(
+            msg.from().and_then(|f| f.first()).and_then(|f| f.address()),
+            Some("sender@example.com")
+        );
+        let mut recipients = Worker::merge_recipients(&["to@example.com".into()], &msg);
+        recipients.sort();
+        assert_eq!(recipients, ["copy@example.org", "to@example.com"]);
+        assert_eq!(
+            crate::dkim::from_domain(&normalized).unwrap(),
+            "example.com"
+        );
+
+        // A bare-CR-injected second From header must be rejected consistently.
+        let smuggled = b"From: sender@example.com\rFrom: spoof@evil.com\r\n\r\nBody\r\n";
+        let smuggled_norm = normalize_line_endings(smuggled);
+        assert!(crate::dkim::from_domain(&smuggled_norm).is_err());
     }
 
     #[test]

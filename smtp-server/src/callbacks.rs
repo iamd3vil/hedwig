@@ -5,6 +5,7 @@ use mailparse::MailAddr;
 ///
 /// This module implements the `SmtpCallbacks` trait, providing the logic for
 /// handling SMTP commands such as `EHLO`, `AUTH`, `MAIL FROM`, `RCPT TO`, and `DATA`.
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,7 +14,7 @@ use miette::{Context, IntoDiagnostic};
 use moka::{future::Cache, Expiry};
 use smtp::{Email, SmtpCallbacks, SmtpError};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use crate::{
@@ -609,7 +610,11 @@ impl SmtpCallbacks for Callbacks {
     }
 
     // Handles the DATA command.
-    async fn on_data(&self, email: Email) -> Result<(), SmtpError> {
+    async fn on_data(&self, mut email: Email) -> Result<(), SmtpError> {
+        if let Cow::Owned(normalized) = worker::normalize_line_endings(&email.body) {
+            debug!("Normalizing bare line endings in inbound email to CRLF");
+            email.body = bytes::Bytes::from(normalized);
+        }
         self.runtime
             .load()
             .signer_for(&email.body)
@@ -1693,6 +1698,9 @@ mod tests {
         for headers in [
             "From: a@unknown.com",
             "From: a@example.com\r\nFrom: b@example.com",
+            // Bare CR separating a second From header must be caught before
+            // signer_for runs, matching the CRLF headers the worker will sign.
+            "From: a@example.com\rFrom: b@unknown.com",
         ] {
             let result = callbacks
                 .on_data(Email {
@@ -1705,16 +1713,22 @@ mod tests {
             assert!(receiver.is_empty());
             assert!(storage.list(Status::Queued).next().await.is_none());
         }
+        // A bare-CR-separated valid From header is normalized before
+        // signer_for runs, so authorization and queued bytes agree.
         callbacks
             .on_data(Email {
                 from: "bounce@other.com".into(),
                 to: vec!["r@example.com".into()],
-                body: "From: a@example.com\r\n\r\nbody".into(),
+                body: "Subject: otp\rFrom: a@example.com\n\nbody\n".into(),
             })
             .await
             .unwrap();
         assert_eq!(receiver.len(), 1);
-        assert!(storage.list(Status::Queued).next().await.unwrap().is_ok());
+        let queued_email = storage.list(Status::Queued).next().await.unwrap().unwrap();
+        assert_eq!(
+            queued_email.body,
+            "Subject: otp\r\nFrom: a@example.com\r\n\r\nbody\r\n"
+        );
     }
 
     #[tokio::test]
