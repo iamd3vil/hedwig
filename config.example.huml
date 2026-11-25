@@ -44,6 +44,7 @@ server::
   workers: 4
 
 storage::
+  auto_migrate: false
   base_path: "/var/lib/hedwig/mail"
   cleanup::
     bounced_retention: "7d"
@@ -67,7 +68,7 @@ log::
   format: "fmt"
   level: "info"
 
-# Optional durable append-log mail queue (not yet wired into the serving path)
+# Optional durable append-log mail queue (used by the log backend and legacy migration)
 # queue::
 #   append_writers: 1                  # Number of shards / concurrent append writers (default: 1)
 #   pending_append_bytes: 134217728    # Pending (not-yet-durable) append bytes before backpressure (default: 128 MiB)

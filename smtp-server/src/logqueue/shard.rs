@@ -103,6 +103,18 @@ impl ShardDir {
         let segs = self.list_segments()?;
         Ok(segs.sealed.is_empty() && segs.active.is_none())
     }
+
+    /// Whether the shard directory contains no filesystem entries at all
+    /// (no segments, checkpoints, journals, or unknown files).
+    pub fn has_no_entries(&self) -> Result<bool, QueueError> {
+        let mut entries =
+            std::fs::read_dir(&self.path).map_err(|e| QueueError::io(&self.path, e))?;
+        match entries.next() {
+            None => Ok(true),
+            Some(Ok(_)) => Ok(false),
+            Some(Err(e)) => Err(QueueError::io(&self.path, e)),
+        }
+    }
 }
 
 #[cfg(test)]

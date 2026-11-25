@@ -415,60 +415,8 @@ impl Dispatcher {
         } = init;
         let chain = shared.chain();
 
-        // Reconcile checkpoint state with the writer-validated chain. A torn
-        // active tail was truncated during writer recovery, so a checkpoint
-        // written just before the crash can reference positions past the
-        // committed head:
-        //  - a cursor past the head would skip every record appended after
-        //    restart (stranding accepted mail forever) — clamp it back;
-        //  - a job whose payload sat in the truncated tail no longer exists
-        //    on disk; the append was never completed-and-acknowledged (or
-        //    was lost within the accepted page-cache window), so drop it.
-        let committed_of = |segment: u64| -> Option<u64> {
-            chain
-                .iter()
-                .find(|h| h.segment == segment)
-                .map(|h| h.committed)
-        };
-        if let Some((seg, off)) = recovered.cursor {
-            match committed_of(seg) {
-                Some(committed) if off > committed => {
-                    tracing::warn!(
-                        shard = shared.shard(),
-                        segment = seg,
-                        cursor = off,
-                        committed,
-                        "checkpoint cursor is past the validated tail; clamping"
-                    );
-                    recovered.cursor = Some((seg, committed));
-                }
-                _ => {}
-            }
-        }
-        let payload_gone = |location: &JobLocation| -> bool {
-            matches!(
-                committed_of(location.segment),
-                Some(committed) if location.offset + location.length as u64 > committed
-            )
-        };
-        recovered.ready.retain(|id, r| {
-            if payload_gone(&r.location) {
-                tracing::warn!(message_id = %id, location = ?r.location,
-                    "dropping recovered ready job whose payload was truncated with the torn tail");
-                false
-            } else {
-                true
-            }
-        });
-        recovered.deferred.retain(|id, d| {
-            if payload_gone(&d.location) {
-                tracing::warn!(message_id = %id, location = ?d.location,
-                    "dropping recovered deferred job whose payload was truncated with the torn tail");
-                false
-            } else {
-                true
-            }
-        });
+        // Reconcile checkpoint state with the writer-validated chain.
+        recovered.reconcile_against_chain(shared.shard(), &chain);
 
         for (id, r) in recovered.ready {
             self.jobs.insert(

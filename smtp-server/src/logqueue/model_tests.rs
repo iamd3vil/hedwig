@@ -333,6 +333,15 @@ enum Act {
         seg_len: u8,
         journal_len: u8,
     },
+    /// OS crash followed by legacy migration appending `msg` before server
+    /// startup: `migrate_with_cancel` recovers + reconciles + checkpoints
+    /// against the validated tail BEFORE appending `msg`, then the server
+    /// starts and recovers/checkpoints again.
+    CrashMigrate {
+        seg_len: u8,
+        journal_len: u8,
+        msg: Msg,
+    },
 }
 
 struct LogQueue;
@@ -370,6 +379,15 @@ impl Model for LogQueue {
                     seg_len,
                     journal_len,
                 });
+                for m in 0..MSGS {
+                    if !s.acked.contains(&m) {
+                        actions.push(Act::CrashMigrate {
+                            seg_len,
+                            journal_len,
+                            msg: m,
+                        });
+                    }
+                }
             }
         }
     }
@@ -435,6 +453,26 @@ impl Model for LogQueue {
                 // re-persisted (checkpoint written, journals pruned) before
                 // admission reopens, so no durable artifact keeps referencing
                 // offsets past the validated committed head.
+                publish_checkpoint(&mut s);
+            }
+            Act::CrashMigrate {
+                seg_len,
+                journal_len,
+                msg,
+            } => {
+                s.segment.truncate(seg_len as usize);
+                s.journal.truncate(journal_len as usize);
+                // `migrate_with_cancel`: reconcile and checkpoint against the
+                // validated segment tail BEFORE appending any migrated mail so
+                // a recycled offset cannot fall behind a stale cursor.
+                s.mem = rebuild_mem(&s.segment, &s.journal, &s.checkpoint);
+                publish_checkpoint(&mut s);
+                // Migration appends `msg` (and fsyncs segments) without moving
+                // the discovery cursor, then the server starts and discovers
+                // the newly migrated record.
+                s.segment.push(msg);
+                s.acked.insert(msg);
+                s.mem = rebuild_mem(&s.segment, &s.journal, &s.checkpoint);
                 publish_checkpoint(&mut s);
             }
         }

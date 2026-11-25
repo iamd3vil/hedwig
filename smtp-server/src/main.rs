@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
 async fn run_server(config_path: &str) -> Result<()> {
     // Register before config I/O or any other startup work so SIGHUP can
     // never take the process's default terminating action during startup.
-    let signal_streams = register_signal_streams()?;
+    let mut signal_streams = register_signal_streams()?;
     // Load the configuration from the file.
     let cfg = config::Cfg::load(config_path).wrap_err("error loading configuration")?;
 
@@ -143,7 +143,15 @@ async fn run_server(config_path: &str) -> Result<()> {
     // archive (with the usual retention cleanup).
     let is_log_backend = cfg.storage.storage_type == "log";
     if is_log_backend {
-        warn_about_unmigrated_legacy_spool(&cfg.storage.base_path);
+        run_startup_auto_migrate(&cfg, &shutdown_token, &mut signal_streams)
+            .await
+            .wrap_err("error running automatic legacy spool migration")?;
+        if shutdown_token.is_cancelled() {
+            info!("shutdown requested during startup; exiting before starting listeners");
+            return Ok(());
+        }
+    } else if cfg.storage.auto_migrate {
+        warn!("storage.auto_migrate is enabled but ignored because storage_type is not \"log\"");
     }
     let storage: Arc<dyn Storage> = if is_log_backend {
         Arc::new(
@@ -242,9 +250,9 @@ async fn run_server(config_path: &str) -> Result<()> {
         let spool = logqueue::spool::Spool::open(&spool_root, qcfg.append_writers())
             .map_err(miette::Report::new)
             .wrap_err("error opening log-queue spool")?;
-        let max_record_len = (max_message_size as u64
-            + logqueue::spool::ENVELOPE_ALLOWANCE
-            + logqueue::record::FIXED_HEADER_LEN as u64) as u32;
+        let max_record_len = qcfg
+            .max_record_len(max_message_size)
+            .wrap_err("invalid max_message_size for log queue")?;
         let writers = logqueue::writer::LogWriters::start(
             &spool,
             logqueue::writer::WriterConfig {
@@ -716,25 +724,58 @@ async fn wait_for_shutdown_signal(
     Ok(())
 }
 
-/// The log backend never reads the legacy one-file-per-message spool; mail
-/// sitting there is preserved but undelivered until `hedwig queue migrate`
-/// runs. Make that state loud at startup instead of silently ignoring it.
-fn warn_about_unmigrated_legacy_spool(base_path: &str) {
-    let mut counts = Vec::new();
-    for dir in ["queued", "deferred"] {
-        let path = std::path::Path::new(base_path).join(dir);
-        let n = std::fs::read_dir(&path)
-            .map(|entries| entries.filter_map(|e| e.ok()).count())
-            .unwrap_or(0);
-        if n > 0 {
-            counts.push(format!("{n} entries in {}", path.display()));
+async fn run_startup_auto_migrate(
+    cfg: &config::Cfg,
+    shutdown_token: &CancellationToken,
+    signal_streams: &mut SignalStreams,
+) -> Result<()> {
+    let mig_fut = hedwig::migrate::maybe_auto_migrate_with_cancel(cfg, Some(shutdown_token));
+    tokio::pin!(mig_fut);
+
+    #[cfg(unix)]
+    {
+        let mut signalled = false;
+        let result = loop {
+            tokio::select! {
+                biased;
+                _ = signal_streams.interrupt.recv(), if !signalled => {
+                    signalled = true;
+                    info!("SIGINT received during automatic migration; stopping gracefully");
+                    shutdown_token.cancel();
+                }
+                _ = signal_streams.terminate.recv(), if !signalled => {
+                    signalled = true;
+                    info!("SIGTERM received during automatic migration; stopping gracefully");
+                    shutdown_token.cancel();
+                }
+                res = &mut mig_fut => {
+                    break res.map(|_| ());
+                }
+            }
+        };
+        // Catch a termination signal that arrived right as migration finished
+        // so startup never proceeds to bind listeners after a pending stop.
+        if !signalled {
+            tokio::select! {
+                biased;
+                _ = signal_streams.interrupt.recv() => {
+                    info!("SIGINT pending after automatic migration; stopping gracefully");
+                    shutdown_token.cancel();
+                }
+                _ = signal_streams.terminate.recv() => {
+                    info!("SIGTERM pending after automatic migration; stopping gracefully");
+                    shutdown_token.cancel();
+                }
+                _ = std::future::ready(()) => {}
+            }
         }
+        result
     }
-    if !counts.is_empty() {
-        warn!(
-            "unmigrated legacy spool detected ({}); this mail is preserved but will NOT be              delivered until you stop the server and run `hedwig queue migrate --config <config>`",
-            counts.join(", ")
-        );
+
+    #[cfg(not(unix))]
+    {
+        let _ = signal_streams;
+        mig_fut.await.map(|_| ())
     }
 }
 

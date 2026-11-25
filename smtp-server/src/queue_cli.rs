@@ -124,38 +124,26 @@ async fn cmd_migrate(args: MigrateArgs) -> Result<()> {
          stopped before running this command — there is no lock on the legacy spool."
     );
 
-    let legacy_base_path = camino::Utf8PathBuf::from(cfg.storage.base_path.clone());
-    let spool_root = std::path::Path::new(&cfg.storage.base_path).join("spool");
-
-    let qcfg = cfg.queue();
-    let max_message_size = cfg.server.max_message_size.unwrap_or(25 * 1024 * 1024);
-    qcfg.validate(max_message_size)
-        .wrap_err("invalid [queue] configuration")?;
-    let max_record_len = (max_message_size as u64
-        + crate::logqueue::spool::ENVELOPE_ALLOWANCE
-        + crate::logqueue::record::FIXED_HEADER_LEN as u64) as u32;
-    let writer_config = crate::logqueue::writer::WriterConfig {
-        segment_target_bytes: qcfg.segment_target_bytes(),
-        max_record_len,
-        pending_append_bytes: qcfg.pending_append_bytes(),
-    };
-
-    let summary = crate::migrate::migrate(
-        &legacy_base_path,
-        &spool_root,
-        qcfg.append_writers(),
-        writer_config,
-    )
-    .await?;
+    let summary = crate::migrate::migrate_from_cfg(&cfg).await?;
 
     summary.print();
 
     if !summary.failed.is_empty() {
-        bail!(
-            "migration completed with {} failed message(s) (see above); the legacy spool \
-             was left in place — safe to re-run this command after investigating",
-            summary.failed.len()
-        );
+        if summary.renamed.is_empty() {
+            bail!(
+                "migration completed with {} error(s) (see above); the legacy spool \
+                 was left in place — safe to re-run this command after investigating",
+                summary.failed.len()
+            );
+        } else {
+            bail!(
+                "migration completed with {} error(s) after partially archiving {} legacy \
+                 directory(ies) (see renamed paths above); remaining legacy directories were \
+                 left in place",
+                summary.failed.len(),
+                summary.renamed.len()
+            );
+        }
     }
 
     println!("migration complete.");

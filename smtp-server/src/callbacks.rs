@@ -795,6 +795,7 @@ mod tests {
             storage: CfgStorage {
                 storage_type: "mock".to_string(),
                 base_path: "/tmp/hedwig".to_string(),
+                auto_migrate: false,
                 cleanup: None,
             },
             filters,
@@ -1833,6 +1834,7 @@ mod tests {
             storage: CfgStorage {
                 storage_type: "memory".to_string(),
                 base_path: "/tmp".to_string(),
+                auto_migrate: false,
                 cleanup: None,
             },
             filters: None,

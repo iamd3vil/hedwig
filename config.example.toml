@@ -91,6 +91,7 @@ key_type = "rsa"                             # "rsa" or "ed25519"
 [storage]
 storage_type = "log"        # "log" (durable log queue, default) or "fs" (legacy one file per message)
 base_path = "/var/lib/hedwig/mail"
+auto_migrate = false        # When true with storage_type = "log", migrate legacy fs queued/deferred mail on startup
 
 # Optional retention policy for local spool cleanup
 [storage.cleanup]
@@ -98,7 +99,7 @@ bounced_retention = "7d"
 deferred_retention = "2d"
 interval = "1h"
 
-# Optional durable append-log mail queue (not yet wired into the serving path)
+# Optional durable append-log mail queue (used by the log backend and legacy migration)
 # [queue]
 # append_writers = 1             # Number of shards / concurrent append writers (default: 1)
 # pending_append_bytes = 134217728    # Pending (not-yet-durable) append bytes before backpressure (default: 128 MiB)
