@@ -66,6 +66,52 @@ fn strip_brackets(s: &str) -> &str {
     s.trim_matches(|c| c == '<' || c == '>')
 }
 
+/// Normalizes bare `\n` and bare `\r` line endings to `\r\n`, borrowing
+/// `raw_email` with zero allocation when line endings are already valid CRLF.
+pub(crate) fn normalize_line_endings(raw_email: &[u8]) -> Cow<'_, [u8]> {
+    if has_bare_line_ending(raw_email) {
+        Cow::Owned(normalize_crlf(raw_email, 0))
+    } else {
+        Cow::Borrowed(raw_email)
+    }
+}
+
+/// Returns true if `raw_email` contains any bare `\n` (not preceded by `\r`)
+/// or bare `\r` (not followed by `\n`). Valid CRLF messages pass in a single
+/// SIMD scan without allocating.
+fn has_bare_line_ending(raw_email: &[u8]) -> bool {
+    let mut pos = 0;
+    while let Some(rel) = memchr::memchr2(b'\r', b'\n', &raw_email[pos..]) {
+        let i = pos + rel;
+        if raw_email[i] == b'\r' && raw_email.get(i + 1) == Some(&b'\n') {
+            pos = i + 2;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+/// Normalizes bare `\n` and bare `\r` line endings to `\r\n`, preserving
+/// existing `\r\n` pairs. Allocates with `extra_capacity` headroom so a
+/// subsequent `DKIM-Signature` splice can reuse the same buffer.
+fn normalize_crlf(raw_email: &[u8], extra_capacity: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw_email.len() + extra_capacity);
+    let mut pos = 0;
+    while let Some(rel) = memchr::memchr2(b'\r', b'\n', &raw_email[pos..]) {
+        let i = pos + rel;
+        out.extend_from_slice(&raw_email[pos..i]);
+        out.extend_from_slice(b"\r\n");
+        if raw_email[i] == b'\r' && raw_email.get(i + 1) == Some(&b'\n') {
+            pos = i + 2;
+        } else {
+            pos = i + 1;
+        }
+    }
+    out.extend_from_slice(&raw_email[pos..]);
+    out
+}
+
 fn fmt_option<T: std::fmt::Display>(opt: Option<T>) -> String {
     match opt {
         Some(v) => v.to_string(),
@@ -302,9 +348,15 @@ impl Worker {
             Err(e) => return Err(e).wrap_err("failed to get email from storage"),
         };
 
+        // Normalize bare line endings before the first header parse so
+        // Subject/From/Cc/Bcc extraction, DKIM authorization, and outbound
+        // signing all see identical CRLF headers (including already-queued
+        // messages). Valid CRLF messages borrow without copying.
+        let body = normalize_line_endings(email.body.as_bytes());
+
         // Only header fields are ever read out of `msg`, so parsing the
         // whole MIME tree per attempt is wasted work.
-        let msg = match MessageParser::default().parse_headers(&email.body) {
+        let msg = match MessageParser::default().parse_headers(&body) {
             Some(msg) => msg,
             None => {
                 error!(msg_id = ?job.job_id, "Failed to parse email body");
@@ -347,7 +399,7 @@ impl Worker {
             attempt: job.attempts,
         };
 
-        match self.send_email(&email.to, &msg, &email.body, &ctx).await {
+        match self.send_email(&email.to, &msg, &body, &ctx).await {
             Ok(_) => {
                 self.storage.delete(&job.job_id, Status::Queued).await?;
                 metrics::queue_depth_dec();
@@ -487,23 +539,33 @@ impl Worker {
 
     /// Returns `raw_email` minus the headers that must not be transmitted,
     /// along with the offset at which a `DKIM-Signature` header belongs (the
-    /// end of the header block). When no headers need to be dropped and
-    /// `reserve == 0` (the unsigned path), borrows `raw_email` directly with
-    /// zero allocation or body copy.
+    /// end of the header block). When line endings are already valid CRLF, no
+    /// headers need to be dropped, and `reserve == 0` (the unsigned path),
+    /// borrows `raw_email` directly with zero allocation or body copy.
     ///
     /// Bcc is always dropped. A `DKIM-Signature` already on the message is
     /// dropped only when we are about to add our own: otherwise it belongs
     /// to an upstream signer and stripping it would discard an
     /// authentication result we are merely relaying.
     ///
-    /// Line endings are preserved verbatim, so the bytes handed to the
-    /// signer are the bytes that go on the wire.
+    /// Valid CRLF line endings are preserved verbatim. Bare LF or bare CR line
+    /// endings (e.g. from legacy Python 3 `smtplib.sendmail(bytes)` clients
+    /// that skip `_fix_eols`) are normalized to CRLF before header stripping
+    /// and DKIM signing, so both the signer and the wire receive valid
+    /// RFC 5321 CRLF bytes.
     fn strip_outbound_headers<'a>(
         raw_email: &'a [u8],
         drop_dkim_signature: bool,
         reserve: usize,
     ) -> Result<(Cow<'a, [u8]>, usize)> {
-        let boundary = memmem::find(raw_email, HEADER_BODY_SEPARATOR).ok_or_else(|| {
+        let normalized: Cow<'a, [u8]> = if has_bare_line_ending(raw_email) {
+            debug!("Normalizing bare line endings in outbound email to CRLF");
+            Cow::Owned(normalize_crlf(raw_email, reserve))
+        } else {
+            Cow::Borrowed(raw_email)
+        };
+
+        let boundary = memmem::find(&normalized, HEADER_BODY_SEPARATOR).ok_or_else(|| {
             miette::miette!("Invalid email format: header body boundary not found")
         })?;
 
@@ -512,7 +574,7 @@ impl Worker {
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
         };
 
-        let header_block = &raw_email[..boundary];
+        let header_block = &normalized[..boundary];
         let has_dropped = header_block.split(|&b| b == b'\n').any(|line| {
             let trimmed = line.strip_suffix(b"\r").unwrap_or(line);
             is_header(trimmed, BCC_HEADER_PREFIX)
@@ -520,27 +582,31 @@ impl Worker {
         });
 
         if !has_dropped {
-            if reserve == 0 {
-                return Ok((Cow::Borrowed(raw_email), boundary + 2));
+            if reserve == 0 || matches!(normalized, Cow::Owned(_)) {
+                return Ok((normalized, boundary + 2));
             }
-            let mut out = Vec::with_capacity(raw_email.len() + reserve);
-            out.extend_from_slice(raw_email);
+            let mut out = Vec::with_capacity(normalized.len() + reserve);
+            out.extend_from_slice(&normalized);
             return Ok((Cow::Owned(out), boundary + 2));
         }
 
-        let mut out = Vec::with_capacity(raw_email.len() + reserve);
+        let mut out = Vec::with_capacity(normalized.len() + reserve);
+        let mut dropping = false;
         for line in header_block.split(|&b| b == b'\n') {
             let trimmed = line.strip_suffix(b"\r").unwrap_or(line);
-            // A folded continuation line is not recognized as part of the
-            // header it continues, so a folded Bcc keeps its continuation
-            // lines. Fixing that needs real header parsing; the behavior is
-            // pinned by `test_strip_outbound_headers_folded_bcc`.
-            let drop = is_header(trimmed, BCC_HEADER_PREFIX)
-                || (drop_dkim_signature && is_header(trimmed, DKIM_HEADER_PREFIX));
-            if !drop {
-                out.extend_from_slice(line);
-                out.push(b'\n');
+            if matches!(trimmed.first(), Some(b' ' | b'\t')) {
+                if dropping {
+                    continue;
+                }
+            } else {
+                dropping = is_header(trimmed, BCC_HEADER_PREFIX)
+                    || (drop_dkim_signature && is_header(trimmed, DKIM_HEADER_PREFIX));
+                if dropping {
+                    continue;
+                }
             }
+            out.extend_from_slice(line);
+            out.push(b'\n');
         }
 
         // The loop left a terminator on the last kept header; the separator
@@ -557,7 +623,7 @@ impl Worker {
         // i.e. just inside the separator.
         let signature_at = out.len() + 2;
         out.extend_from_slice(HEADER_BODY_SEPARATOR);
-        out.extend_from_slice(&raw_email[boundary + HEADER_BODY_SEPARATOR.len()..]);
+        out.extend_from_slice(&normalized[boundary + HEADER_BODY_SEPARATOR.len()..]);
 
         Ok((Cow::Owned(out), signature_at))
     }
@@ -576,18 +642,33 @@ impl Worker {
     /// Strip Bcc headers and DKIM-sign (when configured), borrowing the
     /// original slice on the unsigned fast path when no headers are dropped.
     fn sign_outbound<'a>(&self, body: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        let normalized = normalize_line_endings(body);
         let runtime = self.runtime.load();
-        let Some(signer) = runtime.signer_for(body)? else {
-            let (out, _) = Self::strip_outbound_headers(body, false, 0)
-                .wrap_err("Failed to remove Bcc header")?;
-            return Ok(out);
+        let Some(signer) = runtime.signer_for(&normalized)? else {
+            return match normalized {
+                Cow::Borrowed(raw) => {
+                    let (out, _) = Self::strip_outbound_headers(raw, false, 0)
+                        .wrap_err("Failed to remove Bcc header")?;
+                    Ok(out)
+                }
+                Cow::Owned(buf) => {
+                    let stripped = match Self::strip_outbound_headers(&buf, false, 0)
+                        .wrap_err("Failed to remove Bcc header")?
+                        .0
+                    {
+                        Cow::Owned(stripped) => Some(stripped),
+                        Cow::Borrowed(_) => None,
+                    };
+                    Ok(Cow::Owned(stripped.unwrap_or(buf)))
+                }
+            };
         };
 
         debug!("Signing email with DKIM");
         // Reserve the signature's room up front so splicing it in below
         // cannot reallocate and copy the whole message again.
         let (out_cow, signature_at) =
-            Self::strip_outbound_headers(body, true, DKIM_SIGNATURE_RESERVE)
+            Self::strip_outbound_headers(&normalized, true, DKIM_SIGNATURE_RESERVE)
                 .wrap_err("Failed to remove Bcc header")?;
         let mut out = out_cow.into_owned();
         // Signing `out` signs the message exactly as it will be
@@ -840,12 +921,17 @@ impl Worker {
             );
         };
 
+        // Normalize bare line endings before the first header parse so
+        // From/Cc/Bcc extraction, DKIM authorization, and outbound signing all
+        // see identical CRLF headers (including already-queued messages).
+        let body = normalize_line_endings(body);
+
         // Headers only: this path reads the From address and (on the first
         // attempt) Cc/Bcc, never the body parts.
-        let Some(msg) = MessageParser::default().parse_headers(body) else {
+        let Some(msg) = MessageParser::default().parse_headers(&body) else {
             error!(msg_id = %job.message_id, "Failed to parse email body");
             return self
-                .bounce_claim(job, body, "unparseable message body".into())
+                .bounce_claim(job, &body, "unparseable message body".into())
                 .await;
         };
 
@@ -871,7 +957,7 @@ impl Worker {
             Cow::Borrowed(&job.recipients)
         };
 
-        let raw_email = match self.sign_outbound(body) {
+        let raw_email = match self.sign_outbound(&body) {
             Ok(raw) => raw,
             Err(e) => {
                 if e.downcast_ref::<crate::dkim::UnconfiguredDomain>()
@@ -892,13 +978,13 @@ impl Worker {
                     };
                 }
                 return self
-                    .bounce_claim(job, body, format!("preparing outbound message: {e:#}"))
+                    .bounce_claim(job, &body, format!("preparing outbound message: {e:#}"))
                     .await;
             }
         };
         let Some(from) = msg.from().and_then(|f| f.first()).and_then(|f| f.address()) else {
             return self
-                .bounce_claim(job, body, "invalid from address".into())
+                .bounce_claim(job, &body, "invalid from address".into())
                 .await;
         };
 
@@ -1001,7 +1087,7 @@ impl Worker {
         }
 
         match bounce_reason {
-            Some(reason) if !delivered_any => self.bounce_claim(job, body, reason).await,
+            Some(reason) if !delivered_any => self.bounce_claim(job, &body, reason).await,
             _ => {
                 metrics::email_sent();
                 JobOutcome::Delivered {
@@ -1049,10 +1135,10 @@ impl Worker {
         &self,
         to: &[String],
         email: &'b Message<'b>,
-        body: &str,
+        body: &[u8],
         ctx: &DeliveryContext<'b>,
     ) -> Result<()> {
-        let raw_email = self.sign_outbound(body.as_bytes())?;
+        let raw_email = self.sign_outbound(body)?;
         let from = email
             .from()
             .and_then(|f| f.first())
@@ -1449,19 +1535,73 @@ mod tests {
 
     #[test]
     fn test_strip_outbound_headers_folded_bcc() {
-        // Folded headers are tricky. This line-oriented implementation
-        // won't handle a folded Bcc; a robust solution would need proper
-        // header parsing.
-        let raw_email = b"From: a@b.com\r\nTo: c@d.com\r\nBcc: e@f.com,\r\n g@h.com\r\nSubject: Test\r\n\r\nBody";
-        // Only the first line "Bcc: e@f.com," is removed.
-        let expected_current =
-            b"From: a@b.com\r\nTo: c@d.com\r\n g@h.com\r\nSubject: Test\r\n\r\nBody";
-        let result = strip_bcc(raw_email).unwrap();
+        // Space- and tab-indented continuation lines of Bcc must be dropped
+        // completely so blind recipients never leak on CRLF or bare-LF mail.
+        let raw_crlf = b"From: a@b.com\r\nTo: c@d.com\r\nBcc: e@f.com,\r\n g@h.com,\r\n\ti@j.com\r\nSubject: Test\r\n folded\r\n\r\nBody";
+        let expected = b"From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n folded\r\n\r\nBody";
         assert_eq!(
-            str::from_utf8(&result).unwrap(),
-            str::from_utf8(expected_current).unwrap(),
-            "Note: Folded Bcc headers are not fully handled by this simple removal logic."
+            str::from_utf8(&strip_bcc(raw_crlf).unwrap()).unwrap(),
+            str::from_utf8(expected).unwrap()
         );
+
+        // LF-only folded Bcc in trailing position on both unsigned and signed paths.
+        let raw_lf_trailing =
+            b"From: a@b.com\nTo: c@d.com\nSubject: Test\nBcc: e@f.com,\n g@h.com\n\nBody\n";
+        assert_eq!(
+            str::from_utf8(&strip_bcc(raw_lf_trailing).unwrap()).unwrap(),
+            "From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n\r\nBody\r\n"
+        );
+        let signed = strip_and_sign(raw_lf_trailing, "DKIM-Signature: fresh").unwrap();
+        assert_eq!(
+            str::from_utf8(&signed).unwrap(),
+            "From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\nDKIM-Signature: fresh\r\n\r\nBody\r\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_outbound_headers_folded_dkim_signature() {
+        let raw_email = b"From: a@b.com\nDKIM-Signature: v=1; a=rsa-sha256; d=old.com;\n s=sel; bh=abc;\n\tb=xyz\nSubject: Test\n\nBody\n";
+        // Unsigned relay preserves the entire folded upstream DKIM-Signature.
+        let unsigned = strip_bcc(raw_email).unwrap();
+        assert_eq!(
+            str::from_utf8(&unsigned).unwrap(),
+            "From: a@b.com\r\nDKIM-Signature: v=1; a=rsa-sha256; d=old.com;\r\n s=sel; bh=abc;\r\n\tb=xyz\r\nSubject: Test\r\n\r\nBody\r\n"
+        );
+        // Signed path drops the entire folded stale signature without leaving fragments.
+        let signed = strip_and_sign(raw_email, "DKIM-Signature: fresh").unwrap();
+        assert_eq!(
+            str::from_utf8(&signed).unwrap(),
+            "From: a@b.com\r\nSubject: Test\r\nDKIM-Signature: fresh\r\n\r\nBody\r\n"
+        );
+    }
+
+    #[test]
+    fn test_bare_cr_headers_parsed_consistently_after_normalization() {
+        // With bare CR between Subject, From, and Cc, normalizing before the
+        // first header parse ensures recipient selection and per-domain DKIM
+        // authorization see the same headers that signing will transmit.
+        let raw = b"Subject: OTP\rFrom: sender@example.com\rCc: copy@example.org\r\n\r\nBody\r\n";
+        let normalized = normalize_line_endings(raw);
+
+        let msg = MessageParser::default()
+            .parse_headers(&normalized)
+            .expect("parse normalized headers");
+        assert_eq!(
+            msg.from().and_then(|f| f.first()).and_then(|f| f.address()),
+            Some("sender@example.com")
+        );
+        let mut recipients = Worker::merge_recipients(&["to@example.com".into()], &msg);
+        recipients.sort();
+        assert_eq!(recipients, ["copy@example.org", "to@example.com"]);
+        assert_eq!(
+            crate::dkim::from_domain(&normalized).unwrap(),
+            "example.com"
+        );
+
+        // A bare-CR-injected second From header must be rejected consistently.
+        let smuggled = b"From: sender@example.com\rFrom: spoof@evil.com\r\n\r\nBody\r\n";
+        let smuggled_norm = normalize_line_endings(smuggled);
+        assert!(crate::dkim::from_domain(&smuggled_norm).is_err());
     }
 
     #[test]
@@ -1480,6 +1620,135 @@ mod tests {
         let raw_email = b"From: a@b.com\r\nBcc: e@f.com"; // Missing \r\n\r\n
         assert!(strip_bcc(raw_email).is_err());
         assert!(strip_and_sign(raw_email, "DKIM-Signature: test-signature").is_err());
+
+        let bare_lf_no_boundary = b"From: a@b.com\nBcc: e@f.com"; // Missing \n\n
+        assert!(strip_bcc(bare_lf_no_boundary).is_err());
+        assert!(strip_and_sign(bare_lf_no_boundary, "DKIM-Signature: test-signature").is_err());
+    }
+
+    #[test]
+    fn test_strip_outbound_headers_normalizes_bare_lf() {
+        let raw_email = b"From: a@b.com\nTo: c@d.com\nSubject: Test\n\nLine 1\nLine 2\n";
+        let expected = b"From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n\r\nLine 1\r\nLine 2\r\n";
+
+        let (cow, sig_at) = Worker::strip_outbound_headers(raw_email, false, 0).unwrap();
+        assert!(
+            matches!(cow, Cow::Owned(_)),
+            "bare LF input must be normalized into an owned buffer"
+        );
+        assert_eq!(
+            str::from_utf8(&cow).unwrap(),
+            str::from_utf8(expected).unwrap()
+        );
+        assert!(!has_bare_line_ending(&cow));
+        assert_eq!(&cow[sig_at..sig_at + 2], b"\r\n");
+
+        let signed = strip_and_sign(raw_email, "DKIM-Signature: fresh").unwrap();
+        assert_eq!(
+            str::from_utf8(&signed).unwrap(),
+            "From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\nDKIM-Signature: fresh\r\n\r\nLine 1\r\nLine 2\r\n"
+        );
+        assert!(!has_bare_line_ending(&signed));
+    }
+
+    #[test]
+    fn test_strip_outbound_headers_normalizes_bare_lf_with_dropped_headers() {
+        let raw_email =
+            b"From: a@b.com\nTo: c@d.com\nDKIM-Signature: stale\nBcc: hidden@example.com\n\nBody\nLine 2";
+        let stripped = strip_bcc(raw_email).unwrap();
+        assert_eq!(
+            str::from_utf8(&stripped).unwrap(),
+            "From: a@b.com\r\nTo: c@d.com\r\nDKIM-Signature: stale\r\n\r\nBody\r\nLine 2"
+        );
+        assert!(!has_bare_line_ending(&stripped));
+
+        let signed = strip_and_sign(raw_email, "DKIM-Signature: fresh").unwrap();
+        assert_eq!(
+            str::from_utf8(&signed).unwrap(),
+            "From: a@b.com\r\nTo: c@d.com\r\nDKIM-Signature: fresh\r\n\r\nBody\r\nLine 2"
+        );
+        assert!(!has_bare_line_ending(&signed));
+    }
+
+    #[test]
+    fn test_strip_outbound_headers_normalizes_mixed_and_body_only_bare_line_endings() {
+        // Mixed CRLF/LF/CR across headers and body.
+        let mixed = b"From: a@b.com\r\nTo: c@d.com\rSubject: Test\n\r\nBody\rline2\nline3";
+        let stripped = strip_bcc(mixed).unwrap();
+        assert_eq!(
+            str::from_utf8(&stripped).unwrap(),
+            "From: a@b.com\r\nTo: c@d.com\r\nSubject: Test\r\n\r\nBody\r\nline2\r\nline3"
+        );
+        assert!(!has_bare_line_ending(&stripped));
+
+        // Valid CRLF headers, bare LF only inside the body: must still normalize
+        // so DKIM signing and outbound SMTP wire format use CRLF throughout.
+        let body_only_lf = b"From: a@b.com\r\nSubject: Test\r\n\r\nBody\nline2\n";
+        let (cow, _) = Worker::strip_outbound_headers(body_only_lf, false, 0).unwrap();
+        assert_eq!(
+            str::from_utf8(&cow).unwrap(),
+            "From: a@b.com\r\nSubject: Test\r\n\r\nBody\r\nline2\r\n"
+        );
+        assert!(!has_bare_line_ending(&cow));
+    }
+
+    #[test]
+    fn test_dkim_sign_bare_lf_email_matches_crlf_body_hash() {
+        use rsa::pkcs8::EncodePrivateKey;
+
+        let mut rng = rand::rng();
+        let key = rsa::PrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
+        let pem = key
+            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .expect("encode test RSA key");
+        let dkim = CfgDKIM {
+            domain: "example.com".to_string(),
+            selector: "default".to_string(),
+            private_key: "unused.pem".to_string(),
+            key_type: DkimKeyType::Rsa,
+        };
+        let DkimSignerType::Rsa(signer) =
+            Worker::create_dkim_signer(&dkim, &pem).expect("create RSA DKIM signer")
+        else {
+            panic!("expected RSA signer");
+        };
+
+        let bare_lf =
+            b"From: sender@example.com\nTo: recipient@example.com\nSubject: OTP\n\nCode: 123456\n";
+        let crlf =
+            b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: OTP\r\n\r\nCode: 123456\r\n";
+
+        let (lf_out_cow, lf_sig_at) =
+            Worker::strip_outbound_headers(bare_lf, true, DKIM_SIGNATURE_RESERVE).unwrap();
+        let (crlf_out_cow, crlf_sig_at) =
+            Worker::strip_outbound_headers(crlf, true, DKIM_SIGNATURE_RESERVE).unwrap();
+        assert_eq!(lf_out_cow.as_ref(), crlf_out_cow.as_ref());
+        assert_eq!(lf_sig_at, crlf_sig_at);
+
+        let mut lf_out = lf_out_cow.into_owned();
+        let lf_sig = signer
+            .sign(&lf_out)
+            .expect("sign normalized bare-LF email")
+            .to_header();
+        let crlf_sig = signer
+            .sign(&crlf_out_cow)
+            .expect("sign CRLF email")
+            .to_header();
+        Worker::splice_dkim_signature(&mut lf_out, lf_sig_at, &lf_sig);
+
+        // Extract `bh=...;` body hash from both signatures and verify they match.
+        let extract_bh = |sig: &str| {
+            sig.split(';')
+                .map(str::trim)
+                .find(|part| part.starts_with("bh="))
+                .expect("DKIM signature contains bh=")
+                .to_string()
+        };
+        assert_eq!(extract_bh(&lf_sig), extract_bh(&crlf_sig));
+        assert!(!has_bare_line_ending(&lf_out));
+        let signed_str = str::from_utf8(&lf_out).unwrap();
+        assert!(signed_str.contains("DKIM-Signature:"));
+        assert!(signed_str.ends_with("\r\n\r\nCode: 123456\r\n"));
     }
 
     #[test]

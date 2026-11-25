@@ -626,13 +626,17 @@ impl SmtpServer {
         // empty (RFC 5321 4.1.1.4 — there is no preceding line to end). The
         // empty form is only meaningful while the buffer still starts at the
         // first body byte, which shedding below breaks.
+        //
+        // In `<CRLF>.<CRLF>`, the leading `<CRLF>` terminates the final line
+        // of the message itself (RFC 5321 4.1.1.4), so `body_end` preserves
+        // those two bytes while `consumed` advances past the full terminator.
         let end = if !*oversized && data_buffer.starts_with(b".\r\n") {
             Some((0usize, 3usize))
         } else {
             // Only the newly received bytes need to be searched; earlier
             // reads already covered the rest.
             find_data_terminator(data_buffer, *data_scanned)
-                .map(|pos| (pos, pos + DATA_TERMINATOR.len()))
+                .map(|pos| (pos + 2, pos + DATA_TERMINATOR.len()))
         };
 
         // Enforce message size limit.
@@ -669,12 +673,13 @@ impl SmtpServer {
 
         match end {
             Some((body_end, consumed)) => {
-                // A stuffed dot can only start the message or follow a CRLF;
-                // when neither occurs (the overwhelmingly common case) the
-                // body is a zero-copy slice of the receive buffer.
+                // A stuffed dot starts the message or follows a line ending
+                // (`\r\n.` or, for legacy Python `smtplib` bytes callers,
+                // bare `\n.`); searching for `\n.` covers both in one pass
+                // while keeping the zero-copy fast path for ordinary mail.
                 let stuffed = {
                     let raw = &data_buffer[..body_end];
-                    raw.starts_with(b".") || memchr::memmem::find(raw, b"\r\n.").is_some()
+                    raw.starts_with(b".") || memchr::memmem::find(raw, b"\n.").is_some()
                 };
                 session.email.body = if stuffed {
                     let body = Bytes::from(unstuff_dot_lines(&data_buffer[..body_end]));
@@ -986,41 +991,21 @@ fn push_unstuffed_line(output: &mut Vec<u8>, segment: &[u8]) {
     }
 }
 
-// unstuff_dot_lines removes dot-stuffing from a raw message slice in place without converting to a string.
+/// Removes SMTP dot-stuffing from a raw message payload without converting to
+/// UTF-8. Unstuffs leading dots at the start of the payload and after `\n`
+/// (covering both RFC 5321 `\r\n` and legacy clients such as Python `smtplib`
+/// that dot-stuff after bare `\n`), while preserving literal dots after a
+/// standalone `\r` and continuing past bare `\r` bytes.
 fn unstuff_dot_lines(input: &[u8]) -> Vec<u8> {
-    // Prepare an output buffer with the same capacity as the input.
     let mut output = Vec::with_capacity(input.len());
-
     let mut offset = 0;
     while offset < input.len() {
-        // Find the next CR. We assume lines end with "\r\n"
-        if let Some(cr_index) = memchr::memchr(b'\r', &input[offset..]) {
-            let line_end = offset + cr_index;
-            // If we have a CRLF pair
-            if line_end + 1 < input.len() && input[line_end + 1] == b'\n' {
-                // Process the line: check if it begins with a dot
-                if (line_end > offset) && (input[offset] == b'.') {
-                    // Skip the dot: append from offset+1 to line_end
-                    output.extend_from_slice(&input[offset + 1..line_end]);
-                } else {
-                    output.extend_from_slice(&input[offset..line_end]);
-                }
-                // Append the CRLF separator unmodified.
-                output.extend_from_slice(b"\r\n");
-                offset = line_end + 2;
-            } else {
-                // CR is not followed by LF; copy the rest and break. It
-                // still begins a line, so its stuffing comes off.
-                push_unstuffed_line(&mut output, &input[offset..]);
-                break;
-            }
-        } else {
-            // The final line: its CRLF was consumed as part of the
-            // end-of-data sequence, but it is a line like any other and its
-            // transparency dot must come off too.
-            push_unstuffed_line(&mut output, &input[offset..]);
-            break;
-        }
+        let line_end = match memchr::memchr(b'\n', &input[offset..]) {
+            Some(lf_index) => offset + lf_index + 1,
+            None => input.len(),
+        };
+        push_unstuffed_line(&mut output, &input[offset..line_end]);
+        offset = line_end;
     }
     output
 }
@@ -1097,8 +1082,17 @@ mod tests {
         // Empty input and a lone CRLF are untouched.
         assert_eq!(unstuff_dot_lines(b""), b"");
         assert_eq!(unstuff_dot_lines(b"\r\n"), b"\r\n");
-        // A bare CR ends the scan; that trailing segment is still a line.
-        assert_eq!(unstuff_dot_lines(b"a\r\n.b\rc"), b"a\r\nb\rc");
+        // Bare CR does not abort scanning for subsequent stuffed lines, and a
+        // literal dot immediately after standalone CR is preserved.
+        assert_eq!(
+            unstuff_dot_lines(b"a\r\n.b\r.c\r\n..d\r\n"),
+            b"a\r\nb\r.c\r\n.d\r\n"
+        );
+        // Bare LF line boundaries (e.g. Python smtplib bytes path) are also unstuffed.
+        assert_eq!(
+            unstuff_dot_lines(b"Subject: hi\n\n..note\nmiddle\r\n"),
+            b"Subject: hi\n\n.note\nmiddle\r\n"
+        );
     }
 
     #[test]
@@ -1283,9 +1277,14 @@ mod tests {
 
         // Body plus terminator, in small chunks with explicit flushes so the
         // server sees many partial reads (including one that splits the
-        // terminator itself).
+        // terminator itself). Per RFC 5321 §4.1.1.4, when the message already
+        // ends in CRLF the client appends only `.\r\n`.
         let mut wire = body.as_bytes().to_vec();
-        wire.extend_from_slice(DATA_TERMINATOR);
+        if wire.ends_with(b"\r\n") {
+            wire.extend_from_slice(b".\r\n");
+        } else {
+            wire.extend_from_slice(DATA_TERMINATOR);
+        }
         for chunk in wire.chunks(chunk_size) {
             writer.write_all(chunk).await.unwrap();
             writer.flush().await.unwrap();
@@ -1388,7 +1387,7 @@ mod tests {
         assert!(reply.contains("221"), "{reply}");
         assert_eq!(emails.len(), 1, "{reply}");
         assert!(emails[0].from.contains("second@example.com"));
-        assert!(emails[0].body.ends_with(b"accepted"));
+        assert!(emails[0].body.ends_with(b"accepted\r\n"));
     }
 
     /// Drives a session over a duplex stream and returns every byte the
@@ -1484,7 +1483,7 @@ mod tests {
             emails.len()
         );
         assert!(
-            emails[0].body.ends_with(b"fits"),
+            emails[0].body.ends_with(b"fits\r\n"),
             "the accepted message must be the small one, got {:?}",
             emails[0].body
         );
@@ -1519,9 +1518,8 @@ mod tests {
         );
     }
 
-    /// The last body line's CRLF is consumed as part of the end-of-data
-    /// sequence, so it used to escape unstuffing: a message whose final line
-    /// is "." arrived as "..".
+    /// The final body line's CRLF is preserved when terminating with
+    /// `<CRLF>.<CRLF>`, and a trailing stuffed line is unstuffed cleanly.
     #[tokio::test]
     async fn test_trailing_stuffed_line_is_unstuffed() {
         let (replies, emails) = run_pipelined_session(&[
@@ -1535,10 +1533,39 @@ mod tests {
         assert_eq!(emails.len(), 1, "message must be accepted: {replies:?}");
         assert_eq!(
             &emails[0].body[..],
-            b"hello\r\n.",
-            "trailing stuffed dot must be removed, got {:?}",
+            b"hello\r\n.\r\n",
+            "trailing stuffed dot must be removed while preserving closing CRLF, got {:?}",
             emails[0].body
         );
+    }
+
+    #[tokio::test]
+    async fn test_bare_lf_dot_stuffing_and_mixed_empty_body_separator() {
+        // Bare-LF body line starting with `.` as sent by Python smtplib bytes:
+        // terminator stays strictly CRLF.CRLF, and `..note` unstuffs to `.note`.
+        let (replies, emails) = run_pipelined_session(&[
+            b"EHLO client.test\r\n",
+            b"MAIL FROM:<a@example.com>\r\nRCPT TO:<b@example.org>\r\nDATA\r\n",
+            b"From: a@example.com\nSubject: hi\n\n..note\nline2\r\n.\r\nQUIT\r\n",
+        ])
+        .await;
+        assert_eq!(emails.len(), 1, "message must be accepted: {replies:?}");
+        assert_eq!(
+            &emails[0].body[..],
+            b"From: a@example.com\nSubject: hi\n\n.note\nline2\r\n"
+        );
+
+        // Mixed-ending empty body (header ends in LF, blank separator line is
+        // CRLF, smtplib appends `.\r\n`): preserving the closing CRLF retains
+        // the empty separator line for downstream header/body boundary parsing.
+        let (replies, emails) = run_pipelined_session(&[
+            b"EHLO client.test\r\n",
+            b"MAIL FROM:<a@example.com>\r\nRCPT TO:<b@example.org>\r\nDATA\r\n",
+            b"From: a@example.com\n\r\n.\r\nQUIT\r\n",
+        ])
+        .await;
+        assert_eq!(emails.len(), 1, "message must be accepted: {replies:?}");
+        assert_eq!(&emails[0].body[..], b"From: a@example.com\n\r\n");
     }
 
     /// A bare CR is illegal in a command line (RFC 5321 2.3.8). The loop
@@ -1633,7 +1660,7 @@ mod tests {
 
         assert_eq!(emails.len(), 1, "8-bit body must be accepted: {replies:?}");
         assert!(
-            emails[0].body.ends_with(b"raw \xff\xfe bytes"),
+            emails[0].body.ends_with(b"raw \xff\xfe bytes\r\n"),
             "body must survive verbatim, got {:?}",
             emails[0].body
         );
