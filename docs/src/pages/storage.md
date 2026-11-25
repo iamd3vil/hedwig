@@ -9,7 +9,8 @@ description: Configure filesystem storage and retention policies.
 ```toml
 [storage]
 storage_type = "log"                     # "log" (default) or "fs" (legacy filesystem)
-base_path = "/var/spool/hedwig"         # Base directory for email storage
+base_path = "/var/spool/hedwig"          # Base directory for email storage
+auto_migrate = false                     # Migrate legacy fs queued/deferred mail on startup when true
 
 [storage.cleanup]
 bounced_retention = "7d"                 # Remove bounced messages after 7 days
@@ -71,7 +72,13 @@ hedwig queue show  --spool /var/spool/hedwig/spool <MESSAGE_ID>
 hedwig queue stats --spool /var/spool/hedwig/spool
 ```
 
-To migrate an existing filesystem spool, stop the server, set
-`storage_type = "log"`, then run `hedwig queue migrate --config <config>`;
-legacy `queued/` and `deferred/` directories are preserved as timestamped
-`.migrated-*` backups.
+### Migrating from the legacy filesystem spool
+
+Before migrating, stop any Hedwig instance still running with `storage_type = "fs"` (the legacy filesystem spool has no file lock).
+
+You can migrate in either of two ways:
+
+1. **Opt-in startup migration:** set `storage_type = "log"` and `auto_migrate = true` under `[storage]` and start Hedwig. On startup, if legacy `queued/` or `deferred/` messages exist, Hedwig migrates them into `<base_path>/spool/` before accepting traffic and renames the legacy directories to timestamped `.migrated-*` backups. If any message fails to migrate or unexpected non-mail entries are found in `queued/` or `deferred/`, startup fails and leaves the legacy directories intact so you can fix the issue and restart (migration is idempotent). Once legacy directories are absent, empty, or contain only recognized housekeeping files (`.keep`, `.gitkeep`, `.DS_Store`) or orphaned `.meta.json` files (which log a warning), `auto_migrate = true` is a fast no-op on future restarts.
+2. **Offline CLI migration:** set `storage_type = "log"`, run `hedwig queue migrate --config <config>`, and then start Hedwig.
+
+In both modes, the `queued.migrated-*` and `deferred.migrated-*` backup directories are never deleted automatically; `bounced/` stays in place as the live bounce archive and continues to honor `storage.cleanup.bounced_retention`.

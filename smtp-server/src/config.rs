@@ -77,6 +77,11 @@ pub struct CfgStorage {
     #[serde(default = "default_storage_type")]
     pub storage_type: String,
     pub base_path: String,
+    /// When true and `storage_type = "log"`, automatically migrate any
+    /// remaining legacy `queued/` and `deferred/` mail into the log-queue
+    /// spool during startup before serving traffic.
+    #[serde(default, deserialize_with = "deserialize_strict_bool")]
+    pub auto_migrate: bool,
     #[serde(default)]
     pub cleanup: Option<CfgCleanup>,
 }
@@ -277,6 +282,12 @@ impl CfgQueue {
         self.checkpoint_interval_bytes.unwrap_or(8 * 1024 * 1024)
     }
 
+    /// Checked maximum encoded record length for `max_message_size`.
+    pub fn max_record_len(&self, max_message_size: usize) -> miette::Result<u32> {
+        crate::logqueue::spool::checked_max_record_len(max_message_size as u64)
+            .map_err(miette::Report::new)
+    }
+
     /// Validate the resolved configuration. `max_message_size` is the
     /// server's configured (or defaulted) maximum message size in bytes,
     /// since the segment target must be able to hold one worst-case record.
@@ -314,7 +325,6 @@ impl Cfg {
 
         // For HUML files, deserialize directly without using the config crate
         if path.extension().and_then(|s| s.to_str()) == Some("huml") {
-            println!("Loading HUML configuration from {}", cfg_path);
             let huml_content = std::fs::read_to_string(cfg_path).into_diagnostic()?;
             // Parse the document first so syntax errors report a location without echoing the configuration.
             let (_, document) = huml_rs::parse_huml(huml_content.trim())
@@ -372,6 +382,25 @@ fn default_cleanup_interval() -> Duration {
 /// The durable log queue is the default backend.
 fn default_storage_type() -> String {
     "log".to_string()
+}
+
+/// Deserialize a boolean without accepting integer or string coercions (the
+/// `config` crate's loosely-typed `deserialize_bool` otherwise coerces nonzero
+/// integers like `-1` to `true`).
+fn deserialize_strict_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error> {
+    struct StrictBool;
+    impl<'de> serde::de::Visitor<'de> for StrictBool {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a boolean (true or false)")
+        }
+        fn visit_bool<E: serde::de::Error>(self, v: bool) -> std::result::Result<bool, E> {
+            Ok(v)
+        }
+    }
+    deserializer.deserialize_any(StrictBool)
 }
 
 #[cfg(test)]
@@ -477,6 +506,62 @@ mod tests {
         "#,
         );
         assert_eq!(cfg.storage.storage_type, "log");
+        assert!(!cfg.storage.auto_migrate);
+    }
+
+    #[test]
+    fn storage_auto_migrate_parses_in_toml_and_huml() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("config.toml");
+        for (val, expected) in [("true", true), ("false", false)] {
+            std::fs::write(
+                &toml_path,
+                format!(
+                    "[server]\nlisteners = []\n[storage]\nstorage_type = \"log\"\nbase_path = \"/tmp/hedwig-test-spool\"\nauto_migrate = {val}\n"
+                ),
+            )
+            .unwrap();
+            let cfg = Cfg::load(toml_path.to_str().unwrap()).unwrap();
+            assert_eq!(cfg.storage.auto_migrate, expected);
+        }
+
+        for invalid in ["-1", "1", "0", "\"true\""] {
+            std::fs::write(
+                &toml_path,
+                format!(
+                    "[server]\nlisteners = []\n[storage]\nstorage_type = \"log\"\nbase_path = \"/tmp/hedwig-test-spool\"\nauto_migrate = {invalid}\n"
+                ),
+            )
+            .unwrap();
+            assert!(
+                Cfg::load(toml_path.to_str().unwrap()).is_err(),
+                "TOML auto_migrate = {invalid} must be rejected"
+            );
+        }
+
+        let huml_path = dir.path().join("config.huml");
+        std::fs::write(
+            &huml_path,
+            "server::\n  listeners::\n    - ::\n      addr: \"127.0.0.1:2525\"\nstorage::\n  base_path: \"/tmp/hedwig-test\"\n  auto_migrate: true\n",
+        )
+        .unwrap();
+        let huml_cfg = Cfg::load(huml_path.to_str().unwrap()).unwrap();
+        assert_eq!(huml_cfg.storage.storage_type, "log");
+        assert!(huml_cfg.storage.auto_migrate);
+
+        for invalid in ["-1", "1", "\"true\""] {
+            std::fs::write(
+                &huml_path,
+                format!(
+                    "server::\n  listeners::\n    - ::\n      addr: \"127.0.0.1:2525\"\nstorage::\n  base_path: \"/tmp/hedwig-test\"\n  auto_migrate: {invalid}\n"
+                ),
+            )
+            .unwrap();
+            assert!(
+                Cfg::load(huml_path.to_str().unwrap()).is_err(),
+                "HUML auto_migrate: {invalid} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -541,5 +626,15 @@ mod tests {
             ..CfgQueue::default()
         };
         assert!(queue.validate(25 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_max_message_size_wrapping_record_limit() {
+        let queue = CfgQueue {
+            segment_target_bytes: Some(4_294_967_296),
+            ..CfgQueue::default()
+        };
+        assert!(queue.validate(4_293_918_664).is_err());
+        assert!(queue.max_record_len(4_293_918_664).is_err());
     }
 }

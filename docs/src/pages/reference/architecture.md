@@ -53,7 +53,7 @@ throughput — slow or stalled outbound cannot block it.
   Destructive operations are fsync-guarded, so older queued mail is never
   at risk.
 - Inspect a live spool with `hedwig queue list|show|stats`; migrate a legacy
-  spool with `hedwig queue migrate`.
+  spool with `storage.auto_migrate = true` on startup or `hedwig queue migrate`.
 
 ### Legacy queue (`storage_type = "fs"`)
 

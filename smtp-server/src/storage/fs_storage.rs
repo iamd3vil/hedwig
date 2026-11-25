@@ -134,6 +134,16 @@ impl FileSystemStorage {
         Ok(storage)
     }
 
+    /// Read and decode a single email file from disk, attaching its path to
+    /// any I/O or parse error.
+    pub(crate) async fn read_email_file(path: &Utf8Path) -> Result<StoredEmail> {
+        let contents = fs::read(path)
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("reading legacy email file {path}"))?;
+        decode_email(contents).wrap_err_with(|| format!("decoding legacy email file {path}"))
+    }
+
     /// Returns the directory path for a given email status.
     ///
     /// # Arguments

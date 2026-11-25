@@ -803,6 +803,86 @@ impl RecoveredState {
         }
     }
 
+    /// Reconcile recovered checkpoint/journal state against the
+    /// writer-validated segment chain.
+    ///
+    /// A torn active tail is truncated during `LogWriters::start`, so
+    /// checkpoint/journal state written before the crash can reference
+    /// positions past the validated committed head:
+    /// - a cursor past the head would skip every record subsequently appended
+    ///   (stranding accepted or migrated mail forever) — clamp it back;
+    /// - a job whose payload sat in the truncated tail no longer exists on
+    ///   disk — drop it so new appends recycling those offsets cannot alias
+    ///   onto it.
+    pub fn reconcile_against_chain(&mut self, shard: u16, chain: &[super::writer::SegmentHead]) {
+        let committed_of = |segment: u64| -> Option<u64> {
+            chain
+                .iter()
+                .find(|h| h.segment == segment)
+                .map(|h| h.committed)
+        };
+        if let Some((seg, off)) = self.cursor {
+            match committed_of(seg) {
+                Some(committed) if off > committed => {
+                    tracing::warn!(
+                        shard,
+                        segment = seg,
+                        cursor = off,
+                        committed,
+                        "checkpoint cursor is past the validated tail; clamping"
+                    );
+                    self.cursor = Some((seg, committed));
+                }
+                _ => {}
+            }
+        }
+        let payload_gone = |location: &JobLocation| -> bool {
+            matches!(
+                committed_of(location.segment),
+                Some(committed) if location.offset + location.length as u64 > committed
+            )
+        };
+        self.ready.retain(|id, r| {
+            if payload_gone(&r.location) {
+                tracing::warn!(
+                    message_id = %id,
+                    location = ?r.location,
+                    "dropping recovered ready job whose payload was truncated with the torn tail"
+                );
+                false
+            } else {
+                true
+            }
+        });
+        self.deferred.retain(|id, d| {
+            if payload_gone(&d.location) {
+                tracing::warn!(
+                    message_id = %id,
+                    location = ?d.location,
+                    "dropping recovered deferred job whose payload was truncated with the torn tail"
+                );
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Snapshot this recovered state into a durable [`Checkpoint`] payload.
+    pub fn to_checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            cursor: self.cursor,
+            ready: self.ready.values().cloned().collect(),
+            deferred: self.deferred.values().cloned().collect(),
+            tombstones: self
+                .tombstones
+                .iter()
+                .map(|(&seg, ids)| (seg, ids.iter().copied().collect()))
+                .collect(),
+            segment_stats: self.segment_stats.iter().map(|(&s, &st)| (s, st)).collect(),
+        }
+    }
+
     /// Apply one journal entry on top of the current state; used both for
     /// recovery replay and could be reused by live accounting.
     pub fn apply(&mut self, entry: StateEntry) {

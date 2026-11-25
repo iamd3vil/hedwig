@@ -369,6 +369,7 @@ mod tests {
             storage: CfgStorage {
                 storage_type: "fs".into(),
                 base_path: "/tmp/hedwig-reload-test".into(),
+                auto_migrate: false,
                 cleanup: None,
             },
             filters: None,
@@ -390,8 +391,16 @@ mod tests {
         let mut new = old.clone();
         new.server.workers = Some(77);
         new.storage.base_path = "/secret/customer/path".into();
+        new.storage.auto_migrate = true;
         let fields = unsupported_changes(&old, &new).unwrap();
-        assert_eq!(fields, vec!["server.workers", "storage.base_path"]);
+        assert_eq!(
+            fields,
+            vec![
+                "server.workers",
+                "storage.auto_migrate",
+                "storage.base_path",
+            ]
+        );
         let rendered = fields.join(", ");
         assert!(!rendered.contains("77"));
         assert!(!rendered.contains("customer"));

@@ -60,6 +60,26 @@ impl Spool {
                     )));
                 }
             }
+            if existing > shard_count {
+                // Persist the shrunk topology only when surplus shard
+                // directories contain no files at all (no checkpoints,
+                // journals, or unknown files). Never recursively delete state.
+                for shard in shard_count..existing {
+                    let dir = ShardDir::open_or_create(&root, shard)?;
+                    if !dir.has_no_entries()? {
+                        return Err(QueueError::Layout(format!(
+                            "spool has {existing} shards but {shard_count} are configured, and \
+                             surplus shard {shard} still contains state or unknown files; \
+                             reconcile or empty it before shrinking append_writers",
+                        )));
+                    }
+                }
+                for shard in shard_count..existing {
+                    let orphan = root.join(super::shard::shard_dir_name(shard));
+                    std::fs::remove_dir(&orphan).map_err(|e| QueueError::io(&orphan, e))?;
+                }
+                sync_dir(&root)?;
+            }
         }
 
         let mut shards = Vec::with_capacity(shard_count as usize);
@@ -142,6 +162,23 @@ pub fn disk_free_bytes(path: &Path) -> std::io::Result<u64> {
     Ok(vfs.f_bavail as u64 * vfs.f_frsize as u64)
 }
 
+/// Compute the hard encoded-record length cap from `max_message_bytes` plus
+/// fixed framing and envelope allowance, using checked arithmetic and
+/// rejecting values above [`super::record::MAX_RECORD_LEN`].
+pub fn checked_max_record_len(max_message_bytes: u64) -> Result<u32, QueueError> {
+    let total = max_message_bytes
+        .checked_add(ENVELOPE_ALLOWANCE)
+        .and_then(|n| n.checked_add(FIXED_HEADER_LEN as u64));
+    match total {
+        Some(n) if n <= super::record::MAX_RECORD_LEN as u64 => Ok(n as u32),
+        _ => Err(QueueError::Layout(format!(
+            "max_message_size ({max_message_bytes} bytes) plus record overhead exceeds maximum \
+             supported record length ({} bytes)",
+            super::record::MAX_RECORD_LEN
+        ))),
+    }
+}
+
 /// Reject configurations where a maximum-size message could not fit in one
 /// segment. Records never span segments, so the segment target must cover
 /// the largest possible record.
@@ -149,7 +186,7 @@ pub fn check_segment_sizing(
     segment_target_bytes: u64,
     max_message_bytes: u64,
 ) -> Result<(), QueueError> {
-    let worst_case = max_message_bytes + ENVELOPE_ALLOWANCE + FIXED_HEADER_LEN as u64;
+    let worst_case = checked_max_record_len(max_message_bytes)? as u64;
     if segment_target_bytes < worst_case {
         return Err(QueueError::SegmentTooSmall {
             segment_bytes: segment_target_bytes,
@@ -157,6 +194,13 @@ pub fn check_segment_sizing(
         });
     }
     Ok(())
+}
+
+/// Fsync a directory entry table so creates/renames/unlinks inside it are durable.
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), QueueError> {
+    File::open(dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| QueueError::io(dir, e))
 }
 
 #[cfg(test)]
@@ -246,11 +290,64 @@ mod tests {
     }
 
     #[test]
+    fn shrinking_empty_spool_persists_topology_across_writes_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("spool");
+        {
+            let _spool = Spool::open(&root, 2).unwrap();
+            assert!(root.join("shard-0001").is_dir());
+        }
+        {
+            let spool = Spool::open(&root, 1).unwrap();
+            assert!(!root.join("shard-0001").exists());
+            std::fs::write(spool.shard(0).path().join(sealed_file_name(1)), b"data").unwrap();
+        }
+        // Reopening with 1 shard after shard 0 holds data must succeed.
+        let reopened = Spool::open(&root, 1).unwrap();
+        assert_eq!(reopened.shard_count(), 1);
+    }
+
+    #[test]
+    fn shrinking_rejects_surplus_shard_with_checkpoint_or_unknown_file() {
+        for filename in ["checkpoint", "recovery-notes.txt"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("spool");
+            {
+                let spool = Spool::open(&root, 2).unwrap();
+                std::fs::write(spool.shard(1).path().join(filename), b"important").unwrap();
+            }
+            assert!(
+                matches!(Spool::open(&root, 1), Err(QueueError::Layout(_))),
+                "shrinking must reject surplus shard containing {filename}"
+            );
+            assert_eq!(
+                std::fs::read(root.join("shard-0001").join(filename)).unwrap(),
+                b"important",
+                "surplus shard file {filename} must be preserved"
+            );
+        }
+    }
+
+    #[test]
     fn segment_sizing_invariant() {
         assert!(check_segment_sizing(64 * 1024 * 1024, 25 * 1024 * 1024).is_ok());
         assert!(matches!(
             check_segment_sizing(8 * 1024 * 1024, 25 * 1024 * 1024),
             Err(QueueError::SegmentTooSmall { .. })
+        ));
+        // Values whose worst-case record length would wrap u32 or exceed
+        // MAX_RECORD_LEN must be rejected rather than wrapping.
+        assert!(matches!(
+            checked_max_record_len(4_293_918_664),
+            Err(QueueError::Layout(_))
+        ));
+        assert!(matches!(
+            check_segment_sizing(4_294_967_296, 4_293_918_664),
+            Err(QueueError::Layout(_))
+        ));
+        assert!(matches!(
+            checked_max_record_len(u64::MAX),
+            Err(QueueError::Layout(_))
         ));
     }
 }
