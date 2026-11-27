@@ -17,7 +17,7 @@ Pushing a `v*` Git tag triggers two independent workflows:
   build cache. A merge job publishes the multi-platform tags only after both
   builds succeed.
 
-For `v0.13.0`, Docker publishes `0.13.0`, `0.13`, and `latest`. The Docker
+For `v0.14.0`, Docker publishes `0.14.0`, `0.14`, and `latest`. The Docker
 workflow checks out the release tag, so the image contains the tagged source.
 A successful binary release does not imply that Docker publishing has finished;
 check both workflows.
@@ -29,7 +29,7 @@ refresh `Cargo.lock`, and update the installation examples before committing
 the release preparation. Run the workspace tests, formatting, and Clippy
 checks, then use `verbump` to create the tag on that commit.
 
-For the minor version bump from `v0.12.3` to `v0.13.0`:
+For the minor version bump from `v0.13.0` to `v0.14.0`:
 
 ```bash
 verbump --show
@@ -59,7 +59,7 @@ The Docker workflow also accepts a manual `tag` input. Run the workflow from
 `main` to use the current workflow while building the existing tagged source:
 
 ```bash
-gh workflow run docker.yml --ref main -f tag=v0.13.0
+gh workflow run docker.yml --ref main -f tag=v0.14.0
 gh run list --workflow docker.yml
 ```
 
@@ -77,8 +77,8 @@ are serialized by the workflow's concurrency group.
 ## Verify publication
 
 ```bash
-docker buildx imagetools inspect ghcr.io/iamd3vil/hedwig:0.13.0
-docker run --rm ghcr.io/iamd3vil/hedwig:0.13.0 --version
+docker buildx imagetools inspect ghcr.io/iamd3vil/hedwig:0.14.0
+docker run --rm ghcr.io/iamd3vil/hedwig:0.14.0 --version
 ```
 
 The image index should contain `linux/amd64` and `linux/arm64`. Additional

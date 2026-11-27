@@ -12,12 +12,12 @@ description: Install Hedwig from release binaries, Docker images, or source.
 
 ## Install from GitHub Releases (recommended)
 
-Latest release: `v0.13.0`
+Latest release: `v0.14.0`
 
 Linux x86_64 (statically linked with glibc):
 
 ```bash
-curl -L -o hedwig.zip https://github.com/iamd3vil/hedwig/releases/download/v0.13.0/hedwig-v0.13.0-linux-x86_64.zip
+curl -L -o hedwig.zip https://github.com/iamd3vil/hedwig/releases/download/v0.14.0/hedwig-v0.14.0-linux-x86_64.zip
 unzip hedwig.zip
 chmod +x hedwig
 ```
@@ -25,7 +25,7 @@ chmod +x hedwig
 Checksums are available at:
 
 ```
-https://github.com/iamd3vil/hedwig/releases/download/v0.13.0/checksums.txt
+https://github.com/iamd3vil/hedwig/releases/download/v0.14.0/checksums.txt
 ```
 
 ## Install with Docker
@@ -34,11 +34,11 @@ Published images are available from `ghcr.io/iamd3vil/hedwig` for `linux/amd64`
 and `linux/arm64`. Docker selects the matching architecture when pulling:
 
 ```bash
-docker pull ghcr.io/iamd3vil/hedwig:0.13.0
-docker run --rm ghcr.io/iamd3vil/hedwig:0.13.0 --version
+docker pull ghcr.io/iamd3vil/hedwig:0.14.0
+docker run --rm ghcr.io/iamd3vil/hedwig:0.14.0 --version
 ```
 
-Available tags include the exact version (`0.13.0`), major/minor (`0.13`), and
+Available tags include the exact version (`0.14.0`), major/minor (`0.14`), and
 `latest`. Pin an exact version to control upgrades; the other tags change when
 release builds publish. Image tags omit the Git release tag's `v` prefix.
 
