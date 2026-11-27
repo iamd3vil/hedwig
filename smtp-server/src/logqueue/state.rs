@@ -1623,7 +1623,7 @@ mod tests {
 
         // Calling it again is idempotent and still doesn't touch the file.
         let state2 = load_state_readonly(dir.path()).unwrap();
-        assert_eq!(state2.deferred.contains_key(&id(1)), true);
+        assert!(state2.deferred.contains_key(&id(1)));
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
             torn_len,

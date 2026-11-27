@@ -815,7 +815,7 @@ mod tests {
     fn retry_counter_increments() {
         let before = METRICS.retry_total.get();
         retry_scheduled();
-        assert!(METRICS.retry_total.get() >= before + 1);
+        assert!(METRICS.retry_total.get() > before);
     }
 
     #[test]
@@ -839,7 +839,7 @@ mod tests {
             let _guard = job_processing_guard();
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(METRICS.worker_jobs_processed.get() >= before_count + 1);
+        assert!(METRICS.worker_jobs_processed.get() > before_count);
         assert!(METRICS.worker_job_duration.get_sample_count() > before_samples);
     }
 
@@ -932,23 +932,23 @@ mod tests {
     fn email_counters_increment() {
         let before_received = METRICS.emails_received.get();
         email_received();
-        assert!(METRICS.emails_received.get() >= before_received + 1);
+        assert!(METRICS.emails_received.get() > before_received);
 
         let before_sent = METRICS.emails_sent.get();
         email_sent();
-        assert!(METRICS.emails_sent.get() >= before_sent + 1);
+        assert!(METRICS.emails_sent.get() > before_sent);
 
         let before_deferred = METRICS.emails_deferred.get();
         email_deferred();
-        assert!(METRICS.emails_deferred.get() >= before_deferred + 1);
+        assert!(METRICS.emails_deferred.get() > before_deferred);
 
         let before_bounced = METRICS.emails_bounced.get();
         email_bounced();
-        assert!(METRICS.emails_bounced.get() >= before_bounced + 1);
+        assert!(METRICS.emails_bounced.get() > before_bounced);
 
         let before_dropped = METRICS.emails_dropped.get();
         email_dropped();
-        assert!(METRICS.emails_dropped.get() >= before_dropped + 1);
+        assert!(METRICS.emails_dropped.get() > before_dropped);
     }
 
     #[test]
@@ -986,7 +986,7 @@ mod tests {
         // them concurrently, so assert deltas rather than absolute values.
         let before = METRICS.logqueue_relocations.get();
         logqueue_relocations(1);
-        assert!(METRICS.logqueue_relocations.get() >= before + 1);
+        assert!(METRICS.logqueue_relocations.get() > before);
         assert!(METRICS.logqueue_append_errors.get() >= 1);
     }
 }

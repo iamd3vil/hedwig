@@ -34,7 +34,6 @@ subtle = "2.6.1"
 # For CRAM-MD5 verification; both already in the tree as transitive deps.
 hmac = "0.13.0"
 md-5 = "0.11.0"
-tempfile = "3.27.0"
 pkcs8 = "0.11.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
@@ -77,3 +76,4 @@ arc-swap = "1.9.5"
 
 [dev-dependencies]
 stateright = "0.31.0"
+tempfile = "3.27.0"
